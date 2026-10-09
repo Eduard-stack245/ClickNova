@@ -15,7 +15,13 @@
 #include <QStackedWidget>
 #include <QKeySequenceEdit>
 #include <QKeyCombination>
+#include <QStringList>
+#include <QTranslator>
+#include <QCoreApplication>
+#include <QDir>
 #include <QEvent>
+#include <QHash>
+#include <QVariant>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QRegularExpression>
@@ -39,6 +45,7 @@
 #include <vector>
 #include <memory>
 #include <utility>
+#include "ui_translation.hpp"
 #include "clicknova/version.hpp"
 #include "clicknova/window_target.hpp"
 
@@ -226,12 +233,21 @@ private:
 };
 #endif
 
+bool isSmokeMode() {
+    return qApp->arguments().contains(QStringLiteral("--smoke-test-ui")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-language"));
+}
+
 class MainWindow final : public QMainWindow {
 public:
     MainWindow() {
         setWindowTitle(QStringLiteral("ClickNova — Auto Clicker v") +
                        QString::fromLatin1(CLICKNOVA_VERSION));
-        resize(980, 730);
+        QSettings initialPreferences(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+        language_ = initialPreferences.value(QStringLiteral("ui/language"), QStringLiteral("en")).toString();
+        if (language_ != QStringLiteral("ru") || isSmokeMode()) language_ = QStringLiteral("en");
+        applyQtTranslator();
+        resize(1040, 760);
         setMinimumSize(460, 360);
         auto* root = new QWidget(this);
         auto* layout = new QVBoxLayout(root);
@@ -245,11 +261,11 @@ public:
         body->setSpacing(16);
         navigation_ = new QListWidget(root);
         navigation_->setObjectName(QStringLiteral("navigation"));
-        navigation_->setFixedWidth(190);
+        navigation_->setFixedWidth(175);
         navigation_->setSpacing(6);
         navigation_->addItems({QStringLiteral("Auto Clicker"), QStringLiteral("Position"),
                                QStringLiteral("Windows"), QStringLiteral("Profiles"),
-                               QStringLiteral("Shortcuts")});
+                               QStringLiteral("Shortcuts"), QStringLiteral("Settings")});
         body->addWidget(navigation_);
         pages_ = new QStackedWidget(root);
         body->addWidget(pages_, 1);
@@ -285,9 +301,16 @@ public:
                                        QStringLiteral("Save and restore your frequently used configurations."));
         auto* shortcutsPage = createPage(QStringLiteral("Shortcuts"),
                                          QStringLiteral("Customize keyboard controls to avoid conflicts with other apps."));
-        for (auto* page : {clickPage, positionPage, windowsPage, profilePage, shortcutsPage})
+        auto* settingsPage = createPage(QStringLiteral("Settings"),
+                                        QStringLiteral("Choose the display language. Changes apply immediately."));
+        for (auto* page : {clickPage, positionPage, windowsPage, profilePage, shortcutsPage, settingsPage})
             page->addStretch();
-        connect(navigation_, &QListWidget::currentRowChanged, pages_, &QStackedWidget::setCurrentIndex);
+        connect(navigation_, &QListWidget::currentRowChanged, this, [this](int index) {
+            if (index < 0) return;
+            pages_->setCurrentIndex(index);
+            if (auto* scroll = qobject_cast<QScrollArea*>(pages_->widget(index)))
+                scroll->verticalScrollBar()->setValue(0);
+        });
         navigation_->setCurrentRow(0);
 
         auto* group = new QGroupBox(QStringLiteral("Quick Auto Clicker"));
@@ -418,13 +441,14 @@ public:
                     y_->setValue(point.y());
                     updateTargetInputs();
                     updatePositionInputs();
-                    if (!qApp->arguments().contains(QStringLiteral("--smoke-test-ui")))
+                    if (!isSmokeMode())
                         saveLastSettings();
                 });
         connect(targetWindows_, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [this](int selected) {
                     if (selected >= 0 && selected < static_cast<int>(availableWindows_.size())) {
                         selectedTarget_ = availableWindows_[static_cast<std::size_t>(selected)];
+                        savedWindowTitle_.clear();
                     } else {
                         selectedTarget_.reset();
                     }
@@ -478,7 +502,7 @@ public:
             if (active_ || capturePending_) return;
             positionMode_->setCurrentIndex(enabled ? 1 : 0);
             updatePositionInputs();
-            if (!qApp->arguments().contains(QStringLiteral("--smoke-test-ui"))) saveLastSettings();
+            if (!isSmokeMode()) saveLastSettings();
         });
         connect(quickWindow_, &QCheckBox::toggled, this, [this](bool enabled) {
             if (active_ || capturePending_) return;
@@ -500,6 +524,29 @@ public:
                 this, [this](int) { updateQuickOptions(); });
         updateQuickOptions();
 
+        auto* languageGroup = new QGroupBox(QStringLiteral("Interface language"));
+        auto* languageForm = new QFormLayout(languageGroup);
+        languageForm->setContentsMargins(16, 20, 16, 16);
+        languageSelector_ = new QComboBox;
+        languageSelector_->setObjectName(QStringLiteral("uiLanguage"));
+        languageSelector_->setMinimumHeight(44);
+        languageSelector_->addItem(QStringLiteral("English"), QStringLiteral("en"));
+        languageSelector_->addItem(QString::fromUtf8("Русский"), QStringLiteral("ru"));
+        languageForm->addRow(QStringLiteral("Language"), languageSelector_);
+        settingsPage->insertWidget(settingsPage->count() - 1, languageGroup);
+        languageSelector_->setCurrentIndex(language_ == QStringLiteral("ru") ? 1 : 0);
+        connect(languageSelector_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int index) {
+                    if (index < 0) return;
+                    language_ = languageSelector_->itemData(index).toString();
+                    if (!isSmokeMode()) {
+                        QSettings userSettings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+                        userSettings.setValue(QStringLiteral("ui/language"), language_);
+                    }
+                    applyQtTranslator();
+                    localizeUi();
+                });
+
         auto* profileGroup = new QGroupBox(QStringLiteral("Profiles"));
         auto* profileLayout = new QVBoxLayout(profileGroup);
         profiles_ = new QComboBox;
@@ -516,6 +563,12 @@ public:
         }
         profileLayout->addLayout(profileActions);
         profilePage->insertWidget(profilePage->count() - 1, profileGroup);
+        auto* profileHelp = new QLabel(QStringLiteral(
+            "Profiles save click settings, coordinates, window preference, shortcuts and language. "
+            "They are stored for your local user, never in Git. A window must be selected again after restarting."));
+        profileHelp->setWordWrap(true);
+        profileHelp->setObjectName(QStringLiteral("subheading"));
+        profilePage->insertWidget(profilePage->count() - 1, profileHelp);
         connect(saveProfile_, &QPushButton::clicked, this, [this] { saveNamedProfile(); });
         connect(loadProfile_, &QPushButton::clicked, this, [this] { loadNamedProfile(); });
         connect(deleteProfile_, &QPushButton::clicked, this, [this] { deleteNamedProfile(); });
@@ -594,12 +647,13 @@ public:
         layout->addWidget(status_);
         setCentralWidget(root);
         refreshWindowList();
-        if (!qApp->arguments().contains(QStringLiteral("--smoke-test-ui"))) {
+        if (!isSmokeMode()) {
             restoreLastSettings();
             refreshProfiles();
         }
         updateProfileActions();
         updateTargetInputs();
+        localizeUi();
 
         connect(start_, &QPushButton::clicked, this, [this] { start(); });
         connect(stop_, &QPushButton::clicked, this, [this] { stop(); });
@@ -607,25 +661,25 @@ public:
         connect(&countdownTimer_, &QTimer::timeout, this, [this] { countdownTick(); });
         clickTimer_.setTimerType(Qt::PreciseTimer);
 #ifdef _WIN32
-        if (!qApp->arguments().contains(QStringLiteral("--smoke-test-ui"))) {
+        if (!isSmokeMode()) {
             hotkeys_ = std::make_unique<Hotkeys>([this] { start(); }, [this] { stop(); },
                                                  [this] { finishCursorCapture(); });
             qApp->installNativeEventFilter(hotkeys_.get());
             restoreShortcutSettings();
             if (!hotkeys_->ready()) {
-                status_->setText(QStringLiteral("Start shortcut unavailable. Choose another key in Shortcuts."));
+                setStatus(QStringLiteral("Start shortcut unavailable. Choose another key in Shortcuts."));
             }
         } else {
             refreshShortcutLabels();
         }
 #else
         start_->setEnabled(false);
-        status_->setText(QStringLiteral("Linux input injection is not available in this prototype."));
+        setStatus(QStringLiteral("Linux input injection is not available in this prototype."));
 #endif
     }
     ~MainWindow() override {
         stop();
-        if (!qApp->arguments().contains(QStringLiteral("--smoke-test-ui"))) saveLastSettings();
+        if (!isSmokeMode()) saveLastSettings();
 #ifdef _WIN32
         if (hotkeys_) qApp->removeNativeEventFilter(hotkeys_.get());
 #endif
@@ -644,6 +698,82 @@ private:
         return QMainWindow::eventFilter(watched, event);
     }
 
+    // These strings are UI resources, not persisted keys or macro identifiers.
+    // Language can be switched without restarting or rebuilding the application.
+    void applyQtTranslator() {
+        if (qtTranslator_) qApp->removeTranslator(qtTranslator_.get());
+        qtTranslator_.reset();
+        if (language_ != QStringLiteral("ru")) return;
+        auto candidate = std::make_unique<QTranslator>();
+        const QString translations = QCoreApplication::applicationDirPath()
+                                   + QStringLiteral("/translations");
+        if (candidate->load(QStringLiteral("qt_ru"), translations) ||
+            candidate->load(QStringLiteral("qtbase_ru"), translations)) {
+            qApp->installTranslator(candidate.get());
+            qtTranslator_ = std::move(candidate);
+        }
+    }
+    QString uiText(const QString& english) const {
+        return translateUiText(english, language_);
+    }
+    void setStatus(const QString& english) {
+        lastStatusEnglish_ = english;
+        if (status_) status_->setText(uiText(english));
+    }
+    void localizeUi() {
+        if (!pages_ || !navigation_) return;
+        for (auto* label : findChildren<QLabel*>()) {
+            if (label == status_ || label == activeSetup_ || label == setupHelp_ ||
+                label == targetHelp_ || label == caution_) continue;
+            const QVariant stored = label->property("clicknova.english");
+            const QString english = stored.isValid() ? stored.toString() : label->text();
+            label->setProperty("clicknova.english", english);
+            label->setText(uiText(english));
+        }
+        for (auto* group : findChildren<QGroupBox*>()) {
+            const QVariant stored = group->property("clicknova.english");
+            const QString english = stored.isValid() ? stored.toString() : group->title();
+            group->setProperty("clicknova.english", english);
+            group->setTitle(uiText(english));
+        }
+        for (auto* button : findChildren<QPushButton*>()) {
+            if (button == start_ || button == stop_ || button == capture_) continue;
+            const QVariant stored = button->property("clicknova.english");
+            const QString english = stored.isValid() ? stored.toString() : button->text();
+            button->setProperty("clicknova.english", english);
+            button->setText(uiText(english));
+        }
+        for (auto* box : findChildren<QCheckBox*>()) {
+            const QVariant stored = box->property("clicknova.english");
+            const QString english = stored.isValid() ? stored.toString() : box->text();
+            box->setProperty("clicknova.english", english);
+            box->setText(uiText(english));
+        }
+        for (auto* combo : findChildren<QComboBox*>()) {
+            if (combo == targetWindows_ || combo == profiles_ || combo == languageSelector_) continue;
+            const QVariant existing = combo->property("clicknova.englishItems");
+            QStringList source;
+            if (existing.isValid()) source = existing.toStringList();
+            else for (int i = 0; i < combo->count(); ++i) source.append(combo->itemText(i));
+            combo->setProperty("clicknova.englishItems", source);
+            for (int i = 0; i < source.size() && i < combo->count(); ++i)
+                combo->setItemText(i, uiText(source[i]));
+        }
+        for (int i = 0; i < navigation_->count(); ++i) {
+            static const QStringList names = {"Auto Clicker", "Position", "Windows", "Profiles", "Shortcuts", "Settings"};
+            navigation_->item(i)->setText(uiText(names[i]));
+        }
+        if (profiles_) profiles_->setPlaceholderText(uiText(QStringLiteral("Choose a saved profile")));
+        if (targetWindows_) targetWindows_->setPlaceholderText(uiText(QStringLiteral("Select a running window")));
+        if (positionMode_) positionMode_->setItemText(1, uiText(targetMode_->currentIndex() == 1
+            ? QStringLiteral("Fixed client coordinates") : QStringLiteral("Fixed screen coordinates")));
+        refreshShortcutLabels();
+        updateQuickOptions();
+        updateTargetInputs();
+        if (status_) status_->setText(uiText(lastStatusEnglish_.isEmpty()
+                                    ? QStringLiteral("Ready") : lastStatusEnglish_));
+    }
+
     ShortcutOptions shortcutValues() const {
         ShortcutOptions value;
         value.enableStart = enableStartShortcut_->isChecked();
@@ -659,12 +789,12 @@ private:
     void refreshShortcutLabels() {
         const auto start = startShortcut_->keySequence().toString(QKeySequence::NativeText);
         start_->setText(enableStartShortcut_->isChecked()
-            ? QStringLiteral("Start · %1").arg(start) : QStringLiteral("Start"));
-        stop_->setText(QStringLiteral("Stop · %1").arg(stopHotkeyLabel()));
+            ? uiText(QStringLiteral("Start · %1")).arg(start) : uiText(QStringLiteral("Start")));
+        stop_->setText(uiText(QStringLiteral("Stop · %1")).arg(stopHotkeyLabel()));
         capture_->setText(enablePickShortcut_->isChecked()
-            ? QStringLiteral("Capture in 3 seconds · or %1").arg(
+            ? uiText(QStringLiteral("Capture in 3 seconds · or %1")).arg(
                   pickShortcut_->keySequence().toString(QKeySequence::NativeText))
-            : QStringLiteral("Capture cursor after 3 seconds"));
+            : uiText(QStringLiteral("Capture cursor after 3 seconds")));
     }
     void restoreShortcutSettings() {
         QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
@@ -714,7 +844,7 @@ private:
             startShortcut_->setKeySequence(previous.start);
             stopShortcut_->setKeySequence(previous.stop);
             pickShortcut_->setKeySequence(previous.pick);
-            status_->setText(QStringLiteral("Shortcut conflict or unsupported combination. Previous settings restored."));
+            setStatus(QStringLiteral("Shortcut conflict or unsupported combination. Previous settings restored."));
             startShortcut_->setEnabled(previous.enableStart);
             pickShortcut_->setEnabled(previous.enablePick);
             refreshShortcutLabels();
@@ -728,7 +858,7 @@ private:
         settings.setValue(QStringLiteral("shortcuts/stop"), updated.stop.toString(QKeySequence::PortableText));
         settings.setValue(QStringLiteral("shortcuts/pick"), updated.pick.toString(QKeySequence::PortableText));
         refreshShortcutLabels();
-        status_->setText(QStringLiteral("Keyboard shortcuts saved."));
+        setStatus(QStringLiteral("Keyboard shortcuts saved."));
     }
     void setShortcutEditorsEnabled(bool enabled) {
         enableStartShortcut_->setEnabled(enabled);
@@ -744,14 +874,14 @@ private:
         if (active_ || capturePending_) return;
         if (targetMode_->currentIndex() == 1) {
             if (!selectedTarget_) {
-                status_->setText(QStringLiteral("Select a target window before starting."));
+                setStatus(QStringLiteral("Select a target window before starting."));
                 return;
             }
             // A missing/reused HWND must never trigger a global click.
             const auto state = clicknova::platform::checkTarget(*selectedTarget_);
             if (state != clicknova::platform::TargetCheck::Ready &&
                 state != clicknova::platform::TargetCheck::NotForeground) {
-                status_->setText(QString::fromUtf8(clicknova::platform::targetCheckMessage(state)));
+                setStatus(QString::fromUtf8(clicknova::platform::targetCheckMessage(state)));
                 return;
             }
         }
@@ -759,7 +889,7 @@ private:
         // steal keys from games, editors or other applications.
         if (hotkeys_ && !hotkeys_->setRunning(true)) {
             navigation_->setCurrentRow(4);
-            status_->setText(QStringLiteral("Stop shortcut is in use. Choose another shortcut before starting."));
+            setStatus(QStringLiteral("Stop shortcut is in use. Choose another shortcut before starting."));
             return;
         }
         saveLastSettings();
@@ -782,7 +912,7 @@ private:
         updateTargetInputs();
         start_->setEnabled(false);
         stop_->setEnabled(true);
-        status_->setText(targetMode_->currentIndex() == 1
+        setStatus(targetMode_->currentIndex() == 1
             ? QStringLiteral("Starting in 3 seconds. Focus the selected window. %1 to stop.").arg(stopHotkeyLabel())
             : QStringLiteral("Starting in 3 seconds. Move the cursor to a safe position. %1 to stop.").arg(stopHotkeyLabel()));
         countdownTimer_.start(1000);
@@ -792,12 +922,12 @@ private:
         if (!active_) return;
         --secondsToStart_;
         if (secondsToStart_ > 0) {
-            status_->setText(QStringLiteral("Starting in %1 s · %2 to stop").arg(secondsToStart_).arg(stopHotkeyLabel()));
+            setStatus(QStringLiteral("Starting in %1 s · %2 to stop").arg(secondsToStart_).arg(stopHotkeyLabel()));
             return;
         }
         countdownTimer_.stop();
         clickTimer_.start(interval_->value());
-        status_->setText(QStringLiteral("Running · %1 to stop").arg(stopHotkeyLabel()));
+        setStatus(QStringLiteral("Running · %1 to stop").arg(stopHotkeyLabel()));
     }
     void click() {
         if (!active_) return;
@@ -809,7 +939,7 @@ private:
         int screenY = y_->value();
         if (targetMode_->currentIndex() == 1) {
             if (!selectedTarget_) {
-                stopWithReason(QStringLiteral("Target window is not selected."));
+                stopWithReason(uiText(QStringLiteral("Target window is not selected.")));
                 return;
             }
             using clicknova::platform::TargetCheck;
@@ -849,7 +979,7 @@ private:
             return;
         }
         ++done_;
-        status_->setText(QStringLiteral("Running · clicks: %1 · %2 to stop").arg(done_).arg(stopHotkeyLabel()));
+        setStatus(QStringLiteral("Running · clicks: %1 · %2 to stop").arg(done_).arg(stopHotkeyLabel()));
         if (!infinite_->isChecked() && done_ >= count_->value()) stop();
 #endif
     }
@@ -872,12 +1002,12 @@ private:
         start_->setEnabled(true);
         stop_->setEnabled(false);
         updateTargetInputs();
-        status_->setText(QStringLiteral("Stopped · clicks completed: %1").arg(done_));
+        setStatus(QStringLiteral("Stopped · clicks completed: %1").arg(done_));
     }
 
     void stopWithReason(const QString& reason) {
         stop();
-        status_->setText(reason + QStringLiteral(" Automation stopped."));
+        setStatus(reason + QStringLiteral(" Automation stopped."));
     }
     void updateQuickOptions() {
         if (!quickPosition_ || !quickWindow_ || !positionMode_ || !targetMode_) return;
@@ -894,31 +1024,31 @@ private:
         quickWindow_->setEnabled(editable);
         editPosition_->setEnabled(editable);
         editWindow_->setEnabled(editable);
-        navigation_->item(1)->setText(fixed ? QStringLiteral("Position  · ON") : QStringLiteral("Position  · OFF"));
-        navigation_->item(2)->setText(bound ? QStringLiteral("Windows  · ON") : QStringLiteral("Windows  · OFF"));
+        navigation_->item(1)->setText(uiText(fixed ? QStringLiteral("Position  · ON") : QStringLiteral("Position  · OFF")));
+        navigation_->item(2)->setText(uiText(bound ? QStringLiteral("Windows  · ON") : QStringLiteral("Windows  · OFF")));
         const QString position = fixed
-            ? (bound ? QStringLiteral("Fixed point in target window: (%1, %2)")
-                         : QStringLiteral("Fixed point on screen: (%1, %2)"))
+            ? (bound ? uiText(QStringLiteral("Fixed point in target window: (%1, %2)"))
+                         : uiText(QStringLiteral("Fixed point on screen: (%1, %2)")))
                     .arg(x_->value()).arg(y_->value())
-            : QStringLiteral("Current cursor position");
+            : uiText(QStringLiteral("Current cursor position"));
         const QString target = bound
             ? (selectedTarget_
-                ? QStringLiteral("Selected window: %1").arg(QString::fromStdWString(selectedTarget_->title))
-                : QStringLiteral("Selected window: NOT SELECTED"))
-            : QStringLiteral("Any foreground window (global mouse)");
-        activeSetup_->setText(QStringLiteral("%1 · Every %2 ms · %3\n%4\n%5")
+                ? uiText(QStringLiteral("Selected window: %1")).arg(QString::fromStdWString(selectedTarget_->title))
+                : uiText(QStringLiteral("Selected window: NOT SELECTED")))
+            : uiText(QStringLiteral("Any foreground window (global mouse)"));
+        activeSetup_->setText(uiText(QStringLiteral("%1 · Every %2 ms · %3\n%4\n%5"))
             .arg(button_->currentText())
             .arg(interval_->value())
-            .arg(infinite_->isChecked() ? QStringLiteral("Unlimited")
-                                        : QStringLiteral("%1 clicks").arg(count_->value()))
+            .arg(infinite_->isChecked() ? uiText(QStringLiteral("Unlimited"))
+                                        : uiText(QStringLiteral("%1 clicks")).arg(count_->value()))
             .arg(target)
             .arg(position));
         setupHelp_->setText(bound && !selectedTarget_
-            ? QStringLiteral("Select a window on the Windows page before pressing Start.")
+            ? uiText(QStringLiteral("Select a window on the Windows page before pressing Start."))
             : bound
-                ? QStringLiteral("Foreground only: keep the selected window focused. "
-                                 "With Current cursor, the cursor must be inside its client area.")
-                : QStringLiteral("No window restriction. Clicks use the global mouse and can affect other applications."));
+                ? uiText(QStringLiteral("Foreground only: keep the selected window focused. "
+                                 "With Current cursor, the cursor must be inside its client area."))
+                : uiText(QStringLiteral("No window restriction. Clicks use the global mouse and can affect other applications.")));
     }
 
     void updatePositionInputs() {
@@ -949,7 +1079,7 @@ private:
         const QString shortcut = hotkeys_ && hotkeys_->pickerReady()
             ? QStringLiteral(" or press %1").arg(pickShortcut_->keySequence().toString(QKeySequence::NativeText))
             : QString();
-        status_->setText(QStringLiteral("Move the cursor to the target. Capturing in 3 seconds%1.").arg(shortcut));
+        setStatus(QStringLiteral("Move the cursor to the target. Capturing in 3 seconds%1.").arg(shortcut));
         const int token = captureToken_;
         QTimer::singleShot(3000, this, [this, token] {
             if (capturePending_ && token == captureToken_) finishCursorCapture();
@@ -964,14 +1094,14 @@ private:
             if (targetMode_->currentIndex() == 1) {
                 if (!selectedTarget_ || clicknova::platform::checkScreenPoint(
                          *selectedTarget_, point.x, point.y) != clicknova::platform::TargetCheck::Ready) {
-                    status_->setText(QStringLiteral("Place the cursor inside the focused target window."));
+                    setStatus(QStringLiteral("Place the cursor inside the focused target window."));
                 } else {
                     HWND hwnd = reinterpret_cast<HWND>(selectedTarget_->handle);
                     POINT relative = point;
                     if (ScreenToClient(hwnd, &relative)) {
                         x_->setValue(relative.x);
                         y_->setValue(relative.y);
-                        status_->setText(QStringLiteral("Captured client position: %1, %2")
+                        setStatus(QStringLiteral("Captured client position: %1, %2")
                                              .arg(relative.x).arg(relative.y));
                         saveLastSettings();
                     }
@@ -979,12 +1109,12 @@ private:
             } else {
                 x_->setValue(point.x);
                 y_->setValue(point.y);
-                status_->setText(QStringLiteral("Captured screen position: %1, %2")
+                setStatus(QStringLiteral("Captured screen position: %1, %2")
                                      .arg(point.x).arg(point.y));
                 saveLastSettings();
             }
         } else {
-            status_->setText(QStringLiteral("Unable to read the cursor position."));
+            setStatus(QStringLiteral("Unable to read the cursor position."));
         }
         capturePending_ = false;
         ++captureToken_;
@@ -1011,18 +1141,20 @@ private:
 #else
         captureWindow_->setEnabled(false);
 #endif
-        positionMode_->setItemText(1, bound ? QStringLiteral("Fixed client coordinates")
-                                                : QStringLiteral("Fixed screen coordinates"));
+        positionMode_->setItemText(1, uiText(bound ? QStringLiteral("Fixed client coordinates")
+                                                : QStringLiteral("Fixed screen coordinates")));
         if (bound) {
             targetHelp_->setText(selectedTarget_
-                ? QStringLiteral("Bound to: %1 (PID %2). Focus must remain on this window during clicks.")
+                ? uiText(QStringLiteral("Bound to: %1 (PID %2). Focus must remain on this window during clicks."))
                     .arg(QString::fromStdWString(selectedTarget_->title))
                     .arg(selectedTarget_->processId)
-                : QStringLiteral("Select a window. Background clicks are not implemented; focus is required."));
-            caution_->setText(QStringLiteral("BOUND WINDOW: Uses the global mouse. Automation stops if the target loses focus or becomes covered."));
+                : (savedWindowTitle_.isEmpty()
+                   ? uiText(QStringLiteral("Select a window. Background clicks are not implemented; focus is required."))
+                   : uiText(QStringLiteral("Saved window: %1. Please select it again before starting.")).arg(savedWindowTitle_)));
+            caution_->setText(uiText(QStringLiteral("BOUND WINDOW: Uses the global mouse. Automation stops if the target loses focus or becomes covered.")));
         } else {
-            targetHelp_->setText(QStringLiteral("Global mode does not bind to a window."));
-            caution_->setText(QStringLiteral("GLOBAL MOUSE: Clicking affects the desktop; background automation is not available in this mode."));
+            targetHelp_->setText(uiText(QStringLiteral("Global mode does not bind to a window.")));
+            caution_->setText(uiText(QStringLiteral("GLOBAL MOUSE: Clicking affects the desktop; background automation is not available in this mode.")));
         }
         updateQuickOptions();
     }
@@ -1053,13 +1185,13 @@ private:
         saveProfile_->setEnabled(false);
         updateProfileActions();
         updateTargetInputs();
-        status_->setText(QStringLiteral("Focus your target window. Capturing in 3 seconds..."));
+        setStatus(QStringLiteral("Focus your target window. Capturing in 3 seconds..."));
         QTimer::singleShot(3000, this, [this] {
             capturePending_ = false;
             setShortcutEditorsEnabled(true);
             const auto picked = clicknova::platform::foregroundWindow();
             if (!picked) {
-                status_->setText(QStringLiteral("Could not capture a valid external foreground window."));
+                setStatus(QStringLiteral("Could not capture a valid external foreground window."));
             } else {
                 refreshWindowList();
                 auto it = std::find_if(availableWindows_.begin(), availableWindows_.end(),
@@ -1073,7 +1205,7 @@ private:
                 } else {
                     targetWindows_->setCurrentIndex(static_cast<int>(std::distance(availableWindows_.begin(), it)));
                 }
-                status_->setText(QStringLiteral("Window selected. Clicks require it to stay foreground."));
+                setStatus(QStringLiteral("Window selected. Clicks require it to stay foreground."));
             }
             start_->setEnabled(true);
             positionMode_->setEnabled(true);
@@ -1102,6 +1234,17 @@ private:
         settings.setValue(QStringLiteral("screenY"), screen.y());
         settings.setValue(QStringLiteral("clientX"), client.x());
         settings.setValue(QStringLiteral("clientY"), client.y());
+        settings.setValue(QStringLiteral("language"), window.language_);
+        settings.setValue(QStringLiteral("targetWindowTitle"),
+                          window.selectedTarget_
+                            ? QString::fromStdWString(window.selectedTarget_->title)
+                            : window.savedWindowTitle_);
+        const ShortcutOptions keys = window.shortcutValues();
+        settings.setValue(QStringLiteral("shortcutEnableStart"), keys.enableStart);
+        settings.setValue(QStringLiteral("shortcutEnablePick"), keys.enablePick);
+        settings.setValue(QStringLiteral("shortcutStart"), keys.start.toString(QKeySequence::PortableText));
+        settings.setValue(QStringLiteral("shortcutStop"), keys.stop.toString(QKeySequence::PortableText));
+        settings.setValue(QStringLiteral("shortcutPick"), keys.pick.toString(QKeySequence::PortableText));
     }
     void restoreFields(QSettings& settings) {
         button_->setCurrentIndex(qBound(0, settings.value(QStringLiteral("button"), 0).toInt(), 2));
@@ -1123,6 +1266,7 @@ private:
             targetMode_->setCurrentIndex(mode);
         }
         selectedTarget_.reset();
+        savedWindowTitle_ = settings.value(QStringLiteral("targetWindowTitle")).toString();
         targetWindows_->setCurrentIndex(-1);
         const QPoint point = mode == 1 ? clientCoordinates_ : screenCoordinates_;
         x_->setValue(point.x());
@@ -1163,20 +1307,20 @@ private:
         if (active_ || capturePending_) return;
         bool accepted = false;
         const QString name = QInputDialog::getText(
-            this, QStringLiteral("Save profile"), QStringLiteral("Profile name:"),
+            this, uiText(QStringLiteral("Save profile")), uiText(QStringLiteral("Profile name:")),
             QLineEdit::Normal, profiles_->currentText(), &accepted).trimmed();
         if (!accepted) return;
         static const QRegularExpression validName(QStringLiteral("^[\\p{L}\\p{N}][\\p{L}\\p{N} _-]{0,39}$"));
         if (!validName.match(name).hasMatch()) {
-            QMessageBox::warning(this, QStringLiteral("Invalid name"),
-                QStringLiteral("Use 1-40 letters, numbers, spaces, hyphens, or underscores. Start with a letter or number."));
+            QMessageBox::warning(this, uiText(QStringLiteral("Invalid name")),
+                uiText(QStringLiteral("Use 1-40 letters, numbers, spaces, hyphens, or underscores. Start with a letter or number.")));
             return;
         }
         QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
         settings.beginGroup(QStringLiteral("profiles"));
         if (settings.childGroups().contains(name) &&
-            QMessageBox::question(this, QStringLiteral("Overwrite profile"),
-                                  QStringLiteral("Replace the existing profile '%1'?").arg(name)) != QMessageBox::Yes) {
+            QMessageBox::question(this, uiText(QStringLiteral("Overwrite profile")),
+                                  uiText(QStringLiteral("Replace the existing profile '%1'?")).arg(name)) != QMessageBox::Yes) {
             return;
         }
         settings.beginGroup(name);
@@ -1184,7 +1328,7 @@ private:
         settings.endGroup();
         settings.endGroup();
         refreshProfiles(name);
-        status_->setText(QStringLiteral("Saved profile: %1").arg(name));
+        setStatus(QStringLiteral("Saved profile: %1").arg(name));
     }
     void loadNamedProfile() {
         if (active_ || capturePending_ || profiles_->currentIndex() < 0) return;
@@ -1193,23 +1337,82 @@ private:
         settings.beginGroup(QStringLiteral("profiles"));
         if (!settings.childGroups().contains(name)) return;
         settings.beginGroup(name);
+        // Older profiles without shortcut keys remain compatible.
+        if (settings.contains(QStringLiteral("shortcutStop"))) {
+            ShortcutOptions keys = shortcutValues();
+            keys.enableStart = settings.value(QStringLiteral("shortcutEnableStart"), keys.enableStart).toBool();
+            keys.enablePick = settings.value(QStringLiteral("shortcutEnablePick"), keys.enablePick).toBool();
+            keys.start = QKeySequence(settings.value(QStringLiteral("shortcutStart"),
+                                      keys.start.toString(QKeySequence::PortableText)).toString());
+            keys.stop = QKeySequence(settings.value(QStringLiteral("shortcutStop"),
+                                     keys.stop.toString(QKeySequence::PortableText)).toString());
+            keys.pick = QKeySequence(settings.value(QStringLiteral("shortcutPick"),
+                                     keys.pick.toString(QKeySequence::PortableText)).toString());
+            bool valid = true;
+#ifdef _WIN32
+            valid = validateShortcuts(keys);
+            if (valid && hotkeys_) valid = hotkeys_->configure(keys);
+#endif
+            if (!valid) {
+                settings.endGroup();
+                settings.endGroup();
+                QMessageBox::warning(this, uiText(QStringLiteral("Profiles")),
+                    uiText(QStringLiteral("Profile shortcut unavailable. No settings were changed.")));
+                return;
+            }
+            const QSignalBlocker a(enableStartShortcut_);
+            const QSignalBlocker b(enablePickShortcut_);
+            const QSignalBlocker c(startShortcut_);
+            const QSignalBlocker d(stopShortcut_);
+            const QSignalBlocker e(pickShortcut_);
+            enableStartShortcut_->setChecked(keys.enableStart);
+            enablePickShortcut_->setChecked(keys.enablePick);
+            startShortcut_->setKeySequence(keys.start);
+            stopShortcut_->setKeySequence(keys.stop);
+            pickShortcut_->setKeySequence(keys.pick);
+            startShortcut_->setEnabled(keys.enableStart);
+            pickShortcut_->setEnabled(keys.enablePick);
+            // Persist the loaded bindings for subsequent launches.
+            QSettings userSettings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            userSettings.setValue(QStringLiteral("shortcuts/enableStart"), keys.enableStart);
+            userSettings.setValue(QStringLiteral("shortcuts/enablePick"), keys.enablePick);
+            userSettings.setValue(QStringLiteral("shortcuts/start"), keys.start.toString(QKeySequence::PortableText));
+            userSettings.setValue(QStringLiteral("shortcuts/stop"), keys.stop.toString(QKeySequence::PortableText));
+            userSettings.setValue(QStringLiteral("shortcuts/pick"), keys.pick.toString(QKeySequence::PortableText));
+            refreshShortcutLabels();
+        }
         restoreFields(settings);
+        const QString preferredLanguage = settings.value(QStringLiteral("language"), language_).toString();
         settings.endGroup();
         settings.endGroup();
+        if (preferredLanguage == QStringLiteral("en") || preferredLanguage == QStringLiteral("ru")) {
+            language_ = preferredLanguage;
+            const QSignalBlocker block(languageSelector_);
+            languageSelector_->setCurrentIndex(language_ == QStringLiteral("ru") ? 1 : 0);
+            QSettings userSettings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            userSettings.setValue(QStringLiteral("ui/language"), language_);
+            applyQtTranslator();
+            localizeUi();
+        }
         saveLastSettings();
-        status_->setText(QStringLiteral("Loaded profile: %1").arg(name));
+        setStatus(QStringLiteral("Loaded profile: %1").arg(name));
     }
     void deleteNamedProfile() {
         if (active_ || capturePending_ || profiles_->currentIndex() < 0) return;
         const auto name = profiles_->currentText();
-        if (QMessageBox::question(this, QStringLiteral("Delete profile"),
-            QStringLiteral("Delete saved profile '%1'?").arg(name)) != QMessageBox::Yes) return;
+        if (QMessageBox::question(this, uiText(QStringLiteral("Delete profile")),
+            uiText(QStringLiteral("Delete saved profile '%1'?")).arg(name)) != QMessageBox::Yes) return;
         QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
         settings.remove(QStringLiteral("profiles/") + name);
         refreshProfiles();
-        status_->setText(QStringLiteral("Deleted profile: %1").arg(name));
+        setStatus(QStringLiteral("Deleted profile: %1").arg(name));
     }
 
+    std::unique_ptr<QTranslator> qtTranslator_;
+    QString language_{QStringLiteral("en")};
+    QString lastStatusEnglish_{QStringLiteral("Ready")};
+    QString savedWindowTitle_;
+    QComboBox* languageSelector_{nullptr};
     QListWidget* navigation_{nullptr};
     QStackedWidget* pages_{nullptr};
     QKeySequenceEdit* startShortcut_{nullptr};
@@ -1306,6 +1509,22 @@ int main(int argc, char* argv[]) {
     )"));
     MainWindow window;
     window.show();
+    if (app.arguments().contains(QStringLiteral("--smoke-test-language"))) {
+        QTimer::singleShot(80, &app, [&app, &window] {
+            auto* language = window.findChild<QComboBox*>(QStringLiteral("uiLanguage"));
+            auto* navigation = window.findChild<QListWidget*>(QStringLiteral("navigation"));
+            bool pass = language && navigation && navigation->count() == 6;
+            if (pass) {
+                language->setCurrentIndex(1);
+                pass &= navigation->item(0)->text() == QString::fromUtf8("Автокликер");
+                pass &= navigation->item(5)->text() == QString::fromUtf8("Настройки");
+                language->setCurrentIndex(0);
+                pass &= navigation->item(0)->text() == QStringLiteral("Auto Clicker");
+            }
+            if (!pass) qCritical() << "Language switching test failed";
+            app.exit(pass ? 0 : 1);
+        });
+    }
     if (app.arguments().contains(QStringLiteral("--smoke-test-ui"))) {
         // Headless-ish layout check: does not send clicks or register a macro.
         QTimer::singleShot(50, &app, [&app, &window] {
@@ -1324,7 +1543,7 @@ int main(int argc, char* argv[]) {
             fieldsHaveMinimumHeight &= window.findChild<QSpinBox*>(QStringLiteral("coordinateX")) != nullptr;
             fieldsHaveMinimumHeight &= window.findChild<QSpinBox*>(QStringLiteral("coordinateY")) != nullptr;
             const auto* nav = window.findChild<QListWidget*>(QStringLiteral("navigation"));
-            fieldsHaveMinimumHeight &= nav != nullptr && nav->count() == 5;
+            fieldsHaveMinimumHeight &= nav != nullptr && nav->count() == 6;
             auto* fixed = window.findChild<QCheckBox*>(QStringLiteral("optionUseFixedPosition"));
             auto* bound = window.findChild<QCheckBox*>(QStringLiteral("optionLimitToWindow"));
             auto* positionMode = window.findChild<QComboBox*>(QStringLiteral("positionMode"));
@@ -1365,7 +1584,7 @@ int main(int argc, char* argv[]) {
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutStop")) != nullptr;
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutPick")) != nullptr;
             const auto scrolls = window.findChildren<QScrollArea*>();
-            fieldsHaveMinimumHeight &= scrolls.size() == 5;
+            fieldsHaveMinimumHeight &= scrolls.size() == 6;
             if (!fieldsHaveMinimumHeight) {
                 qCritical() << "ClickNova UI test failed: fields are compressed or scrolling is unavailable";
             }

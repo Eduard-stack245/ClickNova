@@ -113,3 +113,8 @@ __pycache__/
 /examples/
 /schemas/
 /.github/
+
+# Extra local profile exports and UI settings (not repository assets)
+*.clicknova-profile.json
+*.clicknova.ini
+/user-settings/

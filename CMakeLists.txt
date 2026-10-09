@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.20)
-project(ClickNova VERSION 0.4.2 LANGUAGES CXX)
+project(ClickNova VERSION 0.4.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,7 +40,7 @@ if(CLICKNOVA_BUILD_GUI)
       ${CMAKE_CURRENT_BINARY_DIR}/generated/clicknova/version.hpp
       @ONLY)
 
-  qt_add_executable(ClickNova WIN32 src/gui/main.cpp src/platform/window_target.cpp)
+  qt_add_executable(ClickNova WIN32 src/gui/main.cpp src/gui/ui_translation.hpp src/platform/window_target.cpp)
   target_include_directories(ClickNova PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
   target_link_libraries(ClickNova PRIVATE Qt6::Widgets clicknova_core)
   if(WIN32)
@@ -48,7 +48,7 @@ if(CLICKNOVA_BUILD_GUI)
   endif()
   target_compile_features(ClickNova PRIVATE cxx_std_20)
   if(MSVC)
-    target_compile_options(ClickNova PRIVATE /W4 /permissive-)
+    target_compile_options(ClickNova PRIVATE /W4 /permissive- /utf-8)
   else()
     target_compile_options(ClickNova PRIVATE -Wall -Wextra -Wpedantic)
   endif()
@@ -64,6 +64,7 @@ if(CLICKNOVA_BUILD_GUI)
   if(BUILD_TESTING)
     # Layout regression after resizing the main window to its minimum size.
     add_test(NAME gui_layout_smoke COMMAND ClickNova --smoke-test-ui)
+    add_test(NAME gui_language_smoke COMMAND ClickNova --smoke-test-language)
     if(WIN32)
       add_test(NAME gui_shortcuts_smoke COMMAND ClickNova --smoke-test-shortcuts)
     endif()
