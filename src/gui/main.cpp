@@ -4,6 +4,7 @@
 #include <QAbstractSpinBox>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QColor>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
@@ -22,6 +23,8 @@
 #include <QEvent>
 #include <QHash>
 #include <QVariant>
+#include <QVariantList>
+#include <QVariantMap>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QRegularExpression>
@@ -46,6 +49,8 @@
 #include <memory>
 #include <utility>
 #include "ui_translation.hpp"
+#include "sequence_editor.hpp"
+#include "clicknova/sequence.hpp"
 #include "clicknova/version.hpp"
 #include "clicknova/window_target.hpp"
 
@@ -235,7 +240,8 @@ private:
 
 bool isSmokeMode() {
     return qApp->arguments().contains(QStringLiteral("--smoke-test-ui")) ||
-           qApp->arguments().contains(QStringLiteral("--smoke-test-language"));
+           qApp->arguments().contains(QStringLiteral("--smoke-test-language")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-sequence"));
 }
 
 class MainWindow final : public QMainWindow {
@@ -248,7 +254,7 @@ public:
         if (language_ != QStringLiteral("ru") || isSmokeMode()) language_ = QStringLiteral("en");
         applyQtTranslator();
         resize(1040, 760);
-        setMinimumSize(460, 360);
+        setMinimumSize(760, 540);
         auto* root = new QWidget(this);
         auto* layout = new QVBoxLayout(root);
         layout->setContentsMargins(16, 14, 16, 14);
@@ -261,11 +267,13 @@ public:
         body->setSpacing(16);
         navigation_ = new QListWidget(root);
         navigation_->setObjectName(QStringLiteral("navigation"));
-        navigation_->setFixedWidth(175);
+        navigation_->setFixedWidth(208);
+        navigation_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        navigation_->setTextElideMode(Qt::ElideRight);
         navigation_->setSpacing(6);
         navigation_->addItems({QStringLiteral("Auto Clicker"), QStringLiteral("Position"),
-                               QStringLiteral("Windows"), QStringLiteral("Profiles"),
-                               QStringLiteral("Shortcuts"), QStringLiteral("Settings")});
+                               QStringLiteral("Windows"), QStringLiteral("Sequence"),
+                               QStringLiteral("Profiles"), QStringLiteral("Shortcuts"), QStringLiteral("Settings")});
         body->addWidget(navigation_);
         pages_ = new QStackedWidget(root);
         body->addWidget(pages_, 1);
@@ -297,13 +305,15 @@ public:
                                         QStringLiteral("Optional: set a fixed position when enabled on the Auto Clicker page. Otherwise the current cursor is used."));
         auto* windowsPage = createPage(QStringLiteral("Windows"),
                                        QStringLiteral("Optional: select a window to restrict clicking. This is NOT background input; the target must stay foreground."));
+        auto* sequencePage = createPage(QStringLiteral("Sequence"),
+                                         QStringLiteral("Optional: execute multiple click points in order, with a separate delay for each step."));
         auto* profilePage = createPage(QStringLiteral("Profiles"),
                                        QStringLiteral("Save and restore your frequently used configurations."));
         auto* shortcutsPage = createPage(QStringLiteral("Shortcuts"),
                                          QStringLiteral("Customize keyboard controls to avoid conflicts with other apps."));
         auto* settingsPage = createPage(QStringLiteral("Settings"),
                                         QStringLiteral("Choose the display language. Changes apply immediately."));
-        for (auto* page : {clickPage, positionPage, windowsPage, profilePage, shortcutsPage, settingsPage})
+        for (auto* page : {clickPage, positionPage, windowsPage, sequencePage, profilePage, shortcutsPage, settingsPage})
             page->addStretch();
         connect(navigation_, &QListWidget::currentRowChanged, this, [this](int index) {
             if (index < 0) return;
@@ -340,7 +350,8 @@ public:
         count_->setRange(1, 1000000);
         count_->setValue(100);
         count_->setEnabled(false);
-        form->addRow(QStringLiteral("Click count"), count_);
+        countLabel_ = new QLabel(QStringLiteral("Click count"));
+        form->addRow(countLabel_, count_);
         connect(infinite_, &QCheckBox::toggled, count_, [this](bool infinite) { count_->setEnabled(!infinite); });
 
         auto* positionGroup = new QGroupBox(QStringLiteral("Cursor Position"));
@@ -464,7 +475,7 @@ public:
         optionsLayout->setSpacing(12);
         auto* optionsIntro = new QLabel(QStringLiteral(
             "The auto clicker always runs. Choose neither option, either option, or both. "
-            "The Position and Windows pages only configure the options you enable here."));
+            "The Position and Windows pages configure optional settings; Sequence replaces single-point clicking."));
         optionsIntro->setWordWrap(true);
         optionsIntro->setObjectName(QStringLiteral("subheading"));
         optionsLayout->addWidget(optionsIntro);
@@ -484,6 +495,14 @@ public:
         windowRow->addWidget(quickWindow_, 1);
         windowRow->addWidget(editWindow_);
         optionsLayout->addLayout(windowRow);
+
+        auto* sequenceRow = new QHBoxLayout;
+        quickSequence_ = new QCheckBox(QStringLiteral("Use click sequence instead of a single point"));
+        quickSequence_->setObjectName(QStringLiteral("optionUseSequence"));
+        editSequence_ = new QPushButton(QStringLiteral("Edit sequence..."));
+        sequenceRow->addWidget(quickSequence_, 1);
+        sequenceRow->addWidget(editSequence_);
+        optionsLayout->addLayout(sequenceRow);
 
         auto* summaryTitle = new QLabel(QStringLiteral("ACTIVE SETUP"));
         summaryTitle->setObjectName(QStringLiteral("subheading"));
@@ -508,6 +527,14 @@ public:
             if (active_ || capturePending_) return;
             targetMode_->setCurrentIndex(enabled ? 1 : 0);
             updateTargetInputs();
+        });
+        connect(quickSequence_, &QCheckBox::toggled, this, [this](bool) {
+            updateQuickOptions();
+            if (!isSmokeMode() && !restoringSettings_) saveLastSettings();
+        });
+        connect(editSequence_, &QPushButton::clicked, this, [this] {
+            sequenceEditor_->setInitialPoint(x_->value(), y_->value(), button_->currentIndex(), interval_->value());
+            navigation_->setCurrentRow(3);
         });
         connect(editPosition_, &QPushButton::clicked, this, [this] { navigation_->setCurrentRow(1); });
         connect(editWindow_, &QPushButton::clicked, this, [this] { navigation_->setCurrentRow(2); });
@@ -574,6 +601,22 @@ public:
         connect(deleteProfile_, &QPushButton::clicked, this, [this] { deleteNamedProfile(); });
         connect(profiles_, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [this](int) { updateProfileActions(); });
+
+        auto* sequenceGroup = new QGroupBox(QStringLiteral("Click Sequence Editor"));
+        auto* sequenceGroupLayout = new QVBoxLayout(sequenceGroup);
+        sequenceEditor_ = new SequenceEditor(sequenceGroup);
+        sequenceEditor_->setObjectName(QStringLiteral("sequenceEditor"));
+        sequenceEditor_->setSpaceProvider([this] {
+            return targetMode_->currentIndex() == 1
+                ? clicknova::sequence::Space::Client : clicknova::sequence::Space::Screen;
+        });
+        sequenceEditor_->onCapture = [this] { captureSequencePoint(); };
+        sequenceEditor_->onChange = [this] {
+            updateQuickOptions();
+            if (!isSmokeMode() && !restoringSettings_) saveLastSettings();
+        };
+        sequenceGroupLayout->addWidget(sequenceEditor_);
+        sequencePage->insertWidget(sequencePage->count() - 1, sequenceGroup);
 
         auto* shortcutsGroup = new QGroupBox(QStringLiteral("Keyboard Controls"));
         auto* shortcutsForm = new QFormLayout(shortcutsGroup);
@@ -660,6 +703,7 @@ public:
         connect(&clickTimer_, &QTimer::timeout, this, [this] { click(); });
         connect(&countdownTimer_, &QTimer::timeout, this, [this] { countdownTick(); });
         clickTimer_.setTimerType(Qt::PreciseTimer);
+        clickTimer_.setSingleShot(true);
 #ifdef _WIN32
         if (!isSmokeMode()) {
             hotkeys_ = std::make_unique<Hotkeys>([this] { start(); }, [this] { stop(); },
@@ -760,13 +804,14 @@ private:
                 combo->setItemText(i, uiText(source[i]));
         }
         for (int i = 0; i < navigation_->count(); ++i) {
-            static const QStringList names = {"Auto Clicker", "Position", "Windows", "Profiles", "Shortcuts", "Settings"};
+            static const QStringList names = {"Auto Clicker", "Position", "Windows", "Sequence", "Profiles", "Shortcuts", "Settings"};
             navigation_->item(i)->setText(uiText(names[i]));
         }
         if (profiles_) profiles_->setPlaceholderText(uiText(QStringLiteral("Choose a saved profile")));
         if (targetWindows_) targetWindows_->setPlaceholderText(uiText(QStringLiteral("Select a running window")));
         if (positionMode_) positionMode_->setItemText(1, uiText(targetMode_->currentIndex() == 1
             ? QStringLiteral("Fixed client coordinates") : QStringLiteral("Fixed screen coordinates")));
+        if (sequenceEditor_) sequenceEditor_->setLanguage(language_);
         refreshShortcutLabels();
         updateQuickOptions();
         updateTargetInputs();
@@ -885,15 +930,35 @@ private:
                 return;
             }
         }
+        if (quickSequence_->isChecked()) {
+            clicknova::sequence::Plan plan{sequenceEditor_->steps(), count_->value(), infinite_->isChecked()};
+            const auto error = clicknova::sequence::validate(plan);
+            if (!error.empty()) {
+                navigation_->setCurrentRow(3);
+                setStatus(QString::fromStdString(error));
+                return;
+            }
+            const auto expected = targetMode_->currentIndex() == 1
+                ? clicknova::sequence::Space::Client : clicknova::sequence::Space::Screen;
+            for (const auto& step : plan.steps) {
+                if (step.space != expected) {
+                    navigation_->setCurrentRow(3);
+                    setStatus(QStringLiteral("Sequence coordinates do not match the selected target mode."));
+                    return;
+                }
+            }
+            sequenceCursor_ = std::make_unique<clicknova::sequence::Cursor>(std::move(plan));
+        } else sequenceCursor_.reset();
         // Reserve Stop only for the running session. Idle shortcuts do not
         // steal keys from games, editors or other applications.
         if (hotkeys_ && !hotkeys_->setRunning(true)) {
-            navigation_->setCurrentRow(4);
+            navigation_->setCurrentRow(5);
             setStatus(QStringLiteral("Stop shortcut is in use. Choose another shortcut before starting."));
             return;
         }
         saveLastSettings();
         active_ = true;
+        sequenceEditor_->setLocked(true);
         setShortcutEditorsEnabled(false);
         done_ = 0;
         secondsToStart_ = 3;
@@ -926,7 +991,10 @@ private:
             return;
         }
         countdownTimer_.stop();
-        clickTimer_.start(interval_->value());
+        if (sequenceCursor_) {
+            if (auto step = sequenceCursor_->peek()) clickTimer_.start(step->delayMs);
+            else { stop(); return; }
+        } else clickTimer_.start(interval_->value());
         setStatus(QStringLiteral("Running · %1 to stop").arg(stopHotkeyLabel()));
     }
     void click() {
@@ -934,9 +1002,11 @@ private:
 #ifdef _WIN32
         constexpr DWORD down[] = {MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_MIDDLEDOWN};
         constexpr DWORD up[] = {MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEUP};
-        const int buttonIndex = button_->currentIndex();
-        int screenX = x_->value();
-        int screenY = y_->value();
+        const auto step = sequenceCursor_ ? sequenceCursor_->peek() : std::nullopt;
+        if (sequenceCursor_ && !step) { stop(); return; }
+        const int buttonIndex = step ? step->button : button_->currentIndex();
+        int screenX = step ? step->x : x_->value();
+        int screenY = step ? step->y : y_->value();
         if (targetMode_->currentIndex() == 1) {
             if (!selectedTarget_) {
                 stopWithReason(uiText(QStringLiteral("Target window is not selected.")));
@@ -944,9 +1014,10 @@ private:
             }
             using clicknova::platform::TargetCheck;
             TargetCheck state = TargetCheck::Missing;
-            if (positionMode_->currentIndex() == 1) {
+            if (step || positionMode_->currentIndex() == 1) {
                 state = clicknova::platform::resolveClientPoint(
-                    *selectedTarget_, x_->value(), y_->value(), screenX, screenY);
+                    *selectedTarget_, step ? step->x : x_->value(),
+                    step ? step->y : y_->value(), screenX, screenY);
             } else {
                 POINT cursor{};
                 if (GetCursorPos(&cursor)) {
@@ -960,7 +1031,7 @@ private:
                 return;
             }
         }
-        if (positionMode_->currentIndex() == 1 && !SetCursorPos(screenX, screenY)) {
+        if ((step || positionMode_->currentIndex() == 1) && !SetCursorPos(screenX, screenY)) {
             stopWithReason(QStringLiteral("Windows could not move the cursor to the selected position."));
             return;
         }
@@ -980,7 +1051,14 @@ private:
         }
         ++done_;
         setStatus(QStringLiteral("Running · clicks: %1 · %2 to stop").arg(done_).arg(stopHotkeyLabel()));
-        if (!infinite_->isChecked() && done_ >= count_->value()) stop();
+        if (sequenceCursor_) {
+            sequenceCursor_->advance();
+            const auto next = sequenceCursor_->peek();
+            if (next) clickTimer_.start(next->delayMs);
+            else stop();
+        } else if (!infinite_->isChecked() && done_ >= count_->value()) {
+            stop();
+        } else clickTimer_.start(interval_->value());
 #endif
     }
     void stop() {
@@ -988,7 +1066,11 @@ private:
         countdownTimer_.stop();
         if (!active_) return;
         active_ = false;
+        sequenceCursor_.reset();
+        sequenceEditor_->setLocked(false);
+#ifdef _WIN32
         if (hotkeys_) hotkeys_->setRunning(false);
+#endif
         setShortcutEditorsEnabled(true);
         button_->setEnabled(true);
         interval_->setEnabled(true);
@@ -1013,6 +1095,7 @@ private:
         if (!quickPosition_ || !quickWindow_ || !positionMode_ || !targetMode_) return;
         const bool fixed = positionMode_->currentIndex() == 1;
         const bool bound = targetMode_->currentIndex() == 1;
+        const bool sequenced = quickSequence_ && quickSequence_->isChecked();
         {
             const QSignalBlocker blockPosition(quickPosition_);
             const QSignalBlocker blockWindow(quickWindow_);
@@ -1020,12 +1103,30 @@ private:
             quickWindow_->setChecked(bound);
         }
         const bool editable = !active_ && !capturePending_;
-        quickPosition_->setEnabled(editable);
+        quickPosition_->setEnabled(editable && !sequenced);
+        button_->setEnabled(editable && !sequenced);
+        interval_->setEnabled(editable && !sequenced);
+        positionMode_->setEnabled(editable && !sequenced);
+        infinite_->setText(uiText(sequenced ? QStringLiteral("Repeat indefinitely")
+                                           : QStringLiteral("Unlimited clicks")));
+        if (countLabel_) countLabel_->setText(uiText(sequenced ? QStringLiteral("Repeat count")
+                                                              : QStringLiteral("Click count")));
         quickWindow_->setEnabled(editable);
-        editPosition_->setEnabled(editable);
+        editPosition_->setEnabled(editable && !sequenced);
+        quickSequence_->setEnabled(editable);
+        editSequence_->setEnabled(editable);
         editWindow_->setEnabled(editable);
-        navigation_->item(1)->setText(uiText(fixed ? QStringLiteral("Position  · ON") : QStringLiteral("Position  · OFF")));
-        navigation_->item(2)->setText(uiText(bound ? QStringLiteral("Windows  · ON") : QStringLiteral("Windows  · OFF")));
+        // Keep navigation labels short. Activity appears in the tooltip and main overview.
+        for (const auto& entry : {std::pair{1, fixed}, std::pair{2, bound}, std::pair{3, sequenced}}) {
+            auto* item = navigation_->item(entry.first);
+            const QString name = uiText(entry.first == 1 ? QStringLiteral("Position") :
+                                        entry.first == 2 ? QStringLiteral("Windows") :
+                                                           QStringLiteral("Sequence"));
+            item->setText(entry.second ? QStringLiteral("● ") + name : name);
+            item->setToolTip(name + QStringLiteral(" — ") + uiText(entry.second ? QStringLiteral("Enabled") : QStringLiteral("Disabled")));
+            item->setData(Qt::UserRole, entry.second);
+            item->setForeground(entry.second ? QColor(QStringLiteral("#81aaff")) : QColor(QStringLiteral("#e9eef6")));
+        }
         const QString position = fixed
             ? (bound ? uiText(QStringLiteral("Fixed point in target window: (%1, %2)"))
                          : uiText(QStringLiteral("Fixed point on screen: (%1, %2)")))
@@ -1036,7 +1137,12 @@ private:
                 ? uiText(QStringLiteral("Selected window: %1")).arg(QString::fromStdWString(selectedTarget_->title))
                 : uiText(QStringLiteral("Selected window: NOT SELECTED")))
             : uiText(QStringLiteral("Any foreground window (global mouse)"));
-        activeSetup_->setText(uiText(QStringLiteral("%1 · Every %2 ms · %3\n%4\n%5"))
+        if (sequenced) {
+            activeSetup_->setText(uiText(QStringLiteral("Click sequence: %1 steps · %2 passes\n%3"))
+                .arg(sequenceEditor_ ? static_cast<int>(sequenceEditor_->steps().size()) : 0)
+                .arg(infinite_->isChecked() ? uiText(QStringLiteral("Unlimited")) : QString::number(count_->value()))
+                .arg(target));
+        } else activeSetup_->setText(uiText(QStringLiteral("%1 · Every %2 ms · %3\n%4\n%5"))
             .arg(button_->currentText())
             .arg(interval_->value())
             .arg(infinite_->isChecked() ? uiText(QStringLiteral("Unlimited"))
@@ -1052,7 +1158,8 @@ private:
     }
 
     void updatePositionInputs() {
-        const bool enabled = positionMode_->currentIndex() == 1 && !active_ && !capturePending_;
+        const bool enabled = positionMode_->currentIndex() == 1 && !active_ && !capturePending_ &&
+                             !(quickSequence_ && quickSequence_->isChecked());
         x_->setEnabled(enabled);
         y_->setEnabled(enabled);
 #ifdef _WIN32
@@ -1216,6 +1323,47 @@ private:
         });
 #endif
     }
+    void captureSequencePoint() {
+#ifdef _WIN32
+        if (active_ || capturePending_ || !sequenceEditor_) return;
+        if (targetMode_->currentIndex() == 1 && !selectedTarget_) {
+            setStatus(QStringLiteral("Select a target window before starting."));
+            return;
+        }
+        capturePending_ = true;
+        sequenceEditor_->setLocked(true);
+        start_->setEnabled(false);
+        setStatus(QStringLiteral("Move the cursor to the target. Capturing in 3 seconds."));
+        QTimer::singleShot(3000, this, [this] {
+            capturePending_ = false;
+            sequenceEditor_->setLocked(false);
+            start_->setEnabled(true);
+            POINT point{};
+            if (!GetCursorPos(&point)) {
+                setStatus(QStringLiteral("Unable to read the cursor position."));
+                return;
+            }
+            const auto space = targetMode_->currentIndex() == 1
+                ? clicknova::sequence::Space::Client : clicknova::sequence::Space::Screen;
+            if (space == clicknova::sequence::Space::Client) {
+                if (!selectedTarget_) { setStatus(QStringLiteral("Target window is not selected.")); return; }
+                const auto status = clicknova::platform::checkScreenPoint(*selectedTarget_, point.x, point.y);
+                if (status != clicknova::platform::TargetCheck::Ready) {
+                    setStatus(QString::fromUtf8(clicknova::platform::targetCheckMessage(status)));
+                    return;
+                }
+                HWND hwnd = reinterpret_cast<HWND>(selectedTarget_->handle);
+                if (!ScreenToClient(hwnd, &point)) {
+                    setStatus(QStringLiteral("Unable to read the cursor position."));
+                    return;
+                }
+            }
+            sequenceEditor_->addCapturedPoint(point.x, point.y, space);
+            setStatus(QStringLiteral("Sequence point captured."));
+        });
+#endif
+    }
+
     static void saveFields(QSettings& settings, const MainWindow& window) {
         settings.setValue(QStringLiteral("button"), window.button_->currentIndex());
         settings.setValue(QStringLiteral("interval"), window.interval_->value());
@@ -1239,6 +1387,18 @@ private:
                           window.selectedTarget_
                             ? QString::fromStdWString(window.selectedTarget_->title)
                             : window.savedWindowTitle_);
+        settings.setValue(QStringLiteral("sequenceEnabled"), window.quickSequence_->isChecked());
+        QVariantList storedSteps;
+        for (const auto& step : window.sequenceEditor_->steps()) {
+            QVariantMap map;
+            map.insert(QStringLiteral("x"), step.x);
+            map.insert(QStringLiteral("y"), step.y);
+            map.insert(QStringLiteral("button"), step.button);
+            map.insert(QStringLiteral("delayMs"), step.delayMs);
+            map.insert(QStringLiteral("space"), static_cast<int>(step.space));
+            storedSteps.append(map);
+        }
+        settings.setValue(QStringLiteral("sequenceSteps"), storedSteps);
         const ShortcutOptions keys = window.shortcutValues();
         settings.setValue(QStringLiteral("shortcutEnableStart"), keys.enableStart);
         settings.setValue(QStringLiteral("shortcutEnablePick"), keys.enablePick);
@@ -1271,6 +1431,28 @@ private:
         const QPoint point = mode == 1 ? clientCoordinates_ : screenCoordinates_;
         x_->setValue(point.x());
         y_->setValue(point.y());
+        // Missing keys in older profiles disable the new feature safely.
+        std::vector<clicknova::sequence::Step> restored;
+        const auto records = settings.value(QStringLiteral("sequenceSteps")).toList();
+        bool valid = records.size() <= 128;
+        for (const QVariant& record : records) {
+            const auto map = record.toMap();
+            if (map.size() < 5) { valid = false; break; }
+            restored.push_back({map.value(QStringLiteral("x")).toInt(),
+                                map.value(QStringLiteral("y")).toInt(),
+                                map.value(QStringLiteral("button")).toInt(),
+                                map.value(QStringLiteral("delayMs")).toInt(),
+                                static_cast<clicknova::sequence::Space>(map.value(QStringLiteral("space")).toInt())});
+        }
+        if (valid && !restored.empty()) {
+            clicknova::sequence::Plan preview{restored, 1, false};
+            valid = clicknova::sequence::validate(preview).empty();
+        }
+        restoringSettings_ = true;
+        sequenceEditor_->setSteps(valid ? restored : std::vector<clicknova::sequence::Step>{});
+        quickSequence_->setChecked(valid && !restored.empty() &&
+                                   settings.value(QStringLiteral("sequenceEnabled"), false).toBool());
+        restoringSettings_ = false;
         updateTargetInputs();
         updatePositionInputs();
     }
@@ -1424,11 +1606,16 @@ private:
     QComboBox* button_{nullptr};
     QSpinBox* interval_{nullptr};
     QSpinBox* count_{nullptr};
+    QLabel* countLabel_{nullptr};
     QCheckBox* infinite_{nullptr};
     QComboBox* positionMode_{nullptr};
     QComboBox* targetMode_{nullptr};
     QCheckBox* quickPosition_{nullptr};
     QCheckBox* quickWindow_{nullptr};
+    QCheckBox* quickSequence_{nullptr};
+    QPushButton* editSequence_{nullptr};
+    SequenceEditor* sequenceEditor_{nullptr};
+    std::unique_ptr<clicknova::sequence::Cursor> sequenceCursor_;
     QPushButton* editPosition_{nullptr};
     QPushButton* editWindow_{nullptr};
     QLabel* activeSetup_{nullptr};
@@ -1451,6 +1638,7 @@ private:
     QPushButton* loadProfile_{nullptr};
     QPushButton* deleteProfile_{nullptr};
     bool capturePending_{false};
+    bool restoringSettings_{false};
     QPushButton* start_{nullptr};
     QPushButton* stop_{nullptr};
     QLabel* status_{nullptr};
@@ -1495,6 +1683,13 @@ int main(int argc, char* argv[]) {
         QListWidget#navigation::item { border-radius: 7px; padding: 13px 9px; }
         QListWidget#navigation::item:selected { background: #294e92; color: #ffffff; }
         QListWidget#navigation::item:hover:!selected { background: #293341; }
+        QTableWidget { background: #1d222b; alternate-background-color: #242b36;
+                       gridline-color: #384455; border: 1px solid #394250; border-radius: 7px; }
+        QTableWidget::item { padding: 6px; }
+        QTableWidget::item:selected { background: #294e92; color: white; }
+        QHeaderView::section { background: #293341; border: 0; border-bottom: 1px solid #485467;
+                               padding: 9px; color: #d6e1f0; }
+        QPushButton#sequenceAddPoint { background: #285bd6; color: white; font-weight: 700; }
         QLabel#subheading { color: #aab5c5; }
         QLabel#caution { color: #ebc581; }
         QGroupBox { border: 1px solid #394250; border-radius: 10px; margin-top: 12px; }
@@ -1513,15 +1708,44 @@ int main(int argc, char* argv[]) {
         QTimer::singleShot(80, &app, [&app, &window] {
             auto* language = window.findChild<QComboBox*>(QStringLiteral("uiLanguage"));
             auto* navigation = window.findChild<QListWidget*>(QStringLiteral("navigation"));
-            bool pass = language && navigation && navigation->count() == 6;
+            bool pass = language && navigation && navigation->count() == 7;
             if (pass) {
                 language->setCurrentIndex(1);
                 pass &= navigation->item(0)->text() == QString::fromUtf8("Автокликер");
-                pass &= navigation->item(5)->text() == QString::fromUtf8("Настройки");
+                pass &= navigation->item(6)->text() == QString::fromUtf8("Настройки");
                 language->setCurrentIndex(0);
                 pass &= navigation->item(0)->text() == QStringLiteral("Auto Clicker");
             }
             if (!pass) qCritical() << "Language switching test failed";
+            app.exit(pass ? 0 : 1);
+        });
+    }
+    if (app.arguments().contains(QStringLiteral("--smoke-test-sequence"))) {
+        QTimer::singleShot(80, &app, [&app, &window] {
+            auto* sequence = window.findChild<QCheckBox*>(QStringLiteral("optionUseSequence"));
+            auto* table = window.findChild<QTableWidget*>(QStringLiteral("sequenceSteps"));
+            auto* nav = window.findChild<QListWidget*>(QStringLiteral("navigation"));
+            bool pass = sequence && table && nav && nav->count() == 7;
+            if (pass) {
+                auto* add = window.findChild<QPushButton*>(QStringLiteral("sequenceAddPoint"));
+                pass &= add != nullptr;
+                pass &= table->columnCount() == 4 &&
+                        table->horizontalScrollBarPolicy() == Qt::ScrollBarAlwaysOff;
+                if (add) { add->click(); pass &= table->rowCount() == 1; }
+                auto* x = window.findChild<QSpinBox*>(QStringLiteral("sequenceCoordinateX"));
+                auto* save = window.findChild<QPushButton*>(QStringLiteral("sequenceUpdateSelected"));
+                pass &= x != nullptr && save != nullptr && save->isEnabled();
+                if (x && save) {
+                    x->setValue(217);
+                    save->click();
+                    pass &= table->item(0, 1) && table->item(0, 1)->text().contains(QStringLiteral("217"));
+                }
+                sequence->setChecked(true);
+                pass &= nav->item(3)->data(Qt::UserRole).toBool();
+                sequence->setChecked(false);
+                pass &= !nav->item(3)->data(Qt::UserRole).toBool();
+            }
+            if (!pass) qCritical() << "Sequence UI smoke test failed";
             app.exit(pass ? 0 : 1);
         });
     }
@@ -1543,7 +1767,8 @@ int main(int argc, char* argv[]) {
             fieldsHaveMinimumHeight &= window.findChild<QSpinBox*>(QStringLiteral("coordinateX")) != nullptr;
             fieldsHaveMinimumHeight &= window.findChild<QSpinBox*>(QStringLiteral("coordinateY")) != nullptr;
             const auto* nav = window.findChild<QListWidget*>(QStringLiteral("navigation"));
-            fieldsHaveMinimumHeight &= nav != nullptr && nav->count() == 6;
+            fieldsHaveMinimumHeight &= nav != nullptr && nav->count() == 7 &&
+                nav->horizontalScrollBarPolicy() == Qt::ScrollBarAlwaysOff;
             auto* fixed = window.findChild<QCheckBox*>(QStringLiteral("optionUseFixedPosition"));
             auto* bound = window.findChild<QCheckBox*>(QStringLiteral("optionLimitToWindow"));
             auto* positionMode = window.findChild<QComboBox*>(QStringLiteral("positionMode"));
@@ -1584,7 +1809,7 @@ int main(int argc, char* argv[]) {
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutStop")) != nullptr;
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutPick")) != nullptr;
             const auto scrolls = window.findChildren<QScrollArea*>();
-            fieldsHaveMinimumHeight &= scrolls.size() == 6;
+            fieldsHaveMinimumHeight &= scrolls.size() == 7;
             if (!fieldsHaveMinimumHeight) {
                 qCritical() << "ClickNova UI test failed: fields are compressed or scrolling is unavailable";
             }

@@ -29,13 +29,12 @@ Write-Host "ClickNova: configure with Qt at $QtRoot and MSVC v143" -ForegroundCo
 if ($LASTEXITCODE -ne 0) { throw 'Configuration failed. In Visual Studio Installer install MSVC v143 C++ x64/x86 build tools, then try again.' }
 & cmake --build $build --config Release --parallel
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+# Deploy Qt runtime before the GUI smoke tests, including a fresh build folder.
 $exe = Join-Path $build 'Release\ClickNova.exe'
-if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Build succeeded but ClickNova.exe is missing: $exe" }
-$deployTool = Join-Path $QtRoot 'bin\windeployqt.exe'
-if (-not (Test-Path -LiteralPath $deployTool -PathType Leaf)) { throw "Qt deployment tool not found: $deployTool" }
-Write-Host 'Deploying Qt runtime DLLs before GUI testing...' -ForegroundColor Cyan
-& $deployTool --release $exe
-if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed.' }
+$deployer = Join-Path $QtRoot 'bin\windeployqt.exe'
+if (-not (Test-Path -LiteralPath $deployer -PathType Leaf)) { throw 'windeployqt.exe is missing from the selected Qt kit.' }
+& $deployer --release $exe
+if ($LASTEXITCODE -ne 0) { throw 'Qt runtime deployment failed.' }
 & ctest --test-dir $build -C Release --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
 Write-Host "Built: $build\Release\ClickNova.exe" -ForegroundColor Green
