@@ -1,0 +1,115 @@
+# ClickNova - keep source, documentation, test fixtures, scripts, and project assets in Git.
+# Generated binaries, build trees, local settings, and user data must stay local.
+
+# CMake / IDE build directories (all variants used by ClickNova)
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/dist/
+/dist-*/
+/dist-windows/
+/artifacts/
+/.cache/
+/.qt/
+
+# CMake-generated files accidentally created in the source tree
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Testing/
+_autogen/
+*_autogen/
+
+# Visual Studio, VS Code, JetBrains and Qt Creator local metadata
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.vcxproj.user
+*.pro.user
+*.pro.user.*
+CMakeUserPresets.json
+
+# Native binary artifacts (build outputs, not source code)
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.pch
+*.tlog
+*.lastbuildstate
+*.app/
+
+# Generated Qt code
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Packages and release staging (created by CI, not stored in Git)
+/ClickNova-*.zip
+/ClickNova-*.7z
+/ClickNova-*.tar.gz
+*.msi
+*.msix
+*.AppImage
+*.deb
+*.rpm
+
+# Logs, temporary files, crash dumps, system files
+*.log
+*.tmp
+*.bak
+*.dmp
+*.stackdump
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local user profiles and private configuration
+/.clicknova/
+/user-data/
+/user-profiles/
+/user-macros/
+/.env
+/.env.*
+!/.env.example
+
+# Language/tool-specific caches used by auxiliary scripts
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Documentation and repository metadata are intentionally postponed for early commits.
+# The Apache-2.0 LICENSE is NOT ignored: an open-source distribution needs it.
+/README.md
+/QUICKSTART.md
+/QUICKSTART-RU.md
+/CHANGELOG.md
+/CONTRIBUTING.md
+/docs/
+/examples/
+/schemas/
+/.github/

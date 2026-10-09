@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Store text files consistently across Windows and Linux.
+* text=auto
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.in text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
