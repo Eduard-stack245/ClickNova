@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.20)
-project(ClickNova VERSION 0.5.1 LANGUAGES CXX)
+project(ClickNova VERSION 0.5.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(clicknova_core STATIC src/core.cpp src/window_guard.cpp src/sequence.cpp)
+add_library(clicknova_core STATIC src/core.cpp src/window_guard.cpp src/sequence.cpp src/sequence_preview.cpp src/sequence_conversion.cpp)
 target_include_directories(clicknova_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(clicknova_core PUBLIC cxx_std_20)
 if(MSVC)
@@ -26,6 +26,12 @@ if(BUILD_TESTING)
   add_executable(clicknova_sequence_tests tests/sequence_tests.cpp)
   target_link_libraries(clicknova_sequence_tests PRIVATE clicknova_core)
   add_test(NAME sequence_tests COMMAND clicknova_sequence_tests)
+  add_executable(clicknova_sequence_preview_tests tests/sequence_preview_tests.cpp)
+  target_link_libraries(clicknova_sequence_preview_tests PRIVATE clicknova_core)
+  add_test(NAME sequence_preview_tests COMMAND clicknova_sequence_preview_tests)
+  add_executable(clicknova_sequence_conversion_tests tests/sequence_conversion_tests.cpp)
+  target_link_libraries(clicknova_sequence_conversion_tests PRIVATE clicknova_core)
+  add_test(NAME sequence_conversion_tests COMMAND clicknova_sequence_conversion_tests)
   add_test(NAME license_consistency
       COMMAND ${CMAKE_COMMAND} "-DPROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-source-license.cmake)
@@ -43,7 +49,32 @@ if(CLICKNOVA_BUILD_GUI)
       ${CMAKE_CURRENT_BINARY_DIR}/generated/clicknova/version.hpp
       @ONLY)
 
-  qt_add_executable(ClickNova WIN32 src/gui/main.cpp src/gui/ui_translation.hpp src/gui/sequence_editor.hpp src/platform/window_target.cpp)
+  qt_add_executable(ClickNova WIN32
+    src/gui/main.cpp
+    src/gui/app_style.cpp
+    src/gui/app_style.hpp
+    src/gui/smoke_tests.cpp
+    src/gui/smoke_tests.hpp
+    src/gui/wrap_layout.cpp
+    src/gui/wrap_layout.hpp
+    src/gui/wheel_scroll_filter.cpp
+    src/gui/wheel_scroll_filter.hpp
+    src/gui/main_window.cpp
+    src/gui/main_window.hpp
+    src/gui/sequence_editor.cpp
+    src/gui/ui_translation.hpp
+    src/gui/sequence_editor.hpp
+    src/gui/window_chooser.hpp
+    src/gui/window_chooser.cpp
+    src/i18n/translations.cpp
+    src/i18n/translations.hpp
+    src/i18n/en/dictionary.cpp
+    src/i18n/ru/dictionary.cpp
+    src/storage/scenario_store.cpp
+    src/storage/scenario_codec.cpp
+    src/storage/scenario_store.hpp
+    src/platform/window_target.cpp
+    src/platform/windows/input_support.hpp)
   target_include_directories(ClickNova PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
   target_link_libraries(ClickNova PRIVATE Qt6::Widgets clicknova_core)
   if(WIN32)
@@ -67,8 +98,21 @@ if(CLICKNOVA_BUILD_GUI)
   if(BUILD_TESTING)
     # Layout regression after resizing the main window to its minimum size.
     add_test(NAME gui_layout_smoke COMMAND ClickNova --smoke-test-ui)
+    add_test(NAME gui_adaptive_smoke COMMAND ClickNova --smoke-test-adaptive)
     add_test(NAME gui_language_smoke COMMAND ClickNova --smoke-test-language)
+    add_test(NAME gui_workflows_smoke COMMAND ClickNova --smoke-test-workflows)
     add_test(NAME gui_sequence_smoke COMMAND ClickNova --smoke-test-sequence)
+    add_test(NAME gui_window_picker_smoke COMMAND ClickNova --smoke-test-window-picker)
+    add_test(NAME gui_scenarios_smoke COMMAND ClickNova --smoke-test-scenarios)
+    add_executable(clicknova_scenario_store_tests
+        tests/scenario_store_tests.cpp
+        src/storage/scenario_store.cpp
+        src/storage/scenario_codec.cpp
+        src/i18n/translations.cpp
+        src/i18n/en/dictionary.cpp
+        src/i18n/ru/dictionary.cpp)
+    target_link_libraries(clicknova_scenario_store_tests PRIVATE Qt6::Core clicknova_core)
+    add_test(NAME scenario_store_tests COMMAND clicknova_scenario_store_tests)
     if(WIN32)
       add_test(NAME gui_shortcuts_smoke COMMAND ClickNova --smoke-test-shortcuts)
     endif()

@@ -70,6 +70,14 @@ std::optional<WindowTarget> foregroundWindow() {
     return identify(GetAncestor(GetForegroundWindow(), GA_ROOT));
 }
 
+std::optional<WindowTarget> windowUnderCursor() {
+    POINT point{};
+    if (!GetCursorPos(&point)) return std::nullopt;
+    HWND hovered = WindowFromPoint(point);
+    if (!hovered) return std::nullopt;
+    return identify(GetAncestor(hovered, GA_ROOT));
+}
+
 TargetCheck checkTarget(const WindowTarget& window) {
     HWND hwnd = toHandle(window.handle);
     return evaluateWindowTarget(TargetSnapshot{
@@ -93,6 +101,14 @@ TargetCheck checkScreenPoint(const WindowTarget& window, int screenX, int screen
     });
 }
 
+TargetCheck checkCapturePoint(const WindowTarget& window, int screenX, int screenY) {
+    HWND hwnd = toHandle(window.handle);
+    if (!isSameWindow(window) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
+        return TargetCheck::Missing;
+    const POINT point{static_cast<LONG>(screenX), static_cast<LONG>(screenY)};
+    return insideClient(hwnd, point) ? TargetCheck::Ready : TargetCheck::OutOfBounds;
+}
+
 TargetCheck resolveClientPoint(const WindowTarget& window, int clientX, int clientY,
                                int& screenX, int& screenY) {
     const auto status = checkTarget(window);
@@ -114,8 +130,10 @@ TargetCheck resolveClientPoint(const WindowTarget& window, int clientX, int clie
 namespace clicknova::platform {
 std::vector<WindowTarget> listWindows() { return {}; }
 std::optional<WindowTarget> foregroundWindow() { return std::nullopt; }
+std::optional<WindowTarget> windowUnderCursor() { return std::nullopt; }
 TargetCheck checkTarget(const WindowTarget&) { return TargetCheck::Unsupported; }
 TargetCheck checkScreenPoint(const WindowTarget&, int, int) { return TargetCheck::Unsupported; }
+TargetCheck checkCapturePoint(const WindowTarget&, int, int) { return TargetCheck::Unsupported; }
 TargetCheck resolveClientPoint(const WindowTarget&, int, int, int&, int&) { return TargetCheck::Unsupported; }
 } // namespace clicknova::platform
 #endif

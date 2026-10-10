@@ -9,11 +9,17 @@ namespace clicknova::sequence {
 std::string validate(const Plan& plan) {
     if (plan.steps.empty()) return "Add at least one sequence step.";
     if (plan.steps.size() > 128) return "Sequence exceeds the 128-step limit.";
+    if (plan.passDelayMs < 0 || plan.passDelayMs > 60000)
+        return "Pass delay must be between 0 and 60,000 ms.";
     if (plan.repetitions < 1 || plan.repetitions > 1000000)
         return "Repeat count must be between 1 and 1,000,000.";
     for (const Step& step : plan.steps) {
+        if (!step.configured) return "Choose coordinates for every action.";
+        if (step.clickCount < 1 || step.clickCount > 100000)
+            return "Clicks per action must be between 1 and 100,000.";
         if (step.button < 0 || step.button > 2) return "Unsupported mouse button.";
-        if (step.delayMs < 10 || step.delayMs > 60000) return "Delay must be between 10 and 60,000 ms.";
+        if (step.delayMs < 0 || step.delayMs > 60000) return "Action delay must be between 0 and 60,000 ms.";
+        if (step.intervalMs < 10 || step.intervalMs > 60000) return "Click interval must be between 10 and 60,000 ms.";
         if (step.x < -131072 || step.x > 131072 || step.y < -131072 || step.y > 131072)
             return "Point coordinates are out of range.";
         if (step.space != Space::Screen && step.space != Space::Client)
@@ -33,9 +39,17 @@ std::optional<Step> Cursor::peek() const {
     if (completedClicks_ == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
     return plan_.steps[index_];
 }
+int Cursor::nextDelayMs() const {
+    if (!peek()) return 0;
+    if (clickIndex_ > 0) return plan_.steps[index_].intervalMs;
+    const int repeatPause = (completedClicks_ > 0 && index_ == 0) ? plan_.passDelayMs : 0;
+    return plan_.steps[index_].delayMs + repeatPause;
+}
 void Cursor::advance() {
     if (!peek()) return;
     ++completedClicks_;
+    if (++clickIndex_ < plan_.steps[index_].clickCount) return;
+    clickIndex_ = 0;
     if (++index_ == plan_.steps.size()) {
         index_ = 0;
         ++completedPasses_;

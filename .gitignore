@@ -118,3 +118,8 @@ __pycache__/
 *.clicknova-profile.json
 *.clicknova.ini
 /user-settings/
+
+# Saved scenario exports and accidental local scenario folders
+/scenarios/
+/user-scenarios/
+*.clicknova-scenario.json
