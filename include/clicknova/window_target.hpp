@@ -13,6 +13,7 @@ struct WindowTarget {
     std::uintptr_t handle{};
     std::uint32_t processId{};
     std::wstring title;
+    std::wstring process; // basename of executable when accessible
 };
 
 enum class TargetCheck {
@@ -42,6 +43,10 @@ const char* targetCheckMessage(TargetCheck status);
 // On Linux these functions return no candidates / Unsupported, not fake success.
 std::vector<WindowTarget> listWindows();
 std::optional<WindowTarget> foregroundWindow();
+// Find a fresh live HWND from a persisted title/executable name; no cached HWND.
+std::optional<WindowTarget> findWindow(const std::wstring& title, const std::wstring& process);
+// Explicit foreground activation; Windows focus-stealing protection may reject it.
+bool activateWindow(const WindowTarget& target);
 // Identifies the top-level visible window below the cursor without activating it.
 // A ClickNova-owned, minimized, or untitled window is not a valid target.
 std::optional<WindowTarget> windowUnderCursor();

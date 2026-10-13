@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 
 using namespace clicknova::sequence;
 
@@ -66,5 +67,11 @@ int main() {
     assert(large && large->totalClicks && large->totalWaitMs);
     assert(*large->totalClicks == 128ULL * 100000ULL * 1000000ULL);
     assert(*large->totalWaitMs == large->waitMsPerPass * 1000000ULL + 60000ULL * 999999ULL);
+    // Older click-sequence editor can now enter int32-max counts. The preview
+    // must saturate rather than wrap around when total duration exceeds uint64.
+    for (auto& step : maximum.steps) step.clickCount = std::numeric_limits<int>::max();
+    const auto enormous = preview(maximum);
+    assert(enormous && enormous->totalWaitMs);
+    assert(*enormous->totalWaitMs == std::numeric_limits<std::uint64_t>::max());
     std::cout << "Sequence preview calculations: passed\n";
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "window_chooser.hpp"
+#include "ui_icons.hpp"
 #include "ui_translation.hpp"
 
 #include <QDialog>
@@ -40,8 +41,17 @@ std::optional<clicknova::platform::WindowTarget> chooseTargetWindow(
     auto* cancel = new QPushButton(tr(QStringLiteral("Cancel")), &dialog);
     auto* confirm = new QPushButton(tr(QStringLiteral("Use selected window")), &dialog);
     confirm->setObjectName(QStringLiteral("confirmWindowSelection"));
+    confirm->setProperty("actionRole", QStringLiteral("primary"));
+    confirm->setToolTip(language == QStringLiteral("ru")
+        ? QString::fromUtf8("Использовать выделенное окно как цель. Окно должно быть активным при выполнении.")
+        : QStringLiteral("Use the selected window. It must be foreground during playback."));
+    refresh->setProperty("actionRole", QStringLiteral("secondary"));
+    cancel->setProperty("actionRole", QStringLiteral("secondary"));
     confirm->setDefault(true);
     confirm->setEnabled(false);
+    clicknova::gui::setButtonIcon(refresh, clicknova::gui::Icon::Refresh);
+    clicknova::gui::setButtonIcon(cancel, clicknova::gui::Icon::Close);
+    clicknova::gui::setButtonIcon(confirm, clicknova::gui::Icon::Window, QColor(QStringLiteral("#ffffff")));
     row->addWidget(refresh);
     row->addStretch();
     row->addWidget(cancel);
@@ -55,8 +65,10 @@ std::optional<clicknova::platform::WindowTarget> chooseTargetWindow(
         list->clear();
         for (int i = 0; i < static_cast<int>(windows.size()); ++i) {
             const auto& item = windows[static_cast<std::size_t>(i)];
-            const QString display = QStringLiteral("%1 (PID %2)")
+            const QString display = QStringLiteral("%1 (%2, PID %3)")
                 .arg(QString::fromStdWString(item.title).simplified())
+                .arg(item.process.empty() ? QStringLiteral("Unknown application") :
+                    QString::fromStdWString(item.process))
                 .arg(item.processId);
             if (!query.isEmpty() && !display.contains(query, Qt::CaseInsensitive)) continue;
             auto* rowItem = new QListWidgetItem(display, list);

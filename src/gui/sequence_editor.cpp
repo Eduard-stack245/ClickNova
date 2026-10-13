@@ -3,7 +3,9 @@
 #include <QFormLayout>
 #include <QResizeEvent>
 #include <QTimer>
+#include <limits>
 #include "wrap_layout.hpp"
+#include "ui_icons.hpp"
 
 SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         auto* layout = new QVBoxLayout(this);
@@ -16,12 +18,15 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         auto* toolbar = new WrapLayout(nullptr, 8);
         add_ = new QPushButton(this);
         add_->setObjectName(QStringLiteral("sequenceAddPoint"));
+        add_->setProperty("actionRole", QStringLiteral("primary"));
         add_->setMinimumHeight(42);
         pick_ = new QPushButton(this);
         pick_->setObjectName(QStringLiteral("sequencePickWithClick"));
+        pick_->setProperty("actionRole", QStringLiteral("primary"));
         pick_->setMinimumHeight(42);
         hover_ = new QPushButton(this);
         hover_->setObjectName(QStringLiteral("sequencePickWithShortcut"));
+        hover_->setProperty("actionRole", QStringLiteral("secondary"));
         hover_->setMinimumHeight(42);
         capture_ = new QPushButton(this);
         capture_->setMinimumHeight(42);
@@ -44,12 +49,14 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         secondaryToolbar->addWidget(pickSeconds_);
         chooseWindow_ = new QPushButton(this);
         chooseWindow_->setObjectName(QStringLiteral("sequenceChooseWindow"));
+        chooseWindow_->setProperty("actionRole", QStringLiteral("secondary"));
         chooseWindow_->setMinimumHeight(40);
         pickWindow_ = new QPushButton(this);
         pickWindow_->setObjectName(QStringLiteral("sequencePickWindowUnderCursor"));
         pickWindow_->setMinimumHeight(40);
         editToggle_ = new QToolButton(this);
         editToggle_->setObjectName(QStringLiteral("sequenceEditToggle"));
+        editToggle_->setProperty("actionRole", QStringLiteral("secondary"));
         editToggle_->setCheckable(true);
         editToggle_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
         editToggle_->setArrowType(Qt::RightArrow);
@@ -122,7 +129,7 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         interval_->setRange(10, 60000); interval_->setValue(200);
         interval_->setSuffix(QStringLiteral(" ms"));
         clicks_ = new QSpinBox(this); clicks_->setObjectName(QStringLiteral("sequenceStepClickCount"));
-        clicks_->setRange(1, 100000); clicks_->setValue(1);
+        clicks_->setRange(1, std::numeric_limits<int>::max()); clicks_->setValue(1);
         window_ = new QComboBox(this); window_->setObjectName(QStringLiteral("sequenceStepWindow"));
         const std::initializer_list<QWidget*> fields = {x_, y_, button_, delay_, interval_, clicks_, window_};
         for (QWidget* w : fields) w->setMinimumHeight(44);
@@ -240,6 +247,18 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         });
         connect(pickSeconds_, QOverload<int>::of(&QSpinBox::valueChanged), this,
                 [this](int) { if (onChange) onChange(); });
+        using clicknova::gui::Icon;
+        using clicknova::gui::setButtonIcon;
+        setButtonIcon(add_, Icon::Click, QColor(QStringLiteral("#ffffff")));
+        setButtonIcon(pick_, Icon::Target, QColor(QStringLiteral("#ffffff")));
+        setButtonIcon(hover_, Icon::Cursor);
+        setButtonIcon(capture_, Icon::Wait);
+        setButtonIcon(chooseWindow_, Icon::Window);
+        setButtonIcon(pickWindow_, Icon::Target);
+        setButtonIcon(editToggle_, Icon::Edit);
+        setButtonIcon(windowSettingsToggle_, Icon::Window);
+        setButtonIcon(update_, Icon::Check);
+        setButtonIcon(revert_, Icon::Undo);
         setLanguage(QStringLiteral("en"));
         refresh(-1);
     }
@@ -439,6 +458,8 @@ void SequenceEditor::updateRow(int row) {
             auto* cell = table_->item(row, col);
             if (!cell) { cell = new QTableWidgetItem; table_->setItem(row, col, cell); }
             cell->setText(cells[col]);
+            if (col == 0) cell->setIcon(clicknova::gui::icon(
+                s.configured ? clicknova::gui::Icon::Click : clicknova::gui::Icon::Target));
             cell->setToolTip(QStringLiteral("%1\n%2\n%3\n%4").arg(cells[0], cells[1], cells[2], cells[3]));
         }
     }
@@ -449,7 +470,9 @@ void SequenceEditor::refresh(int row, bool notify) {
         table_->setRowCount(static_cast<int>(steps_.size()));
         for (int i = 0; i < static_cast<int>(steps_.size()); ++i) {
             updateRow(i);
-            auto* menuButton = new QPushButton(QStringLiteral("⋯"), table_);
+            auto* menuButton = new QPushButton(table_);
+            menuButton->setIcon(clicknova::gui::icon(clicknova::gui::Icon::More));
+            menuButton->setIconSize(QSize(21, 21));
             menuButton->setToolTip(label(QStringLiteral("Action options")));
             menuButton->setFlat(true);
             connect(menuButton, &QPushButton::clicked, this,

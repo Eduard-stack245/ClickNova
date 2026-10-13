@@ -4,6 +4,7 @@
 #include <QMetaType>
 #include <QVariantList>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace clicknova::storage {
@@ -66,8 +67,18 @@ bool title(const QVariantMap& map, const QString& key, QString& output, QString*
 QVariantMap encodeScenario(const AutoClickerScenario& s) {
     return {{QStringLiteral("button"), s.button},
             {QStringLiteral("interval"), s.intervalMs},
+            {QStringLiteral("holdDurationMs"), s.holdDurationMs},
+            {QStringLiteral("actionMode"), s.actionMode},
+            {QStringLiteral("destinationX"), s.destinationX},
+            {QStringLiteral("destinationY"), s.destinationY},
+            {QStringLiteral("movementMs"), s.movementMs},
+            {QStringLiteral("destinationConfigured"), s.destinationConfigured},
             {QStringLiteral("unlimited"), s.unlimited},
             {QStringLiteral("count"), s.count},
+            {QStringLiteral("startDelayValue"), s.startDelayValue},
+            {QStringLiteral("startDelayUnit"), s.startDelayUnit},
+            {QStringLiteral("startMode"), s.startMode},
+            {QStringLiteral("startTimeSeconds"), s.startTimeSeconds},
             {QStringLiteral("fixed"), s.fixed},
             {QStringLiteral("bound"), s.bound},
             {QStringLiteral("screenX"), s.screen.x()},
@@ -100,9 +111,23 @@ QVariantMap encodeScenario(const SequenceScenario& s) {
 bool decodeScenario(const QVariantMap& values, AutoClickerScenario& output, QString* error) {
     AutoClickerScenario result;
     int screenX = 0, screenY = 0, clientX = 0, clientY = 0;
-    if (!integer(values, QStringLiteral("button"), 0, 2, result.button, error) ||
+    if (!integer(values, QStringLiteral("button"), 0, 4, result.button, error) ||
+        !integer(values, QStringLiteral("holdDurationMs"), 0, 60000, result.holdDurationMs, error, true) ||
+        !integer(values, QStringLiteral("actionMode"), 0, 3, result.actionMode, error, true) ||
+        !integer(values, QStringLiteral("destinationX"), -131072, 131072, result.destinationX, error, true) ||
+        !integer(values, QStringLiteral("destinationY"), -131072, 131072, result.destinationY, error, true) ||
+        !integer(values, QStringLiteral("movementMs"), 0, 60000, result.movementMs, error, true) ||
+        !boolean(values, QStringLiteral("destinationConfigured"), result.destinationConfigured, error, true) ||
         !integer(values, QStringLiteral("interval"), 10, 60000, result.intervalMs, error) ||
-        !integer(values, QStringLiteral("count"), 1, 1000000, result.count, error) ||
+        !integer(values, QStringLiteral("count"), 1, std::numeric_limits<int>::max(), result.count, error) ||
+        !integer(values, QStringLiteral("startDelayValue"), 0, std::numeric_limits<int>::max(),
+                 result.startDelayValue, error, true) ||
+        !integer(values, QStringLiteral("startDelayUnit"), 0, 3,
+                 result.startDelayUnit, error, true) ||
+        !integer(values, QStringLiteral("startMode"), 0, 1,
+                 result.startMode, error, true) ||
+        !integer(values, QStringLiteral("startTimeSeconds"), 0, 86399,
+                 result.startTimeSeconds, error, true) ||
         !integer(values, QStringLiteral("screenX"), -131072, 131072, screenX, error) ||
         !integer(values, QStringLiteral("screenY"), -131072, 131072, screenY, error) ||
         !integer(values, QStringLiteral("clientX"), -131072, 131072, clientX, error) ||
@@ -111,6 +136,11 @@ bool decodeScenario(const QVariantMap& values, AutoClickerScenario& output, QStr
         !boolean(values, QStringLiteral("fixed"), result.fixed, error) ||
         !boolean(values, QStringLiteral("bound"), result.bound, error) ||
         !title(values, QStringLiteral("windowTitle"), result.windowTitle, error)) return false;
+    if (result.bound && result.destinationConfigured &&
+        (result.destinationX < 0 || result.destinationY < 0)) {
+        fail(error, QStringLiteral("Window destination must be non-negative"));
+        return false;
+    }
     if (result.bound && (clientX < 0 || clientY < 0)) {
         fail(error, QStringLiteral("Window coordinates must be non-negative"));
         return false;
@@ -153,7 +183,7 @@ bool decodeScenario(const QVariantMap& values, SequenceScenario& output, QString
             !integer(map, QStringLiteral("button"), 0, 2, step.button, error) ||
             !integer(map, QStringLiteral("delayMs"), 0, 60000, step.delayMs, error) ||
             !integer(map, QStringLiteral("intervalMs"), 10, 60000, step.intervalMs, error, true) ||
-            !integer(map, QStringLiteral("clickCount"), 1, 100000, step.clickCount, error, true) ||
+            !integer(map, QStringLiteral("clickCount"), 1, std::numeric_limits<int>::max(), step.clickCount, error, true) ||
             !integer(map, QStringLiteral("space"), 0, 1, space, error) ||
             !boolean(map, QStringLiteral("configured"), step.configured, error, true) ||
             !boolean(map, QStringLiteral("ownWindow"), step.ownWindow, error, true) ||

@@ -32,8 +32,20 @@ std::optional<WindowTarget> identify(HWND hwnd) {
     const int actual = GetWindowTextW(hwnd, title.data(), length + 1);
     if (actual <= 0) return std::nullopt;
     title.resize(static_cast<std::size_t>(actual));
+    std::wstring executable;
+    HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (processHandle) {
+        wchar_t path[32768]{};
+        DWORD count = 32768;
+        if (QueryFullProcessImageNameW(processHandle, 0, path, &count)) {
+            std::wstring full(path, count);
+            const auto separator = full.find_last_of(L"\\/");
+            executable = full.substr(separator == std::wstring::npos ? 0 : separator + 1);
+        }
+        CloseHandle(processHandle);
+    }
     return WindowTarget{reinterpret_cast<std::uintptr_t>(hwnd),
-                        static_cast<std::uint32_t>(pid), std::move(title)};
+                        static_cast<std::uint32_t>(pid), std::move(title), std::move(executable)};
 }
 
 bool insideClient(HWND hwnd, POINT point) {
@@ -64,6 +76,29 @@ std::vector<WindowTarget> listWindows() {
         return a.title < b.title;
     });
     return result;
+}
+
+std::optional<WindowTarget> findWindow(const std::wstring& title, const std::wstring& process) {
+    if (title.empty()) return std::nullopt;
+    std::optional<WindowTarget> match;
+    for (const auto& candidate : listWindows()) {
+        if (candidate.title != title) continue;
+        if (!process.empty() && _wcsicmp(candidate.process.c_str(), process.c_str()) != 0) continue;
+        // Two identical windows cannot be distinguished from saved labels.
+        // Fail closed instead of accidentally clicking the wrong one.
+        if (match) return std::nullopt;
+        match = candidate;
+    }
+    return match;
+}
+
+bool activateWindow(const WindowTarget& target) {
+    if (!isSameWindow(target)) return false;
+    HWND window = toHandle(target.handle);
+    if (IsIconic(window)) return false;
+    if (GetForegroundWindow() == window) return true;
+    SetForegroundWindow(window);
+    return GetForegroundWindow() == window;
 }
 
 std::optional<WindowTarget> foregroundWindow() {
@@ -130,6 +165,8 @@ TargetCheck resolveClientPoint(const WindowTarget& window, int clientX, int clie
 namespace clicknova::platform {
 std::vector<WindowTarget> listWindows() { return {}; }
 std::optional<WindowTarget> foregroundWindow() { return std::nullopt; }
+std::optional<WindowTarget> findWindow(const std::wstring&, const std::wstring&) { return std::nullopt; }
+bool activateWindow(const WindowTarget&) { return false; }
 std::optional<WindowTarget> windowUnderCursor() { return std::nullopt; }
 TargetCheck checkTarget(const WindowTarget&) { return TargetCheck::Unsupported; }
 TargetCheck checkScreenPoint(const WindowTarget&, int, int) { return TargetCheck::Unsupported; }

@@ -200,6 +200,8 @@ public:
         if (configured_) registerAll();
     }
     bool setRunning(bool running) {
+        // Never claim the safety stop is active while shortcuts are suspended.
+        if (running && suspended_) return false;
         if (running_ == running) return true;
         unregisterAll();
         running_ = running;

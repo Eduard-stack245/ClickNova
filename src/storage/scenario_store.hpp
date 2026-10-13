@@ -7,7 +7,7 @@
 
 namespace clicknova::storage {
 // Scenario data is per-user, never inside the source tree or Git checkout.
-enum class Kind { AutoClicker, Sequence };
+enum class Kind { AutoClicker, Sequence, InputLab };
 class ScenarioStore {
 public:
     explicit ScenarioStore(QString root = {});

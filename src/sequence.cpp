@@ -15,7 +15,7 @@ std::string validate(const Plan& plan) {
         return "Repeat count must be between 1 and 1,000,000.";
     for (const Step& step : plan.steps) {
         if (!step.configured) return "Choose coordinates for every action.";
-        if (step.clickCount < 1 || step.clickCount > 100000)
+        if (step.clickCount < 1)
             return "Clicks per action must be between 1 and 100,000.";
         if (step.button < 0 || step.button > 2) return "Unsupported mouse button.";
         if (step.delayMs < 0 || step.delayMs > 60000) return "Action delay must be between 0 and 60,000 ms.";

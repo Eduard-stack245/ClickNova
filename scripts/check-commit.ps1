@@ -49,17 +49,43 @@ if ($obsolete.Count -gt 0) {
     throw 'Outdated GPL-only project license markers remain.'
 }
 
-# Information-only files are intentionally omitted from early commits.
+# Reject staged documentation, private data, binaries, and build output.
 $staged = @(& git diff --cached --name-only --diff-filter=ACMR)
-$informationOnly = @($staged | Where-Object {
-    $_ -match '^(docs/|examples/|schemas/|\.github/)' -or
-    $_ -match '^(README|QUICKSTART|QUICKSTART-RU|CHANGELOG|CONTRIBUTING)\.md$'
+$sensitive = @($staged | Where-Object {
+    $_ -match '(?i)(^|/)(README|CHANGELOG|CONTRIBUTING|RELEASE_NOTES)\.md$' -or
+    $_ -match '(^|/)(docs|\.github|build(-[^/]*)?|cmake-build-[^/]*|dist(-[^/]*)?|\.clicknova|user-data|user-profiles|user-macros|scenarios|user-scenarios|profiles|backups)/' -or
+    $_ -match '(?i)\.(exe|dll|lib|obj|pdb|log|dmp|zip|json)$' -or
+    $_ -match '(^|/)\.env(\.|$)' -or
+    $_ -match 'autosave'
 })
-if ($informationOnly.Count -gt 0) {
-    $informationOnly | ForEach-Object { Write-Host "Staged optional information file: $_" -ForegroundColor Yellow }
-    throw 'Unstage optional documentation for the minimal source commit. LICENSE must remain in the repository.'
+if ($sensitive.Count -gt 0) {
+    $sensitive | ForEach-Object { Write-Host "Unsafe staged file: $_" -ForegroundColor Yellow }
+    throw 'Remove generated files, documentation, or private data from staging.'
 }
+
+# Previously tracked documentation must also be removed from the index.
+$disallowedTracked = @($tracked | Where-Object {
+    $_ -match '(?i)(^|/)(README|CHANGELOG|CONTRIBUTING|RELEASE_NOTES)\.md$' -or
+    $_ -match '(^|/)(docs|\.github)/'
+})
+if ($disallowedTracked.Count -gt 0) {
+    $disallowedTracked | ForEach-Object { Write-Host "Remove from Git index: $_" -ForegroundColor Yellow }
+    throw 'Remove legacy documentation and workflows from Git before committing.'
+}
+
+# C++ source comments and build tooling are English; localized UI strings are allowed.
+$nonEnglishComments = @(Select-String -Path $sourceFiles.FullName -Pattern '^\s*(?://|/\*|\*|#)\s*.*[А-Яа-яЁё]')
+if ($nonEnglishComments.Count -gt 0) {
+    throw 'Non-English source comments found. Keep comments in English and localized UI strings as-is.'
+}
+
+# Confirm version and repository metadata before publishing source.
+$cmakeText = Get-Content (Join-Path $root 'CMakeLists.txt') -Raw
+$projectVersion = [regex]::Match($cmakeText, 'project\(ClickNova\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)').Groups[1].Value
+if (-not $projectVersion) { throw 'ClickNova project version not found.' }
+& cmake "-DPROJECT_ROOT=$root" "-DPROJECT_VERSION=$projectVersion" -P (Join-Path $PSScriptRoot 'check-repository.cmake')
+if ($LASTEXITCODE -ne 0) { throw 'Repository consistency check failed.' }
 
 Write-Host 'Git status:' -ForegroundColor Cyan
 & git status --short
-Write-Host 'License and Git checks passed; review changes and Windows tests before committing.' -ForegroundColor Green
+Write-Host 'Clean source and Git checks passed; review Windows GUI tests before committing.' -ForegroundColor Green

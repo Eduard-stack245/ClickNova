@@ -17,8 +17,18 @@ int main(int argc, char** argv) {
     const auto sequence = clicknova::storage::Kind::Sequence;
 
     clicknova::storage::AutoClickerScenario autoScenario;
-    autoScenario.button = 2;
+    autoScenario.button = 4;
+    autoScenario.holdDurationMs = 275;
+    autoScenario.actionMode = 2;
+    autoScenario.destinationX = 700;
+    autoScenario.destinationY = 400;
+    autoScenario.movementMs = 850;
+    autoScenario.destinationConfigured = true;
     autoScenario.count = 50;
+    autoScenario.startDelayValue = 12;
+    autoScenario.startDelayUnit = 2;
+    autoScenario.startMode = 1;
+    autoScenario.startTimeSeconds = 18 * 3600 + 30 * 60 + 15;
     autoScenario.unlimited = false;
     autoScenario.screen = QPoint(-15, 42);
     autoScenario.windowTitle = QString::fromUtf8("Окно редактора");
@@ -51,16 +61,50 @@ int main(int argc, char** argv) {
     clicknova::storage::SequenceScenario restoredSequence;
     if (!clicknova::storage::decodeScenario(*loadedAuto, restoredAuto, &error) ||
         !clicknova::storage::decodeScenario(*loadedSequence, restoredSequence, &error)) return 6;
-    if (restoredAuto.count != 50 || restoredAuto.screen.x() != -15 ||
+    if (restoredAuto.count != 50 || restoredAuto.startDelayValue != 12 ||
+        restoredAuto.startDelayUnit != 2 || restoredAuto.startMode != 1 ||
+        restoredAuto.startTimeSeconds != 18 * 3600 + 30 * 60 + 15 ||
+        restoredAuto.button != 4 ||
+        restoredAuto.holdDurationMs != 275 || restoredAuto.actionMode != 2 ||
+        restoredAuto.destinationX != 700 || restoredAuto.destinationY != 400 ||
+        restoredAuto.movementMs != 850 || !restoredAuto.destinationConfigured ||
+        restoredAuto.screen.x() != -15 ||
         restoredAuto.windowTitle != autoScenario.windowTitle ||
         restoredSequence.repeatCount != 3 || restoredSequence.passDelayMs != 750 ||
         restoredSequence.steps.size() != 1 || restoredSequence.steps[0].clickCount != 5 ||
         restoredSequence.steps[0].intervalMs != 150 || !restoredSequence.steps[0].ownWindow ||
         restoredSequence.steps[0].windowHandle != 0 || restoredSequence.steps[0].processId != 0) return 7;
 
+    // Old saved scenarios do not contain movement fields and must load as clicks.
+    auto legacyAuto = autoValues;
+    for (const auto& key : {"actionMode", "destinationX", "destinationY",
+                             "movementMs", "destinationConfigured", "startDelayValue", "startDelayUnit",
+                             "startMode", "startTimeSeconds"})
+        legacyAuto.remove(QString::fromLatin1(key));
+    clicknova::storage::AutoClickerScenario legacy;
+    if (!clicknova::storage::decodeScenario(legacyAuto, legacy) ||
+        legacy.actionMode != 0 || legacy.destinationConfigured ||
+        legacy.startDelayValue != 3 || legacy.startDelayUnit != 0 ||
+        legacy.startMode != 0 || legacy.startTimeSeconds != 18 * 3600 + 30 * 60) return 17;
+    auto corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("startDelayUnit")] = 8;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 18;
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("startDelayValue")] = -1;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 19;
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("startMode")] = 2;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 20;
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("startTimeSeconds")] = 86400;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 21;
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("startTimeSeconds")] = -1;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 22;
+
     // Incomplete or malicious settings never alter the existing destination.
     const auto untouchedCount = restoredAuto.count;
-    auto corruptAuto = autoValues;
+    corruptAuto = autoValues;
     corruptAuto[QStringLiteral("count")] = 1.5;
     if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto, &error) ||
         restoredAuto.count != untouchedCount) return 8;
@@ -74,7 +118,7 @@ int main(int argc, char** argv) {
     auto corruptSequence = sequenceValues;
     auto records = corruptSequence[QStringLiteral("steps")].toList();
     auto action = records[0].toMap();
-    action[QStringLiteral("clickCount")] = 100001;
+    action[QStringLiteral("clickCount")] = 2147483648LL;
     records[0] = action;
     corruptSequence[QStringLiteral("steps")] = records;
     if (clicknova::storage::decodeScenario(corruptSequence, restoredSequence) ||
@@ -87,6 +131,12 @@ int main(int argc, char** argv) {
     corruptSequence[QStringLiteral("steps")] = records;
     if (clicknova::storage::decodeScenario(corruptSequence, restoredSequence)) return 12;
 
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("actionMode")] = 99;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 18;
+    corruptAuto = autoValues;
+    corruptAuto[QStringLiteral("movementMs")] = -1;
+    if (clicknova::storage::decodeScenario(corruptAuto, restoredAuto)) return 19;
     // Scenario names are isolated by type and cannot escape their data directory.
     if (store.save(single, "../invalid", autoValues) ||
         store.save(single, ".", autoValues)) return 13;

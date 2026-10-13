@@ -16,7 +16,12 @@
 namespace clicknova::storage {
 namespace {
 QString category(Kind kind) {
-    return kind == Kind::AutoClicker ? QStringLiteral("auto_clicker") : QStringLiteral("sequences");
+    switch (kind) {
+    case Kind::AutoClicker: return QStringLiteral("auto_clicker");
+    case Kind::Sequence: return QStringLiteral("sequences");
+    case Kind::InputLab: return QStringLiteral("input_lab");
+    }
+    return QStringLiteral("invalid");
 }
 QString encodedName(const QString& name) {
     return QString::fromLatin1(name.toUtf8().toBase64(QByteArray::Base64UrlEncoding |

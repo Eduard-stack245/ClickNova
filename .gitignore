@@ -1,5 +1,5 @@
-# ClickNova - keep source, documentation, test fixtures, scripts, and project assets in Git.
-# Generated binaries, build trees, local settings, and user data must stay local.
+# Track ClickNova source, build scripts, tests, and required license files only.
+# Exclude generated output, documentation, and private user data.
 
 # CMake / IDE build directories (all variants used by ClickNova)
 /build/
@@ -102,17 +102,15 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 
-# Documentation and repository metadata are intentionally postponed for early commits.
-# The Apache-2.0 LICENSE is NOT ignored: an open-source distribution needs it.
+# Documentation and workflow metadata are excluded from the minimal source repository.
 /README.md
-/QUICKSTART.md
-/QUICKSTART-RU.md
 /CHANGELOG.md
 /CONTRIBUTING.md
+/RELEASE_NOTES.md
 /docs/
-/examples/
-/schemas/
 /.github/
+
+# Personal scenarios, build output, and logs are never tracked.
 
 # Extra local profile exports and UI settings (not repository assets)
 *.clicknova-profile.json
@@ -123,3 +121,24 @@ __pycache__/
 /scenarios/
 /user-scenarios/
 *.clicknova-scenario.json
+
+# User autosave drafts and private settings (never stage)
+autosave*.json
+*autosave*.json
+*.clicknova-draft.json
+*.clicknova-draft
+
+# Other exported scenarios and user settings
+*.clicknova.json
+*.clicknova-scenario
+*.clicknova-profile
+*.clicknova-backup
+*.clicknova-session
+*.clicknova-settings.json
+/local/
+/profiles/
+/backups/
+
+# Private input recording recovery files (never commit typed content)
+*.cnrecord.json
+/recording-recovery/
