@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Windows desktop input prototype; the Linux UI does not inject input yet.
+// Qt desktop UI. Windows uses SendInput; Linux X11 uses guarded XTEST playback.
 #include <QApplication>
 #include <QAbstractSpinBox>
 #include <QCheckBox>
@@ -14,11 +14,22 @@
 #include <QToolBar>
 #include <QDockWidget>
 #include <QPlainTextEdit>
+#include <QTextCursor>
+#include <QTextCharFormat>
+#include <QFont>
+#include <QClipboard>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include "portable_storage.hpp"
+#include "optional_components.hpp"
+#include <QFileInfo>
+#include <QToolButton>
 #include <QAction>
 #include <QPoint>
 #include <QListWidget>
 #include <QStackedWidget>
 #include <QTabWidget>
+#include <QTableWidget>
 #include <QKeySequenceEdit>
 #include <QKeyCombination>
 #include <QStringList>
@@ -62,6 +73,7 @@
 #include <utility>
 #include "ui_translation.hpp"
 #include "ui_icons.hpp"
+#include "wheel_scroll_filter.hpp"
 #include "main_window.hpp"
 #include "../storage/scenario_store.hpp"
 #include "../storage/scenario_codec.hpp"
@@ -112,6 +124,8 @@ bool isSmokeMode() {
            qApp->arguments().contains(QStringLiteral("--smoke-test-window-picker")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-input-lab")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-unified")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-unified-search")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-wheel-routing")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-quick-motion"));
 }
 
@@ -130,9 +144,9 @@ public:
         auto* layout = new QVBoxLayout(root);
         layout->setContentsMargins(16, 14, 16, 14);
         layout->setSpacing(12);
-        auto* brand = new QLabel(QStringLiteral("ClickNova"));
-        brand->setObjectName(QStringLiteral("heading"));
-        layout->addWidget(brand);
+        // Application icon and name already appear in the native title bar.
+        // Avoid a second giant logo/title inside the workspace.
+        setWindowIcon(clicknova::gui::icon(clicknova::gui::Icon::Brand));
         // Keep user-visible feedback above the scrollable content. A message
         // only in the bottom status bar is easy to miss on large screens.
         workflowFeedback_ = new QLabel(root);
@@ -197,10 +211,17 @@ public:
                                          QStringLiteral("Customize keyboard controls to avoid conflicts with other apps."));
         auto* settingsPage = createPage(QStringLiteral("Settings"),
                                         QStringLiteral("Manage local profiles, keyboard shortcuts and interface language."));
+        // All seven pages share the same wheel router. Without registering
+        // them, scrolling outside a spinbox/combobox depends on Qt bubbling
+        // and can fail on Windows after the page receives a click.
+        configurePageWheelRouting(pages_);
         inputLab_ = new InputLabWidget;
         inputLab_->setCanBegin([this] { return !active_ && !capturePending_; });
         // The only visible sequence editor accepts recorded, manual and imported actions.
         sequencePage->insertWidget(2, inputLab_);
+        configureStepWheelRouting(
+            inputLab_->findChild<QTableWidget*>(QStringLiteral("inputLabActions")),
+            qobject_cast<QScrollArea*>(pages_->widget(3)));
         for (auto* page : {clickPage, positionPage, windowsPage, sequencePage, profilePage, shortcutsPage, settingsPage})
             page->addStretch();
         connect(navigation_, &QListWidget::currentRowChanged, this, [this](int index) {
@@ -208,10 +229,19 @@ public:
             if (index == 1 && inputLab_) inputLab_->refreshLibrary();
             const int pageIndex = index == 0 ? 0 : index == 1 ? 3 : 6;
             pages_->setCurrentIndex(pageIndex);
+            resetStepWheelRouting();
             // Both workflows share one always-visible toolbar at the top.
             // Settings keeps the last selected execution target.
             if (index < 2) sequenceToolbarActive_ = (index == 1);
             refreshRunToolbar();
+            updateProfileActions();
+            if (activityLog_ && index < 2) {
+                appendActivityLog(language_ == QStringLiteral("ru") ?
+                    (index == 0 ? QStringLiteral("Открыт раздел «Автокликер»") :
+                                  QStringLiteral("Открыт раздел «Шаги»")) :
+                    (index == 0 ? QStringLiteral("Opened Auto Clicker workspace") :
+                                  QStringLiteral("Opened Steps workspace")));
+            }
             if (caution_) caution_->setVisible(index != 1);
             // The selected workspace determines which workflow Start runs.
             // Changing Settings must never change the currently selected mode.
@@ -684,14 +714,18 @@ public:
         auto* profileGroup = new QGroupBox(QStringLiteral("Profiles"));
         auto* profileLayout = new QVBoxLayout(profileGroup);
         profiles_ = new QComboBox;
+        profiles_->setObjectName(QStringLiteral("profileSelector"));
         profiles_->setMinimumHeight(44);
         profiles_->setPlaceholderText(QStringLiteral("Choose a saved profile"));
         profileLayout->addWidget(profiles_);
         auto* profileActions = new WrapLayout(nullptr, 8);
         saveProfile_ = new QPushButton(QStringLiteral("Save as..."));
+        saveProfile_->setObjectName(QStringLiteral("saveProfile"));
         saveProfile_->setProperty("actionRole", QStringLiteral("success"));
         loadProfile_ = new QPushButton(QStringLiteral("Load"));
+        loadProfile_->setObjectName(QStringLiteral("loadProfile"));
         deleteProfile_ = new QPushButton(QStringLiteral("Delete"));
+        deleteProfile_->setObjectName(QStringLiteral("deleteProfile"));
         deleteProfile_->setProperty("actionRole", QStringLiteral("danger"));
         for (auto* action : {saveProfile_, loadProfile_, deleteProfile_}) {
             action->setMinimumHeight(44);
@@ -700,8 +734,9 @@ public:
         profileLayout->addLayout(profileActions);
         profilePage->insertWidget(profilePage->count() - 1, profileGroup);
         auto* profileHelp = new QLabel(QStringLiteral(
-            "Profiles save click settings, coordinates, window preference, shortcuts and language. "
-            "They are stored for your local user, never in Git. A window must be selected again after restarting."));
+            "Use the profile controls in the top bar from any workspace. "
+            "Profiles store click settings, coordinates, shortcuts and language. "
+            "Recorded step scenarios are saved separately. Select the target window again after restarting."));
         profileHelp->setWordWrap(true);
         profileHelp->setObjectName(QStringLiteral("subheading"));
         profilePage->insertWidget(profilePage->count() - 1, profileHelp);
@@ -894,6 +929,8 @@ public:
         addSettingsTab(profileGroup, QStringLiteral("Profiles"), profileHelp);
         addSettingsTab(shortcutsGroup, QStringLiteral("Shortcuts"));
         addSettingsTab(languageGroup, QStringLiteral("Language"));
+        auto* componentsTab = clicknova::gui::components::createSettingsPanel(settingsTabs_);
+        settingsTabs_->addTab(componentsTab, QStringLiteral("Компоненты"));
         settingsPage->insertWidget(settingsPage->count() - 1, settingsTabs_);
 
         // Scenario libraries are independent of the complete user profile.
@@ -942,7 +979,8 @@ public:
                     [this](int) { updateScenarioButtons(); });
             return group;
         };
-        addScenarioLibrary(clickPage, clicknova::storage::Kind::AutoClicker);
+        auto* autoLibrary = addScenarioLibrary(clickPage, clicknova::storage::Kind::AutoClicker);
+        autoLibrary->setObjectName(QStringLiteral("autoScenarioLibraryGroup"));
         // The old click editor stays constructed for reading existing profiles
         // and for the backwards-compatible internal tests, but is NOT another
         // user-facing workflow. All edits, recording and playback take place in
@@ -1013,6 +1051,13 @@ public:
         if (workflowFeedback_) workflowFeedback_->hide();
         setCentralWidget(root);
         setupRunToolbarAndLog();
+        setupLibraryToolbar(autoLibrary);
+        // Remove the old layout items before reparenting the connected
+        // widgets. Otherwise WrapLayout can still position the moved buttons.
+        profileLayout->removeWidget(profiles_);
+        for (auto* action : {saveProfile_, loadProfile_, deleteProfile_})
+            profileActions->removeWidget(action);
+        setupProfileHeader(scenarioToolbar_, profileGroup);
         refreshWindowList();
         if (!isSmokeMode()) {
             restoreLastSettings();
@@ -1131,8 +1176,20 @@ public:
             refreshShortcutLabels();
         }
 #else
+#ifdef CLICKNOVA_WITH_X11
+        // X11 playback owns global F12 while it runs. Advertise the *actual*
+        // emergency stop instead of the Windows-only configurable shortcut.
+        enableStartShortcut_->setChecked(false);
+        enablePickShortcut_->setChecked(false);
+        stopShortcut_->setKeySequence(QKeySequence(QStringLiteral("F12")));
+        setShortcutEditorsEnabled(false);
+        refreshShortcutLabels();
+        start_->setEnabled(!isSmokeMode());
+        setStatus(QStringLiteral("Linux X11: F12 is the emergency stop. XTEST is required."));
+#else
         start_->setEnabled(false);
-        setStatus(QStringLiteral("Linux input injection is not available in this prototype."));
+        setStatus(QStringLiteral("Linux X11 with XTEST is required for input playback."));
+#endif
 #endif
     }
     ~MainWindow() override {
@@ -1189,21 +1246,273 @@ private:
     QString uiText(const QString& english) const {
         return translateUiText(english, language_);
     }
+    enum class ActivityLevel { Info, Success, Warning, Error };
+    static ActivityLevel activityLevel(const QString& message) {
+        const QString lower = message.toLower();
+        if (lower.contains(QStringLiteral("error")) || lower.contains(QStringLiteral("failed")) ||
+            lower.contains(QStringLiteral("cannot")) || lower.contains(QStringLiteral("ошиб")) ||
+            lower.contains(QStringLiteral("не удалось")) || lower.contains(QStringLiteral("не найден")))
+            return ActivityLevel::Error;
+        if (lower.contains(QStringLiteral("warning")) || lower.contains(QStringLiteral("invalid")) ||
+            lower.contains(QStringLiteral("unavailable")) || lower.contains(QStringLiteral("предупреж")) ||
+            lower.contains(QStringLiteral("неверн"))) return ActivityLevel::Warning;
+        if (lower.contains(QStringLiteral("saved")) || lower.contains(QStringLiteral("loaded")) ||
+            lower.contains(QStringLiteral("imported")) || lower.contains(QStringLiteral("completed")) ||
+            lower.contains(QStringLiteral("added steps")) || lower.contains(QStringLiteral("pasted steps")) ||
+            lower.contains(QStringLiteral("duplicated steps")) ||
+            lower.contains(QStringLiteral("сохран")) || lower.contains(QStringLiteral("загруж")) ||
+            lower.contains(QStringLiteral("добавлен")) || lower.contains(QStringLiteral("вставлен")) ||
+            lower.contains(QStringLiteral("дублирован")) || lower.contains(QStringLiteral("готово")))
+            return ActivityLevel::Success;
+        return ActivityLevel::Info;
+    }
     void appendActivityLog(const QString& message) {
         if (!activityLog_ || message.trimmed().isEmpty()) return;
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        // High-frequency click/step progress belongs to the current status,
-        // not thousands of separate entries in the diagnostic history.
-        if (message == previousLogText_ && now - previousLogTime_ < 2000) return;
-        if (now - previousLogTime_ < 1200 &&
-            (message.contains(QStringLiteral("Events:")) ||
-             message.contains(QStringLiteral("Событий:")) ||
-             message.contains(QStringLiteral("clicks:")) ||
-             message.contains(QStringLiteral("кликов:")))) return;
-        previousLogText_ = message;
-        previousLogTime_ = now;
-        activityLog_->appendPlainText(QDateTime::currentDateTime().toString(
-            QStringLiteral("HH:mm:ss")) + QStringLiteral("  ") + message);
+        // Throttle only high-frequency progress updates. Never discard
+        // repeated user commands, failures or warnings: identical step edits
+        // performed twice are two separate events worth diagnosing.
+        const bool progress = message.contains(QStringLiteral("Events:")) ||
+            message.contains(QStringLiteral("Событий:")) ||
+            message.contains(QStringLiteral("clicks:")) ||
+            message.contains(QStringLiteral("кликов:"));
+        if (progress && now - previousProgressLogTime_ < 1200) return;
+        if (progress) previousProgressLogTime_ = now;
+        const auto level = activityLevel(message);
+        const char* code = level == ActivityLevel::Error ? "ERROR" :
+            level == ActivityLevel::Warning ? "WARN" :
+            level == ActivityLevel::Success ? "OK" : "INFO";
+        const QColor color = level == ActivityLevel::Error ? QColor(QStringLiteral("#ff8e97")) :
+            level == ActivityLevel::Warning ? QColor(QStringLiteral("#ffd18c")) :
+            level == ActivityLevel::Success ? QColor(QStringLiteral("#91e5b7")) :
+                QColor(QStringLiteral("#b8cbe5"));
+        QTextCursor cursor = activityLog_->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        QTextCharFormat header;
+        header.setForeground(color);
+        header.setFontWeight(QFont::DemiBold);
+        cursor.insertText(QDateTime::currentDateTime().toString(
+            QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) +
+            QStringLiteral("  [") + QString::fromLatin1(code) + QStringLiteral("]  "), header);
+        QTextCharFormat body;
+        body.setForeground(QColor(QStringLiteral("#e1e9f5")));
+        cursor.insertText(message + QLatin1Char('\n'), body);
+        activityLog_->setTextCursor(cursor);
+        activityLog_->ensureCursorVisible();
+        ++activityLogEntries_;
+        refreshActivityLogActions();
+    }
+    // The counter measures diagnostic entries since the last Clear, not
+    // the QTextDocument block count (one event may span multiple lines).
+    void refreshActivityLogActions() {
+        const bool hasEntries = activityLogEntries_ > 0;
+        if (logCopy_) logCopy_->setEnabled(hasEntries);
+        if (logSave_) logSave_->setEnabled(hasEntries);
+        if (logClear_) logClear_->setEnabled(hasEntries);
+        if (logCount_) {
+            logCount_->setText(QString::number(activityLogEntries_));
+            const QString hint = language_ == QStringLiteral("ru") ?
+                QStringLiteral("Записей с последней очистки: %1") :
+                QStringLiteral("Entries since last clear: %1");
+            logCount_->setToolTip(hint.arg(activityLogEntries_));
+            logCount_->setAccessibleName(logCount_->toolTip());
+        }
+    }
+    void setActivityLogExpanded(bool expanded) {
+        if (!logDock_ || !logBody_) return;
+        logExpanded_ = expanded;
+        logBody_->setVisible(expanded);
+        if (logToggle_) {
+            clicknova::gui::setButtonIcon(logToggle_, expanded ?
+                clicknova::gui::Icon::Down : clicknova::gui::Icon::Up);
+            logToggle_->setToolTip(expanded ?
+                (language_ == QStringLiteral("ru") ? QStringLiteral("Свернуть журнал") : QStringLiteral("Collapse log")) :
+                (language_ == QStringLiteral("ru") ? QStringLiteral("Развернуть журнал") : QStringLiteral("Expand log")));
+            logToggle_->setAccessibleName(logToggle_->toolTip());
+        }
+        if (expanded) {
+            logDock_->setMaximumHeight(QWIDGETSIZE_MAX);
+            logDock_->setMinimumHeight(0);
+            resizeDocks({logDock_}, {195}, Qt::Vertical);
+        } else {
+            // Leave the title/actions row visible, but release workspace space.
+            logDock_->setMinimumHeight(0);
+            logDock_->setMaximumHeight(46);
+        }
+    }
+    void saveActivityLog() {
+        if (!activityLog_) return;
+        const QString dir = clicknova::portable::filePath(QStringLiteral("activity-logs"));
+        if (!QDir().mkpath(dir)) {
+            appendActivityLog(uiText(QStringLiteral("Cannot create activity log folder.")));
+            return;
+        }
+        const QString path = QDir(dir).filePath(QStringLiteral("ClickNova_") +
+            QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzz")) +
+            QStringLiteral(".txt"));
+        QSaveFile file(path);
+        const QByteArray logContents = activityLog_->toPlainText().toUtf8();
+        if (!file.open(QIODevice::WriteOnly) ||
+            file.write(logContents) != logContents.size() || !file.commit()) {
+            appendActivityLog(language_ == QStringLiteral("ru") ?
+                QStringLiteral("Не удалось сохранить журнал: ") + file.errorString() :
+                QStringLiteral("Cannot save activity log: ") + file.errorString());
+            return;
+        }
+        appendActivityLog(language_ == QStringLiteral("ru") ?
+            QStringLiteral("Журнал сохранён: ") + path :
+            QStringLiteral("Activity log saved: ") + path);
+    }
+    void setupProfileHeader(QToolBar* toolbar, QGroupBox* oldGroup) {
+        // Move the already connected profile controls, rather than creating
+        // proxy buttons with different state or a second set of actions.
+        profileHeader_ = new QWidget(this);
+        profileHeader_->setObjectName(QStringLiteral("profileHeader"));
+        auto* row = new QHBoxLayout(profileHeader_);
+        row->setContentsMargins(8, 0, 0, 0);
+        row->setSpacing(6);
+        profileTitle_ = new QLabel(profileHeader_);
+        profileTitle_->setObjectName(QStringLiteral("profileHeaderTitle"));
+        row->addWidget(profileTitle_);
+        profiles_->setMinimumWidth(150);
+        profiles_->setMaximumWidth(245);
+        profiles_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        row->addWidget(profiles_);
+        for (auto* control : {saveProfile_, loadProfile_, deleteProfile_}) {
+            control->setMinimumSize(44, 44);
+            control->setMaximumWidth(44);
+            row->addWidget(control);
+        }
+        // A flexible gutter and a clear divider separate the two libraries.
+        // Unlike the brand row, this toolbar collapses as one unit, so the
+        // rarely used scenario AND profile controls never consume page space.
+        auto* spacer = new QWidget(toolbar);
+        spacer->setObjectName(QStringLiteral("scenarioProfileSpacer"));
+        spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        toolbar->addWidget(spacer);
+        toolbar->addSeparator();
+        toolbar->addWidget(profileHeader_);
+        // Keep the explanation in Settings. The actual connected controls
+        // move, not copies, so the profile format and behavior are unchanged.
+        oldGroup->hide();
+        refreshProfileHeaderLabels();
+    }
+    void refreshProfileHeaderLabels() {
+        if (!profileHeader_) return;
+        const bool ru = language_ == QStringLiteral("ru");
+        if (profileTitle_) profileTitle_->setText(
+            ru ? QStringLiteral("Профиль") : QStringLiteral("Profile"));
+        const auto describe = [ru](QPushButton* control, const QString& en, const QString& translated) {
+            if (!control) return;
+            const QString description = ru ? translated : en;
+            control->setText(QString());
+            control->setToolTip(description);
+            control->setAccessibleName(description);
+        };
+        describe(saveProfile_, QStringLiteral("Save current settings as a profile"),
+                 QStringLiteral("Сохранить текущие настройки в профиль"));
+        describe(loadProfile_, QStringLiteral("Load selected profile settings"),
+                 QStringLiteral("Загрузить настройки выбранного профиля"));
+        describe(deleteProfile_, QStringLiteral("Delete selected profile"),
+                 QStringLiteral("Удалить выбранный профиль"));
+    }
+    void refreshScenarioToggleLabel() {
+        if (!scenarioToggle_) return;
+        const bool ru = language_ == QStringLiteral("ru");
+        const QString label = scenarioToggle_->isChecked() ?
+            (ru ? QStringLiteral("Скрыть сценарии и профили") : QStringLiteral("Hide scenarios and profiles")) :
+            (ru ? QStringLiteral("Показать сценарии и профили") : QStringLiteral("Show scenarios and profiles"));
+        scenarioToggle_->setText(QString());
+        scenarioToggle_->setToolTip(label);
+        scenarioToggle_->setAccessibleName(label);
+        scenarioToggle_->setAccessibleDescription(ru ?
+            QStringLiteral("Открывает или закрывает сценарии слева и профили справа") :
+            QStringLiteral("Opens or closes scenarios on the left and profiles on the right"));
+        clicknova::gui::setButtonIcon(scenarioToggle_, clicknova::gui::Icon::Profile,
+            scenarioToggle_->isChecked() ? QColor(QStringLiteral("#ffffff")) :
+                                           QColor(QStringLiteral("#bfd0e2")));
+    }
+    void refreshLibraryToolbarLabels() {
+        if (!scenarioToolbar_) return;
+        refreshScenarioToggleLabel();
+        const bool ru = language_ == QStringLiteral("ru");
+        if (scenarioToolbarTitle_) scenarioToolbarTitle_->setText(
+            ru ? QStringLiteral("Сценарий") : QStringLiteral("Scenario"));
+        // These are the existing, connected Save/Load/Delete controls. Keep the
+        // toolbar compact while retaining localized accessible labels and tips.
+        const auto label = [ru](QPushButton* button, const QString& en, const QString& translated) {
+            if (!button) return;
+            button->setText(QString());
+            const QString name = ru ? translated : en;
+            button->setToolTip(name);
+            button->setAccessibleName(name);
+        };
+        for (auto* save : {saveClickScenario_, inputLab_->savePlanControl()})
+            label(save, QStringLiteral("Save scenario as..."), QStringLiteral("Сохранить сценарий как..."));
+        for (auto* load : {loadClickScenario_, inputLab_->loadPlanControl()})
+            label(load, QStringLiteral("Load selected scenario"), QStringLiteral("Загрузить выбранный сценарий"));
+        for (auto* del : {deleteClickScenario_, inputLab_->deletePlanControl()})
+            label(del, QStringLiteral("Delete selected scenario"), QStringLiteral("Удалить выбранный сценарий"));
+        if (clickScenarios_) clickScenarios_->setToolTip(ru ?
+            QStringLiteral("Сохранения автокликера") : QStringLiteral("Auto Clicker scenarios"));
+        if (inputLab_->savedPlanPicker()) inputLab_->savedPlanPicker()->setToolTip(ru ?
+            QStringLiteral("Сохранённые сценарии шагов") : QStringLiteral("Saved Steps scenarios"));
+    }
+    void setupLibraryToolbar(QGroupBox* autoLibrary) {
+        auto* toolbar = new QToolBar(QStringLiteral("Scenarios"), this);
+        scenarioToolbar_ = toolbar;
+        toolbar->setObjectName(QStringLiteral("scenarioToolbar"));
+        toolbar->setMovable(false);
+        toolbar->setFloatable(false);
+        toolbar->setIconSize(QSize(19, 19));
+        toolbar->setStyleSheet(QStringLiteral(R"(
+            QToolBar#scenarioToolbar { background: #19212b; border-bottom: 1px solid #354253;
+                                         padding: 4px 12px; spacing: 6px; }
+            QLabel#scenarioToolbarTitle { font-weight: 600; color: #cad7e9; }
+            QLabel#profileHeaderTitle { font-weight: 600; color: #bad6f4; }
+            QToolBar#scenarioToolbar::separator {
+                background: #485b70; width: 2px; margin: 7px 10px;
+            }
+        )"));
+        // Dedicated row avoids squeezing Start/Stop on narrow windows.
+        addToolBarBreak(Qt::TopToolBarArea);
+        addToolBar(Qt::TopToolBarArea, toolbar);
+        scenarioToolbarTitle_ = new QLabel(toolbar);
+        scenarioToolbarTitle_->setObjectName(QStringLiteral("scenarioToolbarTitle"));
+        scenarioToolbarTitle_->setMinimumWidth(102);
+        toolbar->addWidget(scenarioToolbarTitle_);
+        toolbar->addSeparator();
+        const auto attach = [toolbar](QComboBox* picker, QPushButton* save,
+                                      QPushButton* load, QPushButton* remove) {
+            std::vector<QAction*> actions;
+            picker->setMinimumWidth(180);
+            picker->setMaximumWidth(340);
+            // The common 44-pixel control height also applies after reparenting
+            // selectors into the shared scenario toolbar.
+            picker->setMinimumHeight(44);
+            actions.push_back(toolbar->addWidget(picker));
+            for (auto* button : {save, load, remove}) {
+                button->setMinimumSize(44, 44);
+                button->setMaximumWidth(48);
+                actions.push_back(toolbar->addWidget(button));
+            }
+            return actions;
+        };
+        autoLibraryActions_ = attach(clickScenarios_, saveClickScenario_,
+                                     loadClickScenario_, deleteClickScenario_);
+        stepsLibraryActions_ = attach(inputLab_->savedPlanPicker(), inputLab_->savePlanControl(),
+                                      inputLab_->loadPlanControl(), inputLab_->deletePlanControl());
+        // Hide the obsolete containers after moving their real widgets.
+        // Never add proxy buttons: saves must use their original slots.
+        autoLibrary->hide();
+        inputLab_->hideEmbeddedSavedLibrary();
+        // Hidden by default: the upper-right profile-shaped button is the only
+        // entry point. Preserve the real selectors in the hidden toolbar.
+        // Visibility is applied again after moving the original profile
+        // widgets into this toolbar (their previous parent was the brand row).
+        toolbar->setVisible(scenarioToggle_ && scenarioToggle_->isChecked());
+        refreshLibraryToolbarLabels();
+        refreshRunToolbar();
     }
     void refreshRunToolbar() {
         if (!quickStartAction_ || !quickStopAction_ || !stepStartAction_ || !stepStopAction_) return;
@@ -1214,6 +1523,31 @@ private:
         stepStopAction_->setVisible(!quick);
         if (toolbarWorkflow_) toolbarWorkflow_->setText(quick ?
             uiText(QStringLiteral("Auto Clicker")) : uiText(QStringLiteral("Steps")));
+        for (auto* action : autoLibraryActions_) action->setVisible(quick);
+        for (auto* action : stepsLibraryActions_) action->setVisible(!quick);
+    }
+    void refreshActivityLogLabels() {
+        const bool ru = language_ == QStringLiteral("ru");
+        if (logTitle_) logTitle_->setText(ru ? QStringLiteral("Журнал") : QStringLiteral("Activity log"));
+        refreshActivityLogActions();
+        if (activityLog_) activityLog_->setPlaceholderText(
+            uiText(QStringLiteral("Execution and recorder events will appear here.")));
+        const auto update = [this, ru](const QString& object, const QString& en, const QString& translated) {
+            if (auto* button = findChild<QPushButton*>(object)) {
+                button->setText(ru ? translated : en);
+                button->setToolTip(ru ? translated : en);
+                button->setAccessibleName(button->toolTip());
+            }
+        };
+        update(QStringLiteral("copyActivityLog"), QStringLiteral("Copy all"), QStringLiteral("Копировать всё"));
+        update(QStringLiteral("saveActivityLog"), QStringLiteral("Save TXT"), QStringLiteral("Сохранить TXT"));
+        update(QStringLiteral("clearActivityLog"), QStringLiteral("Clear"), QStringLiteral("Очистить"));
+        if (logToggle_) {
+            logToggle_->setText(QString());
+            logToggle_->setToolTip(logExpanded_ ?
+                (ru ? QStringLiteral("Свернуть журнал") : QStringLiteral("Collapse log")) :
+                (ru ? QStringLiteral("Развернуть журнал") : QStringLiteral("Expand log")));
+        }
     }
     void setupRunToolbarAndLog() {
         auto* toolbar = new QToolBar(QStringLiteral("Execution"), this);
@@ -1221,10 +1555,21 @@ private:
         toolbar->setMovable(false);
         toolbar->setFloatable(false);
         toolbar->setIconSize(QSize(22, 22));
+        // Apply a consistent compact command-bar rhythm without creating
+        // new Start/Stop controls or changing their existing connections.
+        toolbar->setStyleSheet(QStringLiteral(R"(
+            QToolBar#executionToolbar {
+                background: #1b222c;
+                border-bottom: 1px solid #354253;
+                padding: 7px 12px;
+                spacing: 9px;
+            }
+            QLabel#executionWorkflow { color: #cad7e9; font-weight: 600; padding-right: 5px; }
+        )"));
         addToolBar(Qt::TopToolBarArea, toolbar);
         toolbarWorkflow_ = new QLabel(toolbar);
         toolbarWorkflow_->setObjectName(QStringLiteral("executionWorkflow"));
-        toolbarWorkflow_->setMinimumWidth(110);
+        toolbarWorkflow_->setMinimumWidth(118);
         toolbar->addWidget(toolbarWorkflow_);
         toolbar->addSeparator();
         // Reparent existing connected buttons; no second Run/Stop controls.
@@ -1233,45 +1578,117 @@ private:
         stepStartAction_ = toolbar->addWidget(inputLab_->runControl());
         stepStopAction_ = toolbar->addWidget(inputLab_->stopControl());
         for (auto* button : {start_, stop_, inputLab_->runControl(), inputLab_->stopControl()}) {
-            button->setMinimumWidth(136);
+            button->setMinimumWidth(155);
             button->setMinimumHeight(42);
         }
-        toolbar->addSeparator();
+        // A single account-style icon opens both the scenario library and
+        // profiles. Their original Save/Load/Delete handlers remain connected.
+        auto* toolbarSpacer = new QWidget(toolbar);
+        toolbarSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        toolbar->addWidget(toolbarSpacer);
+        scenarioToggle_ = new QPushButton(toolbar);
+        scenarioToggle_->setObjectName(QStringLiteral("scenarioToolbarToggle"));
+        scenarioToggle_->setCheckable(true);
+        scenarioToggle_->setChecked(false);
+        scenarioToggle_->setFixedSize(44, 44);
+        scenarioToggle_->setStyleSheet(QStringLiteral(R"(
+            QPushButton#scenarioToolbarToggle {
+                background: #273341; color: #d5e0ee; border: 1px solid #536477;
+                border-radius: 9px; padding: 7px;
+            }
+            QPushButton#scenarioToolbarToggle:hover { background: #344558; }
+            QPushButton#scenarioToolbarToggle:checked {
+                background: #245784; border: 2px solid #64b2ff;
+            }
+            QPushButton#scenarioToolbarToggle:checked:hover { background: #2b6698; }
+        )"));
+        clicknova::gui::setButtonIcon(scenarioToggle_, clicknova::gui::Icon::Profile);
+        toolbar->addWidget(scenarioToggle_);
+        connect(scenarioToggle_, &QPushButton::toggled, this, [this](bool expanded) {
+            if (scenarioToolbar_) scenarioToolbar_->setVisible(expanded);
+            refreshScenarioToggleLabel();
+        });
+        refreshScenarioToggleLabel();
+        // Fixed bottom diagnostics bar: its title and controls remain visible
+        // while only the history pane collapses. No duplicated toolbar toggle.
         logDock_ = new QDockWidget(uiText(QStringLiteral("Activity log")), this);
         logDock_->setObjectName(QStringLiteral("activityLogDock"));
         logDock_->setAllowedAreas(Qt::BottomDockWidgetArea);
-        logDock_->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable);
-        auto* logPanel = new QWidget(logDock_);
-        auto* panelLayout = new QVBoxLayout(logPanel);
-        panelLayout->setContentsMargins(6, 4, 6, 4);
-        panelLayout->setSpacing(4);
-        auto* logActions = new QHBoxLayout;
-        auto* clear = new QPushButton(uiText(QStringLiteral("Clear log")), logPanel);
+        logDock_->setFeatures(QDockWidget::NoDockWidgetFeatures);
+        auto* logHeader = new QWidget(logDock_);
+        logHeader->setObjectName(QStringLiteral("activityLogHeader"));
+        auto* headerLayout = new QHBoxLayout(logHeader);
+        headerLayout->setContentsMargins(9, 4, 9, 4);
+        headerLayout->setSpacing(8);
+        logTitle_ = new QLabel(logHeader);
+        logTitle_->setObjectName(QStringLiteral("activityLogTitle"));
+        headerLayout->addWidget(logTitle_);
+        logCount_ = new QLabel(QStringLiteral("0"), logHeader);
+        logCount_->setObjectName(QStringLiteral("activityLogCount"));
+        logCount_->setAlignment(Qt::AlignCenter);
+        logCount_->setMinimumWidth(31);
+        headerLayout->addWidget(logCount_);
+        logToggle_ = new QPushButton(logHeader);
+        logToggle_->setObjectName(QStringLiteral("toggleActivityLog"));
+        logToggle_->setFixedSize(34, 34);
+        headerLayout->addWidget(logToggle_);
+        headerLayout->addStretch();
+        // Recovery is never hidden in the body: if a checkpoint is available,
+        // the recovery button stays accessible even with collapsed history.
+        headerLayout->addWidget(inputLab_->recoveryControl());
+        logCopy_ = new QPushButton(logHeader);
+        auto* copy = logCopy_;
+        copy->setObjectName(QStringLiteral("copyActivityLog"));
+        clicknova::gui::setButtonIcon(copy, clicknova::gui::Icon::Copy);
+        headerLayout->addWidget(copy);
+        logSave_ = new QPushButton(logHeader);
+        auto* save = logSave_;
+        save->setObjectName(QStringLiteral("saveActivityLog"));
+        clicknova::gui::setButtonIcon(save, clicknova::gui::Icon::Save);
+        headerLayout->addWidget(save);
+        logClear_ = new QPushButton(logHeader);
+        auto* clear = logClear_;
         clear->setObjectName(QStringLiteral("clearActivityLog"));
-        clear->setToolTip(QStringLiteral("Clear only the visible diagnostic history; scenarios and recordings are not changed."));
-        // Recovery belongs to diagnostics, not the frequently-used Record button.
-        // It becomes visible only when an unfinished local checkpoint exists.
-        logActions->addWidget(inputLab_->recoveryControl());
-        logActions->addStretch();
-        logActions->addWidget(clear);
-        panelLayout->addLayout(logActions);
-        activityLog_ = new QPlainTextEdit(logPanel);
+        clear->setProperty("actionRole", QStringLiteral("danger"));
+        clicknova::gui::setButtonIcon(clear, clicknova::gui::Icon::Delete);
+        headerLayout->addWidget(clear);
+        for (auto* button : {copy, save, clear}) {
+            button->setMinimumHeight(34);
+            button->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+        }
+        logDock_->setTitleBarWidget(logHeader);
+        logBody_ = new QWidget(logDock_);
+        auto* panelLayout = new QVBoxLayout(logBody_);
+        panelLayout->setContentsMargins(8, 3, 8, 7);
+        activityLog_ = new QPlainTextEdit(logBody_);
         activityLog_->setObjectName(QStringLiteral("activityLogView"));
         activityLog_->setReadOnly(true);
-        activityLog_->setMaximumBlockCount(1500);
+        activityLog_->setMaximumBlockCount(3000);
         activityLog_->setMinimumHeight(70);
         activityLog_->setPlaceholderText(uiText(QStringLiteral("Execution and recorder events will appear here.")));
+        activityLog_->setStyleSheet(QStringLiteral(
+            "QPlainTextEdit { background: #121820; color: #e1e9f5; border: 1px solid #354253; "
+            "border-radius: 5px; selection-background-color: #395578; }"));
         panelLayout->addWidget(activityLog_);
-        logDock_->setWidget(logPanel);
+        logDock_->setWidget(logBody_);
         addDockWidget(Qt::BottomDockWidgetArea, logDock_);
-        resizeDocks({logDock_}, {185}, Qt::Vertical);
-        connect(clear, &QPushButton::clicked, activityLog_, &QPlainTextEdit::clear);
-        QAction* toggle = logDock_->toggleViewAction();
-        toggle->setObjectName(QStringLiteral("toggleActivityLog"));
-        toggle->setText(uiText(QStringLiteral("Log")));
-        toolbar->addAction(toggle);
+        setActivityLogExpanded(true);
+        connect(logToggle_, &QPushButton::clicked, this,
+                [this] { setActivityLogExpanded(!logExpanded_); });
+        connect(clear, &QPushButton::clicked, this, [this] {
+            activityLog_->clear();
+            activityLogEntries_ = 0;
+            previousProgressLogTime_ = 0;
+            refreshActivityLogActions();
+        });
+        connect(copy, &QPushButton::clicked, this, [this] {
+            QApplication::clipboard()->setText(activityLog_->toPlainText());
+        });
+        connect(save, &QPushButton::clicked, this, [this] { saveActivityLog(); });
+        refreshActivityLogLabels();
         inputLab_->setStatusSink([this](const QString& message) {
             appendActivityLog(message);
+            updateProfileActions();
         });
         sequenceToolbarActive_ = navigation_->currentRow() == 1;
         refreshRunToolbar();
@@ -1335,6 +1752,8 @@ private:
             settingsTabs_->setTabText(0, uiText(QStringLiteral("Profiles")));
             settingsTabs_->setTabText(1, uiText(QStringLiteral("Shortcuts")));
             settingsTabs_->setTabText(2, uiText(QStringLiteral("Language")));
+            settingsTabs_->setTabText(3, language_ == QStringLiteral("ru")
+                ? QStringLiteral("Компоненты") : QStringLiteral("Components"));
         }
         if (profiles_) profiles_->setPlaceholderText(uiText(QStringLiteral("Choose a saved profile")));
         if (clickScenarios_) clickScenarios_->setPlaceholderText(uiText(QStringLiteral("Select a saved scenario")));
@@ -1348,12 +1767,9 @@ private:
         updateQuickOptions();
         updateTargetInputs();
         refreshRunToolbar();
-        if (logDock_) logDock_->setWindowTitle(language_ == QStringLiteral("ru") ?
-            QStringLiteral("Журнал") : QStringLiteral("Activity log"));
-        if (auto* toggle = findChild<QAction*>(QStringLiteral("toggleActivityLog")))
-            toggle->setText(language_ == QStringLiteral("ru") ? QStringLiteral("Журнал") : QStringLiteral("Log"));
-        if (auto* clearLog = findChild<QPushButton*>(QStringLiteral("clearActivityLog")))
-            clearLog->setText(language_ == QStringLiteral("ru") ? QStringLiteral("Очистить") : QStringLiteral("Clear log"));
+        refreshLibraryToolbarLabels();
+        refreshProfileHeaderLabels();
+        refreshActivityLogLabels();
         if (status_) status_->setText(uiText(lastStatusEnglish_.isEmpty()
                                     ? QStringLiteral("Ready") : lastStatusEnglish_));
         if (workflowFeedback_ && workflowFeedback_->isVisible())
@@ -1404,7 +1820,7 @@ private:
         help(optionalDetails_, QStringLiteral("Show or hide less commonly used position and window settings."));
         help(clickScenarios_, QStringLiteral("Saved single-click setups; loading one does not replace a sequence."));
         help(sequenceScenarios_, QStringLiteral("Saved sequences with their actions and timing."));
-        help(profiles_, QStringLiteral("Full profiles include settings from both workspaces."));
+        help(profiles_, QStringLiteral("Profiles store automation settings and shortcuts. Recorded step scenarios are saved separately."));
         help(start_, QStringLiteral("Start the workflow selected on the left. Stop remains available at all times."));
         help(stop_, QStringLiteral("Immediately stop the current automation."));
         help(startShortcut_, QStringLiteral("Shortcut to start automation when enabled."));
@@ -1429,7 +1845,11 @@ private:
         return value;
     }
     QString stopHotkeyLabel() const {
+#ifdef CLICKNOVA_WITH_X11
+        return QStringLiteral("F12");
+#else
         return stopShortcut_->keySequence().toString(QKeySequence::NativeText);
+#endif
     }
     void refreshShortcutLabels() {
         const auto start = startShortcut_->keySequence().toString(QKeySequence::NativeText);
@@ -1513,6 +1933,13 @@ private:
         startShortcut_->setEnabled(enabled && enableStartShortcut_->isChecked());
         stopShortcut_->setEnabled(enabled);
         pickShortcut_->setEnabled(enabled && enablePickShortcut_->isChecked());
+#ifdef CLICKNOVA_WITH_X11
+        enableStartShortcut_->setEnabled(false);
+        enablePickShortcut_->setEnabled(false);
+        startShortcut_->setEnabled(false);
+        stopShortcut_->setEnabled(false); // Reserved fixed global F12
+        pickShortcut_->setEnabled(false);
+#endif
     }
     void start() {
         if (inputLab_ && inputLab_->isRunning()) {
@@ -1524,6 +1951,13 @@ private:
             return;
         }
 #ifndef _WIN32
+#ifdef CLICKNOVA_WITH_X11
+        // Reuse the tested sequence engine and its mandatory global F12 stop.
+        // Never run a separate, unguarded quick-click timer on Linux.
+        if (convertQuickClicksToSequence() && inputLab_) inputLab_->requestRun();
+#else
+        setStatus(QStringLiteral("X11 input playback is unavailable on this Linux build."));
+#endif
         return;
 #else
         if (active_ || capturePending_) return;
@@ -1950,25 +2384,25 @@ private:
         stop();
         setStatus(reason + QStringLiteral(" Automation stopped."));
     }
-    void convertQuickClicksToSequence() {
-        if (!inputLab_ || inputLab_->isRunning() || active_ || capturePending_) return;
+    bool convertQuickClicksToSequence() {
+        if (!inputLab_ || inputLab_->isRunning() || active_ || capturePending_) return false;
         const bool bound = targetMode_->currentIndex() == 1;
         const int mode = quickAction_->currentIndex();
         if (mode == 3) {
             QMessageBox::information(this, QStringLiteral("ClickNova"), uiText(
                 QStringLiteral("Hold-until-Stop cannot be represented as a finite sequence. Add a Mouse Hold action in Steps.")));
-            return;
+            return false;
         }
         int count = count_->value();
         if (infinite_->isChecked()) {
             bool ok = false;
             count = QInputDialog::getInt(this, QStringLiteral("ClickNova"), uiText(
                 QStringLiteral("Enter a finite number of repetitions to convert:")), 1, 1, std::numeric_limits<int>::max(), 1, &ok);
-            if (!ok) return;
+            if (!ok) return false;
         }
         if (bound && !selectedTarget_) {
             setStatus(QStringLiteral("Choose a target window before converting window-bound clicks."));
-            return;
+            return false;
         }
         clicknova::input::Plan plan;
         plan.requireTargetWindow = bound;
@@ -1994,7 +2428,7 @@ private:
         };
         if (mode != 0 && !destinationConfigured_) {
             setStatus(QStringLiteral("Capture the motion destination before converting."));
-            return;
+            return false;
         }
         const int actionsPerClick = (fixed ? 1 : 0) + (mode == 2 ? 3 : 1);
         // Small finite macros become individually editable steps. Larger ones
@@ -2003,22 +2437,23 @@ private:
         if (expand) {
             for (int i = 0; i < count; ++i) {
                 if (i) plan.actions.emplace_back(clicknova::input::Wait{interval_->value()});
-                if (!append()) return;
+                if (!append()) return false;
             }
         } else {
             plan.repetitions = count;
             plan.passDelayMs = interval_->value();
-            if (!append()) return;
+            if (!append()) return false;
         }
         if (const auto error = clicknova::input::validate(plan); !error.empty()) {
             QMessageBox::warning(this, QStringLiteral("ClickNova"), QString::fromStdString(error));
-            return;
+            return false;
         }
         if (QMessageBox::question(this, QStringLiteral("ClickNova"), uiText(
-            QStringLiteral("Replace the common action list with these clicks?"))) != QMessageBox::Yes) return;
+            QStringLiteral("Replace the common action list with these clicks?"))) != QMessageBox::Yes) return false;
         inputLab_->replaceActions(plan);
         navigation_->setCurrentRow(1);
         setStatus(QStringLiteral("Quick actions transferred to the common sequence editor."));
+        return true;
     }
     void updateQuickOptions() {
         if (!quickPosition_ || !quickWindow_ || !positionMode_ || !targetMode_) return;
@@ -2962,12 +3397,15 @@ private:
         updateProfileActions();
     }
     void updateProfileActions() {
-        const bool chosen = profiles_ && profiles_->currentIndex() >= 0 && !active_ && !capturePending_;
+        const bool idle = !active_ && !capturePending_ &&
+                          (!inputLab_ || !inputLab_->isRunning());
+        const bool chosen = profiles_ && profiles_->currentIndex() >= 0 && idle;
+        if (saveProfile_) saveProfile_->setEnabled(idle);
         if (loadProfile_) loadProfile_->setEnabled(chosen);
         if (deleteProfile_) deleteProfile_->setEnabled(chosen);
     }
     void saveNamedProfile() {
-        if (active_ || capturePending_) return;
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning())) return;
         bool accepted = false;
         const QString name = QInputDialog::getText(
             this, uiText(QStringLiteral("Save profile")), uiText(QStringLiteral("Profile name:")),
@@ -2994,7 +3432,8 @@ private:
         setStatus(QStringLiteral("Saved profile: %1").arg(name));
     }
     void loadNamedProfile() {
-        if (active_ || capturePending_ || profiles_->currentIndex() < 0) return;
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            profiles_->currentIndex() < 0) return;
         if (sequenceEditor_->hasUnsavedActionChanges()) {
             navigation_->setCurrentRow(1);
             setStatus(QStringLiteral("Apply changes to the selected action before starting."));
@@ -3066,7 +3505,8 @@ private:
         setStatus(QStringLiteral("Loaded profile: %1").arg(name));
     }
     void deleteNamedProfile() {
-        if (active_ || capturePending_ || profiles_->currentIndex() < 0) return;
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            profiles_->currentIndex() < 0) return;
         const auto name = profiles_->currentText();
         if (QMessageBox::question(this, uiText(QStringLiteral("Delete profile")),
             uiText(QStringLiteral("Delete saved profile '%1'?")).arg(name)) != QMessageBox::Yes) return;
@@ -3163,6 +3603,8 @@ private:
     QPushButton* deleteClickScenario_{nullptr};
     QPushButton* deleteSequenceScenario_{nullptr};
     QComboBox* profiles_{nullptr};
+    QWidget* profileHeader_{nullptr};
+    QLabel* profileTitle_{nullptr};
     QPushButton* saveProfile_{nullptr};
     QPushButton* loadProfile_{nullptr};
     QPushButton* deleteProfile_{nullptr};
@@ -3171,15 +3613,28 @@ private:
     QPushButton* start_{nullptr};
     QPushButton* stop_{nullptr};
     QDockWidget* logDock_{nullptr};
+    QWidget* logBody_{nullptr};
+    QLabel* logTitle_{nullptr};
+    QLabel* logCount_{nullptr};
+    QPushButton* logToggle_{nullptr};
+    QPushButton* logCopy_{nullptr};
+    QPushButton* logSave_{nullptr};
+    QPushButton* logClear_{nullptr};
+    int activityLogEntries_{0};
+    bool logExpanded_{true};
     QPlainTextEdit* activityLog_{nullptr};
     QLabel* toolbarWorkflow_{nullptr};
+    QToolBar* scenarioToolbar_{nullptr};
+    QLabel* scenarioToolbarTitle_{nullptr};
+    QPushButton* scenarioToggle_{nullptr};
+    std::vector<QAction*> autoLibraryActions_;
+    std::vector<QAction*> stepsLibraryActions_;
     QAction* quickStartAction_{nullptr};
     QAction* quickStopAction_{nullptr};
     QAction* stepStartAction_{nullptr};
     QAction* stepStopAction_{nullptr};
     bool sequenceToolbarActive_{false};
-    QString previousLogText_;
-    qint64 previousLogTime_{0};
+    qint64 previousProgressLogTime_{0};
     QLabel* workflowFeedback_{nullptr};
     QLabel* status_{nullptr};
     QTimer clickTimer_;

@@ -86,6 +86,122 @@ int main(int argc, char** argv) {
         1, 0, false, {observed, observed}};
     const auto restoredObserved = decodeInputPlan(encodeInputPlan(observedPlan));
     assert(restoredObserved && restoredObserved->stepWindows == observedPlan.stepWindows);
+    // A UIA selector is saved with its STEP, not a transient COM object.
+    StepWindow withUi{"Browser", "chrome.exe", true, 1000};
+    withUi.elementAutomationId = "submit";
+    withUi.elementName = "Submit";
+    withUi.elementClass = "Button";
+    withUi.elementRole = 1;
+    withUi.elementBrowser = true;
+    const Plan boundClick{{Click{Button::Left, 1, 50}}, 1, 0, false, {withUi}};
+    const auto boundRoundtrip = decodeInputPlan(encodeInputPlan(boundClick));
+    assert(boundRoundtrip && boundRoundtrip->stepWindows == boundClick.stepWindows);
+    // Preserve backend ID, including after a save/reload of Java/MSAA steps.
+    StepWindow msaaBinding = withUi;
+    msaaBinding.elementBrowser = false;
+    msaaBinding.elementProvider = 1;
+    msaaBinding.elementAutomationId = "msaa/d0/i1";
+    const auto msaaData = encodeBoundInputAction(Click{Button::Left}, msaaBinding);
+    assert(msaaData.value(QStringLiteral("uiaProvider")).toInt() == 1);
+    assert(decodeStepWindow(msaaData) == msaaBinding);
+    auto jabBinding = msaaBinding;
+    jabBinding.elementProvider = 2;
+    jabBinding.elementAutomationId = "jab/0/2";
+    assert(decodeStepWindow(encodeBoundInputAction(Click{Button::Left}, jabBinding)) == jabBinding);
+    auto imageBinding = msaaBinding;
+    imageBinding.elementProvider = 3;
+    imageBinding.elementAutomationId = "cv:C:\\templates\\play.png";
+    imageBinding.elementClass = "v1:5000,5000";
+    assert(decodeStepWindow(encodeBoundInputAction(Click{Button::Left}, imageBinding)) == imageBinding);
+    auto ocrBinding = imageBinding;
+    ocrBinding.elementProvider = 4;
+    ocrBinding.elementAutomationId = "ocr:Play";
+    assert(decodeStepWindow(encodeBoundInputAction(Click{Button::Left}, ocrBinding)) == ocrBinding);
+    // Universal element tasks survive clipboard, JSON and scenario storage.
+    auto waitBinding = imageBinding;
+    waitBinding.elementOperation = 0;
+    const Plan tasks{{ElementTask{ElementCommand::WaitVisible, u"", Axis::Vertical, 120, 6400, 250},
+                      ElementTask{ElementCommand::AssertVisible}}, 1, 0, false,
+                     {waitBinding, waitBinding}};
+    const auto tasksRoundtrip = decodeInputPlan(encodeInputPlan(tasks));
+    assert(tasksRoundtrip && tasksRoundtrip->stepWindows == tasks.stepWindows);
+    assert(std::get<ElementTask>(tasksRoundtrip->actions[0]).timeoutMs == 6400);
+    assert(std::get<ElementTask>(tasksRoundtrip->actions[0]).pollMs == 250);
+    assert(std::get<ElementTask>(tasksRoundtrip->actions[0]).doubleIntervalMs == 100);
+    assert(std::get<ElementTask>(tasksRoundtrip->actions[1]).command == ElementCommand::AssertVisible);
+    auto malformedTask = encodeInputAction(ElementTask{ElementCommand::Scroll});
+    malformedTask[QStringLiteral("command")] = 99;
+    assert(!decodeInputAction(malformedTask));
+    auto editTaskBinding = withUi;
+    editTaskBinding.elementBrowser = false;
+    editTaskBinding.elementRole = 2;
+    editTaskBinding.elementOperation = 1;
+    editTaskBinding.elementValue.clear();
+    const Plan setTextTask{{ElementTask{ElementCommand::SetText, u"Русский text"}}, 1, 0, false,
+                           {editTaskBinding}};
+    const auto setTextDecoded = decodeInputPlan(encodeInputPlan(setTextTask));
+    assert(setTextDecoded && std::get<ElementTask>(setTextDecoded->actions[0]).text == u"Русский text");
+    auto scrollTaskBinding = withUi;
+    scrollTaskBinding.elementBrowser = false;
+    scrollTaskBinding.elementRole = 0;
+    scrollTaskBinding.elementOperation = 10;
+    const Plan scrollTask{{ElementTask{ElementCommand::Scroll, u"", Axis::Horizontal, -240}},
+                           1, 0, false, {scrollTaskBinding}};
+    const auto scrollDecoded = decodeInputPlan(encodeInputPlan(scrollTask));
+    assert(scrollDecoded && std::get<ElementTask>(scrollDecoded->actions[0]).delta == -240);
+    auto badProvider = msaaData;
+    badProvider[QStringLiteral("uiaProvider")] = 4;
+    assert(!decodeStepWindow(badProvider));
+    badProvider = msaaData;
+    badProvider[QStringLiteral("uiaProvider")] = 2;
+    assert(!decodeStepWindow(badProvider));
+    StepWindow withTab = withUi;
+    withTab.elementTab = "Example page - Chromium";
+    const auto tabJson = encodeBoundInputAction(Click{Button::Left}, withTab);
+    assert(tabJson.value(QStringLiteral("uiaTab")).toString() == QStringLiteral("Example page - Chromium"));
+    const auto tabDecoded = decodeStepWindow(tabJson);
+    assert(tabDecoded && *tabDecoded == withTab);
+    auto invalidTab = tabJson;
+    invalidTab[QStringLiteral("uiaTab")] = 42;
+    assert(!decodeStepWindow(invalidTab));
+    invalidTab = tabJson;
+    invalidTab[QStringLiteral("uiaBrowser")] = false;
+    assert(!decodeStepWindow(invalidTab));
+    // Old Invoke bindings do not require an operation or value in JSON.
+    auto legacyUia = encodeBoundInputAction(boundClick.actions.front(), withUi);
+    legacyUia.remove(QStringLiteral("uiaOperation"));
+    assert(decodeStepWindow(legacyUia));
+    StepWindow editBinding = withUi;
+    editBinding.elementRole = 2;
+    editBinding.elementOperation = 1;
+    editBinding.elementValue = "User text";
+    const Plan valuePlan{{Click{Button::Left, 1, 0}}, 1, 0, false, {editBinding}};
+    const auto valueRoundtrip = decodeInputPlan(encodeInputPlan(valuePlan));
+    assert(valueRoundtrip && valueRoundtrip->stepWindows == valuePlan.stepWindows);
+    auto numeric = editBinding;
+    numeric.elementRole = 11;
+    numeric.elementOperation = 7;
+    numeric.elementValue = "3.75";
+    assert(decodeStepWindow(encodeBoundInputAction(Click{Button::Left}, numeric)));
+    auto corruptOp = encodeBoundInputAction(Click{Button::Left}, numeric);
+    corruptOp[QStringLiteral("uiaOperation")] = 100;
+    assert(!decodeStepWindow(corruptOp));
+    corruptOp = encodeBoundInputAction(Click{Button::Left}, numeric);
+    corruptOp[QStringLiteral("uiaValue")] = true;
+    assert(!decodeStepWindow(corruptOp));
+    const auto boundRecord = encodeBoundInputAction(boundClick.actions.front(), withUi);
+    assert(boundRecord.value(QStringLiteral("uiaAutomationId")).toString() == QStringLiteral("submit"));
+    auto corruptUi = boundRecord;
+    corruptUi[QStringLiteral("uiaRole")] = 42;
+    assert(!decodeStepWindow(corruptUi));
+    corruptUi = boundRecord;
+    corruptUi.remove(QStringLiteral("uiaAutomationId"));
+    assert(!decodeStepWindow(corruptUi));
+    corruptUi = boundRecord;
+    corruptUi[QStringLiteral("enforceTargetWindow")] = false;
+    assert(!decodeStepWindow(corruptUi));
+    assert(!decodeInputPlan(encodeInputPlan(Plan{{TypeText{u"x"}}, 1, 0, false, {withUi}})));
+
     // Existing JSON plans had no enforcement flag and must remain strict.
     auto legacyRequired = encodedAction;
     legacyRequired.remove(QStringLiteral("enforceTargetWindow"));
@@ -180,6 +296,36 @@ int main(int argc, char** argv) {
     assert(std::get<Click>(wideRoundtrip->actions.front()).count == 8'000'000'000LL);
     assert(std::get<Wait>(wideRoundtrip->actions.back()).durationMs == 1'209'600'000LL);
     assert(wideRoundtrip->passDelayMs == 432'000'000LL);
+    // Named groups persist per action, without altering the number/order of
+    // operations or requiring a new planVersion.
+    Plan grouped{{Click{Button::Left, 1, 50}, TypeText{u"Alice"}, Wait{100}}};
+    grouped.stepWindows.resize(grouped.actions.size());
+    for (auto& window : grouped.stepWindows) {
+        window.manualGroupId = "37ca86e1-01d7-495e-8bd1-e0ccb460b807";
+        window.manualGroupTitle = QStringLiteral("Авторизация").toStdString();
+    }
+    const auto groupedMap = encodeInputPlan(grouped);
+    const auto decodedGroup = decodeInputPlan(groupedMap);
+    assert(decodedGroup && decodedGroup->actions.size() == grouped.actions.size());
+    for (const auto& window : decodedGroup->stepWindows) {
+        assert(window.manualGroupId == grouped.stepWindows.front().manualGroupId);
+        assert(window.manualGroupTitle == grouped.stepWindows.front().manualGroupTitle);
+    }
+    auto brokenGroup = groupedMap;
+    auto brokenRows = brokenGroup[QStringLiteral("actions")].toList();
+    auto brokenEntry = brokenRows[1].toMap();
+    brokenEntry[QStringLiteral("manualGroupId")] = QStringLiteral("not-a-uuid");
+    brokenRows[1] = brokenEntry;
+    brokenGroup[QStringLiteral("actions")] = brokenRows;
+    assert(!decodeInputPlan(brokenGroup));
+    auto incompatible = groupedMap;
+    auto badRows = incompatible[QStringLiteral("actions")].toList();
+    auto badEntry = badRows[1].toMap();
+    badEntry.remove(QStringLiteral("manualGroupTitle"));
+    badRows[1] = badEntry;
+    incompatible[QStringLiteral("actions")] = badRows;
+    assert(!decodeInputPlan(incompatible));
+    assert(decodeInputPlan(encodeInputPlan(Plan{{Click{Button::Left, 1, 100}}})));
     assert(store.load(Kind::Sequence, QStringLiteral("Mixed test")) == std::nullopt);
     assert(store.remove(Kind::InputLab, QStringLiteral("Mixed test")));
     assert(store.names(Kind::InputLab).isEmpty());

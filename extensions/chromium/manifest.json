@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "ClickNova Tabs Bridge",
+  "version": "0.6.0",
+  "description": "With your consent, send tab names, URLs and favicons to ClickNova on your computer. No page contents or cookies.",
+  "permissions": ["tabs", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1:48231/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_title": "ClickNova Tabs", "default_popup": "options.html"},
+  "options_page": "options.html"
+}

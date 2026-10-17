@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "input_lab.hpp"
+#include "browser_discovery.hpp"
+#include "browser_extension_bridge.hpp"
 #include "action_table_widget.hpp"
 #include "clicknova/action_list_edit.hpp"
+#include "clicknova/action_step_groups.hpp"
 #include "clicknova/duration_expression.hpp"
 #include "input_capture_dialog.hpp"
 #include "input_recorder_dialog.hpp"
@@ -10,26 +13,56 @@
 #include "window_chooser.hpp"
 #include "wrap_layout.hpp"
 #include "ui_icons.hpp"
+#include "portable_storage.hpp"
+#include <QCryptographicHash>
 #include "clicknova/input_recording.hpp"
+#include "clicknova/ui_element_search.hpp"
+#include "clicknova/visual_recognition.hpp"
 #include "../storage/input_plan_codec.hpp"
 #include "../storage/scenario_codec.hpp"
 #include "clicknova/sequence_to_input.hpp"
 #include "clicknova/windows_awake.hpp"
 #ifdef _WIN32
 #include "clicknova/windows_input_backend.hpp"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include <QComboBox>
+#include <QCursor>
+#include <QMouseEvent>
+#include <QSizePolicy>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QBuffer>
+#include <QImageReader>
+#include <QHash>
+#include <QSet>
+#include <QQueue>
 #include <QCheckBox>
 #include <QRegularExpressionValidator>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QDateTime>
+#include <QUuid>
 #include <QTimeEdit>
 #include <QFile>
 #include <QFileInfo>
+#include <QFileDialog>
+#include <QFileIconProvider>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QStandardItemModel>
 #include <QSaveFile>
 #include <QDir>
 #include <QStandardPaths>
+#include "portable_storage.hpp"
 #include <QJsonArray>
 #include <QProcess>
 #include <QTemporaryDir>
@@ -38,6 +71,9 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QLabel>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QThread>
 #include <QPlainTextEdit>
 #include <QMessageBox>
 #include <QInputDialog>
@@ -47,6 +83,9 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTableWidget>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
+#include <QSplitter>
 #include <QTableWidgetItem>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -55,8 +94,10 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QMimeData>
+#include <QGuiApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QStringList>
 #include <QMenu>
 #include <QContextMenuEvent>
 #include <QAction>
@@ -71,6 +112,8 @@
 #include <variant>
 #include <utility>
 #include <array>
+#include <memory>
+#include <functional>
 
 using namespace clicknova::input;
 
@@ -90,11 +133,33 @@ public:
         const auto process = QString::fromStdString(step.process).toStdWString();
         const auto started = std::chrono::steady_clock::now();
         while (!stop.stop_requested()) {
-            if (const auto found = clicknova::platform::findWindow(title, process)) {
-                if ((!step.activate && clicknova::platform::checkTarget(*found) ==
-                     clicknova::platform::TargetCheck::Ready) ||
+            auto found = clicknova::platform::findWindow(title, process);
+            // A browser window title often changes with the active tab. If an
+            // explicit tab was saved, allow a unique process-name match only.
+            // Several windows with the same executable remain ambiguous: fail.
+            if (!found && !step.elementTab.empty() &&
+                !process.empty()) {
+                std::optional<clicknova::platform::WindowTarget> unique;
+                bool ambiguous = false;
+                for (const auto& candidate : clicknova::platform::listWindows()) {
+                    if (QString::compare(QString::fromStdWString(candidate.process),
+                        QString::fromStdWString(process), Qt::CaseInsensitive) != 0) continue;
+                    if (unique) { ambiguous = true; break; }
+                    unique = candidate;
+                }
+                if (!ambiguous) found = std::move(unique);
+            }
+            if (found) {
+                // Only explicit native-provider element steps may run without
+                // activating their window. Raw input and visual OCR/OpenCV
+                // always go through the foreground input/visibility guard.
+                const bool background = clicknova::input::backgroundElementAction(step);
+                if ((background && clicknova::platform::checkAccessibleTarget(*found) ==
+                         clicknova::platform::TargetCheck::Ready) ||
+                    (!background && !step.activate &&
+                         clicknova::platform::checkTarget(*found) == clicknova::platform::TargetCheck::Ready) ||
                     (step.activate && clicknova::platform::activateWindow(*found) &&
-                     clicknova::platform::checkTarget(*found) == clicknova::platform::TargetCheck::Ready)) {
+                         clicknova::platform::checkTarget(*found) == clicknova::platform::TargetCheck::Ready)) {
                     native_.setTarget(*found);
                     return true;
                 }
@@ -104,6 +169,124 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return false;
+    }
+    bool invokeElement(const clicknova::input::StepWindow& binding, std::stop_token stop) override {
+        if (stop.stop_requested() || !native_.selectedWindow()) return false;
+        if (!binding.elementTab.empty() &&
+            !clicknova::accessibility::selectBrowserTab(*native_.selectedWindow(),
+                QString::fromStdString(binding.elementTab).toStdWString())) return false;
+        const bool invoked = clicknova::accessibility::perform(*native_.selectedWindow(),
+            QString::fromStdString(binding.elementName).toStdWString(),
+            QString::fromStdString(binding.elementAutomationId).toStdWString(),
+            QString::fromStdString(binding.elementClass).toStdWString(),
+            static_cast<clicknova::accessibility::Role>(binding.elementRole), binding.elementBrowser,
+            static_cast<clicknova::accessibility::Operation>(binding.elementOperation),
+            QString::fromStdString(binding.elementValue).toStdWString(),
+            static_cast<clicknova::accessibility::Provider>(binding.elementProvider),
+            clicknova::input::backgroundElementAction(binding));
+        return invoked && !stop.stop_requested();
+    }
+    bool doubleClickElement(const clicknova::input::StepWindow& binding,
+                            int intervalMs, std::stop_token stop) override {
+        if (stop.stop_requested() || !native_.selectedWindow() || !binding.activate ||
+            !binding.elementTab.empty()) return false;
+        const auto ok = clicknova::accessibility::pointerGesture(*native_.selectedWindow(),
+            QString::fromStdString(binding.elementName).toStdWString(),
+            QString::fromStdString(binding.elementAutomationId).toStdWString(),
+            QString::fromStdString(binding.elementClass).toStdWString(),
+            static_cast<clicknova::accessibility::Role>(binding.elementRole),
+            static_cast<clicknova::accessibility::Provider>(binding.elementProvider),
+            clicknova::accessibility::PointerGesture::DoubleClick, false, 0,
+            intervalMs, stop);
+        return ok && !stop.stop_requested();
+    }
+    bool elementPresent(const clicknova::input::StepWindow& binding, std::stop_token stop) override {
+        if (stop.stop_requested() || !native_.selectedWindow()) return false;
+        if (!binding.elementTab.empty() &&
+            !clicknova::accessibility::selectBrowserTab(*native_.selectedWindow(),
+                QString::fromStdString(binding.elementTab).toStdWString())) return false;
+        return clicknova::accessibility::present(*native_.selectedWindow(),
+            QString::fromStdString(binding.elementName).toStdWString(),
+            QString::fromStdString(binding.elementAutomationId).toStdWString(),
+            QString::fromStdString(binding.elementClass).toStdWString(),
+            static_cast<clicknova::accessibility::Role>(binding.elementRole), binding.elementBrowser,
+            static_cast<clicknova::accessibility::Provider>(binding.elementProvider),
+            clicknova::input::backgroundElementAction(binding)) && !stop.stop_requested();
+    }
+    bool scrollElement(const clicknova::input::StepWindow& binding,
+                       clicknova::input::Axis axis, int delta, std::stop_token stop) override {
+        if (stop.stop_requested() || !native_.selectedWindow()) return false;
+        if (binding.elementProvider != 0) {
+            if (!binding.activate || !binding.elementTab.empty()) return false;
+            return clicknova::accessibility::pointerGesture(*native_.selectedWindow(),
+                QString::fromStdString(binding.elementName).toStdWString(),
+                QString::fromStdString(binding.elementAutomationId).toStdWString(),
+                QString::fromStdString(binding.elementClass).toStdWString(),
+                static_cast<clicknova::accessibility::Role>(binding.elementRole),
+                static_cast<clicknova::accessibility::Provider>(binding.elementProvider),
+                clicknova::accessibility::PointerGesture::Wheel,
+                axis == clicknova::input::Axis::Horizontal, delta, 0, stop);
+        }
+        const QString amount = QStringLiteral("%1:%2")
+            .arg(axis == clicknova::input::Axis::Vertical ? QStringLiteral("v") : QStringLiteral("h"))
+            .arg(delta);
+        const auto& target = *native_.selectedWindow();
+        const auto name = QString::fromStdString(binding.elementName).toStdWString();
+        const auto id = QString::fromStdString(binding.elementAutomationId).toStdWString();
+        const auto cls = QString::fromStdString(binding.elementClass).toStdWString();
+        const auto role = static_cast<clicknova::accessibility::Role>(binding.elementRole);
+        if (clicknova::accessibility::perform(target, name, id, cls, role,
+            binding.elementBrowser, clicknova::accessibility::Operation::Scroll,
+            amount.toStdWString(), clicknova::accessibility::Provider::Uia,
+            clicknova::input::backgroundElementAction(binding))) return !stop.stop_requested();
+        // Explicit Scroll step in a foreground window: if the element has no
+        // ScrollPattern, use its re-resolved visible rectangle for a wheel.
+        // Never use the desktop cursor position or do this in background.
+        return !stop.stop_requested() && binding.activate && binding.elementTab.empty() &&
+            clicknova::accessibility::pointerGesture(target, name, id, cls, role,
+                clicknova::accessibility::Provider::Uia,
+                clicknova::accessibility::PointerGesture::Wheel,
+                axis == clicknova::input::Axis::Horizontal, delta, 0, stop);
+    }
+    bool setElementText(const clicknova::input::StepWindow& binding,
+                        const std::u16string& value, std::stop_token stop) override {
+        if (stop.stop_requested() || !native_.selectedWindow()) return false;
+        if (binding.elementProvider >= 3) {
+            if (!binding.activate || !binding.elementTab.empty() || value.empty()) return false;
+            // User explicitly selected visual text entry. Click the UNIQUE fresh
+            // visual match before typing; this is foreground keyboard input,
+            // never a claim that OCR exposes a native editable field.
+            if (!clicknova::accessibility::perform(*native_.selectedWindow(),
+                QString::fromStdString(binding.elementName).toStdWString(),
+                QString::fromStdString(binding.elementAutomationId).toStdWString(),
+                QString::fromStdString(binding.elementClass).toStdWString(),
+                static_cast<clicknova::accessibility::Role>(binding.elementRole),
+                false, clicknova::accessibility::Operation::Invoke, L"",
+                static_cast<clicknova::accessibility::Provider>(binding.elementProvider), false)) return false;
+            for (char16_t unit : value) {
+                if (stop.stop_requested() || clicknova::platform::checkTarget(*native_.selectedWindow()) !=
+                    clicknova::platform::TargetCheck::Ready) return false;
+                clicknova::input::Event ev{};
+                ev.kind = clicknova::input::EventKind::UnicodePress;
+                ev.unicodeUnit = unit;
+                if (!native_.dispatch(ev)) return false;
+                ev.kind = clicknova::input::EventKind::UnicodeRelease;
+                if (!native_.dispatch(ev)) return false;
+            }
+            return true;
+        }
+        if (!binding.elementTab.empty() &&
+            !clicknova::accessibility::selectBrowserTab(*native_.selectedWindow(),
+                QString::fromStdString(binding.elementTab).toStdWString())) return false;
+        return clicknova::accessibility::perform(*native_.selectedWindow(),
+            QString::fromStdString(binding.elementName).toStdWString(),
+            QString::fromStdString(binding.elementAutomationId).toStdWString(),
+            QString::fromStdString(binding.elementClass).toStdWString(),
+            static_cast<clicknova::accessibility::Role>(binding.elementRole), binding.elementBrowser,
+            clicknova::accessibility::Operation::SetValue,
+            QString::fromStdU16String(value).toStdWString(),
+            static_cast<clicknova::accessibility::Provider>(binding.elementProvider),
+            clicknova::input::backgroundElementAction(binding)) && !stop.stop_requested();
     }
     bool dispatch(const clicknova::input::Event& e) override { return native_.dispatch(e); }
     bool releaseOnCleanup(const clicknova::input::Event& e) override { return native_.releaseOnCleanup(e); }
@@ -164,6 +347,57 @@ std::int64_t nonnegative(const QLineEdit* edit) {
     bool ok = false;
     const auto n = edit->text().toLongLong(&ok);
     return ok && n >= 0 ? n : kInvalidWideNumber;
+}
+// Executable icons come from Windows itself. Site entries use a neutral web
+// icon: UIA exposes tab names, not reliable favicons or URLs.
+QIcon searchWindowIcon(const clicknova::platform::WindowTarget& window) {
+#ifdef _WIN32
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, window.processId);
+    if (process) {
+        wchar_t path[32768]{};
+        DWORD size = 32768;
+        const bool found = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE;
+        CloseHandle(process);
+        if (found) {
+            const QIcon icon = QFileIconProvider{}.icon(QFileInfo(QString::fromWCharArray(path,
+                static_cast<qsizetype>(size))));
+            if (!icon.isNull()) return icon;
+        }
+    }
+#else
+    (void)window;
+#endif
+    return clicknova::gui::icon(clicknova::gui::Icon::Window);
+}
+QIcon browserSiteIcon() {
+    QPixmap canvas(20, 20);
+    canvas.fill(Qt::transparent);
+    QPainter painter(&canvas);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(QStringLiteral("#78b9fa")), 1.6));
+    painter.drawEllipse(QRectF(2, 2, 16, 16));
+    painter.drawLine(QPointF(2, 10), QPointF(18, 10));
+    painter.drawEllipse(QRectF(6, 2, 8, 16));
+    return QIcon(canvas);
+}
+struct UiSearchTarget {
+    clicknova::platform::WindowTarget window;
+    std::wstring tab; // Empty: the complete application's current accessible tree.
+    bool browser{false};
+    QString pageUrl; // DevTools URL is display-only; never used as an unsafe UIA window selector.
+    bool devToolsOnly{false};
+};
+// Never display UIA SetValue contents in step summaries or activity logs.
+QString uiOperationLabel(int operation, bool russian) {
+    constexpr std::array<const char*, 10> en = {
+        "Invoke", "Set value", "Check", "Uncheck", "Select", "Expand", "Collapse",
+        "Set number", "Focus", "Scroll to"};
+    constexpr std::array<const char*, 10> ru = {
+        "Нажать", "Ввести", "Включить", "Выключить", "Выбрать", "Раскрыть", "Свернуть",
+        "Задать число", "Фокус", "Прокрутить"};
+    return operation >= 0 && operation < 10 ?
+        QString::fromUtf8(russian ? ru[static_cast<std::size_t>(operation)] :
+                                    en[static_cast<std::size_t>(operation)]) : QStringLiteral("?");
 }
 // Keep the countdown readable for multi-day pauses without integer overflow.
 QString readableRemaining(std::int64_t milliseconds, bool ru) {
@@ -248,7 +482,9 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    table_->setAlternatingRowColors(true);
+    // Alternating rows used to look like preselected actions in the dark theme.
+    // A row is highlighted only in response to an actual selection.
+    table_->setAlternatingRowColors(false);
     table_->horizontalHeader()->setStretchLastSection(false);
     table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
@@ -256,7 +492,86 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     table_->verticalHeader()->hide();
     table_->setMinimumHeight(180);
-    layout->addWidget(table_);
+    // The ordered action model stays in the table: grouping never modifies the
+    // saved or executed step order, so all existing shortcuts and undo work.
+    stepsRootLayout_ = layout;
+    stepsPanel_ = new QWidget(this);
+    stepsPanel_->setObjectName(QStringLiteral("inputLabStepPanel"));
+    auto* panelLayout = new QVBoxLayout(stepsPanel_);
+    panelLayout->setContentsMargins(0, 0, 0, 0);
+    panelLayout->setSpacing(6);
+    stepsHeading_ = new QLabel;
+    stepsHeading_->setObjectName(QStringLiteral("inputLabStepsHeading"));
+    panelLayout->addWidget(stepsHeading_);
+    auto* tools = new QHBoxLayout;
+    stepSearch_ = new QLineEdit;
+    stepSearch_->setObjectName(QStringLiteral("inputLabStepSearch"));
+    stepSearch_->setClearButtonEnabled(true);
+    stepFilter_ = new QComboBox;
+    stepFilter_->setObjectName(QStringLiteral("inputLabStepFilter"));
+    for (int i = 0; i < 7; ++i) stepFilter_->addItem(QString(), i);
+    expandGroups_ = new QPushButton;
+    expandGroups_->setObjectName(QStringLiteral("inputLabExpandGroups"));
+    collapseGroups_ = new QPushButton;
+    collapseGroups_->setObjectName(QStringLiteral("inputLabCollapseGroups"));
+    shrinkSteps_ = new QPushButton(QStringLiteral("−"));
+    shrinkSteps_->setObjectName(QStringLiteral("inputLabShrinkSteps"));
+    enlargeSteps_ = new QPushButton(QStringLiteral("+"));
+    enlargeSteps_->setObjectName(QStringLiteral("inputLabEnlargeSteps"));
+    detachSteps_ = new QPushButton;
+    detachSteps_->setObjectName(QStringLiteral("inputLabDetachSteps"));
+    tools->addWidget(stepSearch_, 2);
+    tools->addWidget(stepFilter_, 1);
+    for (auto* button : {expandGroups_, collapseGroups_, shrinkSteps_, enlargeSteps_, detachSteps_})
+        tools->addWidget(button);
+    panelLayout->addLayout(tools);
+    table_->setFixedHeight(attachedHeight_);
+    panelLayout->addWidget(table_);
+    stepCount_ = new QLabel;
+    stepCount_->setObjectName(QStringLiteral("inputLabStepCount"));
+    auto* footer = new QHBoxLayout;
+    footer->addWidget(stepCount_, 1);
+    auto* grip = new QLabel(QStringLiteral("↕"));
+    grip->setObjectName(QStringLiteral("inputLabStepResizeGrip"));
+    grip->setCursor(Qt::SizeVerCursor);
+    grip->setToolTip(QStringLiteral("Drag to resize the steps list"));
+    grip->setMinimumWidth(65);
+    grip->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    grip->installEventFilter(this);
+    stepResizeGrip_ = grip;
+    footer->addWidget(grip);
+    panelLayout->addLayout(footer);
+    layout->addWidget(stepsPanel_);
+    connect(stepSearch_, &QLineEdit::textChanged, this, [this] { applyStepVisibility(); });
+    connect(stepFilter_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this] { applyStepVisibility(); });
+    connect(expandGroups_, &QPushButton::clicked, this, [this] {
+        collapsedStepGroups_.clear(); collapsedManualGroups_.clear(); applyStepVisibility();
+    });
+    connect(collapseGroups_, &QPushButton::clicked, this, [this] {
+        collapsedStepGroups_.clear();
+        collapsedManualGroups_.clear();
+        for (int i = 0; i < static_cast<int>(groupEndByStart_.size()); ++i)
+            if (groupEndByStart_[i] > i + 1) collapsedStepGroups_.insert(i);
+        for (int i = 0; i < static_cast<int>(manualEndByStart_.size()); ++i)
+            if (manualEndByStart_[i] > i)
+                collapsedManualGroups_.insert(QString::fromStdString(stepWindows_[i].manualGroupId));
+        applyStepVisibility();
+    });
+    connect(enlargeSteps_, &QPushButton::clicked, this, [this] { resizeStepList(100); });
+    connect(shrinkSteps_, &QPushButton::clicked, this, [this] { resizeStepList(-100); });
+    connect(detachSteps_, &QPushButton::clicked, this, [this] { detachStepList(); });
+    connect(table_, &QTableWidget::cellClicked, this, [this](int row, int column) {
+        if (column != 0 || row >= static_cast<int>(groupEndByStart_.size()) ||
+            (groupEndByStart_[row] <= row + 1 && manualEndByStart_[row] <= row)) return;
+        const QPoint local = table_->viewport()->mapFromGlobal(QCursor::pos());
+        const QRect cell = table_->visualItemRect(table_->item(row, 0));
+        if (local.x() >= cell.left() && local.x() < cell.left() + 30)
+            toggleStepGroup(row);
+    });
+    connect(table_, &QTableWidget::cellDoubleClicked, this, [this](int row, int column) {
+        if (column == 0) toggleStepGroup(row);
+    });
 
     // One optional foreground-window binding for the shared action list.
     // No Win32 handles are serialized with saved scenarios.
@@ -294,8 +609,43 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
         b->setMinimumHeight(38);
         quickActions->addWidget(b);
     }
-    // Keep common actions above the list; users needn't scroll past it to add a step.
-    layout->insertLayout(2, quickActions);
+    // List management belongs above its contents; additions and editing below.
+    quickHeading_ = new QLabel;
+    quickHeading_->setObjectName(QStringLiteral("inputLabQuickHeading"));
+    layout->insertWidget(layout->indexOf(stepsPanel_) + 1, quickHeading_);
+    layout->insertLayout(layout->indexOf(quickHeading_) + 1, quickActions);
+    auto* editButtons = new QHBoxLayout;
+    createGroup_ = new QPushButton;
+    createGroup_->setObjectName(QStringLiteral("inputLabCreateManualGroup"));
+    renameGroup_ = new QPushButton;
+    renameGroup_->setObjectName(QStringLiteral("inputLabRenameManualGroup"));
+    ungroupSteps_ = new QPushButton;
+    ungroupSteps_->setObjectName(QStringLiteral("inputLabUngroupManualSteps"));
+    duplicateStep_ = new QPushButton;
+    duplicateStep_->setObjectName(QStringLiteral("inputLabDuplicateStep"));
+    deleteStep_ = new QPushButton;
+    deleteStep_->setObjectName(QStringLiteral("inputLabDeleteStep"));
+    moveStepUp_ = new QPushButton;
+    moveStepUp_->setObjectName(QStringLiteral("inputLabMoveStepUp"));
+    moveStepDown_ = new QPushButton;
+    moveStepDown_->setObjectName(QStringLiteral("inputLabMoveStepDown"));
+    undoStep_ = new QPushButton;
+    undoStep_->setObjectName(QStringLiteral("inputLabUndoStep"));
+    redoStep_ = new QPushButton;
+    redoStep_->setObjectName(QStringLiteral("inputLabRedoStep"));
+    for (auto* button : {createGroup_, renameGroup_, ungroupSteps_, duplicateStep_, deleteStep_,
+                         moveStepUp_, moveStepDown_, undoStep_, redoStep_})
+        editButtons->addWidget(button);
+    layout->insertLayout(layout->indexOf(quickHeading_) + 2, editButtons);
+    connect(createGroup_, &QPushButton::clicked, this, [this] { createManualGroup(); });
+    connect(renameGroup_, &QPushButton::clicked, this, [this] { renameManualGroup(); });
+    connect(ungroupSteps_, &QPushButton::clicked, this, [this] { ungroupManualSteps(); });
+    connect(duplicateStep_, &QPushButton::clicked, this, [this] { duplicateSelectedRows(); });
+    connect(deleteStep_, &QPushButton::clicked, this, [this] { deleteSelectedRows(); });
+    connect(moveStepUp_, &QPushButton::clicked, this, [this] { moveSelectedRows(-1); });
+    connect(moveStepDown_, &QPushButton::clicked, this, [this] { moveSelectedRows(1); });
+    connect(undoStep_, &QPushButton::clicked, this, [this] { undoActionEdit(); });
+    connect(redoStep_, &QPushButton::clicked, this, [this] { redoActionEdit(); });
     editorGroup_ = new QGroupBox;
     editorGroup_->setObjectName(QStringLiteral("inputLabEditor"));
     auto* form = new QFormLayout(editorGroup_);
@@ -312,6 +662,10 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     chooseStepWindow_ = new QPushButton;
     chooseStepWindow_->setObjectName(QStringLiteral("inputLabStepChooseWindow"));
     clearStepWindow_ = new QPushButton;
+    searchStepUi_ = new QPushButton;
+    searchStepUi_->setObjectName(QStringLiteral("inputLabSearchUiElements"));
+    clearStepUi_ = new QPushButton;
+    clearStepUi_->setObjectName(QStringLiteral("inputLabClearUiElement"));
     clearStepWindow_->setObjectName(QStringLiteral("inputLabStepClearWindow"));
     chooseStepWindow_->setMinimumHeight(38);
     clearStepWindow_->setMinimumHeight(38);
@@ -320,6 +674,8 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     stepWindowStatus_->setWordWrap(true);
     stepWindowRow->addWidget(chooseStepWindow_);
     stepWindowRow->addWidget(clearStepWindow_);
+    stepWindowRow->addWidget(searchStepUi_);
+    stepWindowRow->addWidget(clearStepUi_);
     stepWindowRow->addWidget(stepWindowStatus_, 1);
     form->addRow(stepWindowRow);
     stepEnforce_ = new QCheckBox;
@@ -329,10 +685,12 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     stepActivate_->setObjectName(QStringLiteral("inputLabStepActivateWindow"));
     form->addRow(stepActivate_);
     stepWindowWait_ = largeIntegerEdit("inputLabStepWindowWaitMs", QStringLiteral("0"));
-    stepWindowWait_->setToolTip(QStringLiteral("How long to wait for the selected window, in milliseconds. 0 = no waiting."));
-    form->addRow(new QLabel(QStringLiteral("Window timeout (ms)")), stepWindowWait_);
+    stepWindowTimeoutLabel_ = new QLabel;
+    form->addRow(stepWindowTimeoutLabel_, stepWindowWait_);
     connect(chooseStepWindow_, &QPushButton::clicked, this, [this] { chooseStepWindow(); });
     connect(clearStepWindow_, &QPushButton::clicked, this, [this] { clearStepWindow(); });
+    connect(searchStepUi_, &QPushButton::clicked, this, [this] { searchStepUiElements(); });
+    connect(clearStepUi_, &QPushButton::clicked, this, [this] { clearStepUiElement(); });
     connect(stepEnforce_, &QCheckBox::toggled, this, [this] { editStepWindow(); });
     connect(stepActivate_, &QCheckBox::toggled, this, [this] { editStepWindow(); });
     connect(stepWindowWait_, &QLineEdit::editingFinished, this, [this] { editStepWindow(); });
@@ -715,9 +1073,9 @@ InputLabWidget::InputLabWidget(QWidget* parent) : QWidget(parent) {
     setButtonIcon(quickKey_, Icon::Keyboard);
     setButtonIcon(quickText_, Icon::Text);
     setButtonIcon(quickWait_, Icon::Wait);
-    setButtonIcon(quickWaitUntil_, Icon::Wait);
-    setButtonIcon(quickCode_, Icon::Text);
-    setButtonIcon(selectAll_, Icon::Copy);
+    setButtonIcon(quickWaitUntil_, Icon::ClockUntil);
+    setButtonIcon(quickCode_, Icon::Code);
+    setButtonIcon(selectAll_, Icon::SelectAll);
     setButtonIcon(captureMouse_, Icon::Mouse);
     setButtonIcon(captureKey_, Icon::Keyboard);
     setButtonIcon(savedToggle_, Icon::Folder);
@@ -737,6 +1095,9 @@ InputLabWidget::~InputLabWidget() {
     if (autosaveTimer_ && autosaveTimer_->isActive()) writeAutosave();
     if (recorder_) { delete recorder_; recorder_ = nullptr; }
     worker_.request_stop();
+#ifdef CLICKNOVA_WITH_X11
+    if (x11Stop_) x11Stop_->stop();
+#endif
     if (worker_.joinable()) worker_.join();
     // The owner unregisters the native hotkey before QWidget children are destroyed.
     // Avoid callbacks into the already-destroyed main-window hotkey controller.
@@ -754,6 +1115,13 @@ void InputLabWidget::setLegacyImporter(std::function<void()> importer) {
 }
 
 void InputLabWidget::refreshLibrary() { refreshSavedPlans(); }
+
+void InputLabWidget::hideEmbeddedSavedLibrary() {
+    // The connected controls now live in the common toolbar, not twice in the editor.
+    savedToggle_->hide();
+    savedGroup_->hide();
+}
+
 
 void InputLabWidget::updateStartLabel() {
     const QString label = startHotkeyLabel_ ? startHotkeyLabel_() : QString();
@@ -773,14 +1141,55 @@ QString InputLabWidget::trText(const char* en, const char* ru) const {
 
 void InputLabWidget::setRussian(bool enabled) {
     russian_ = enabled;
+    if (quickHeading_) quickHeading_->setText(trText("ADD STEP", "ДОБАВИТЬ ШАГ"));
+    if (stepsHeading_) stepsHeading_->setText(trText("STEP LIST", "СПИСОК ШАГОВ"));
+    stepSearch_->setPlaceholderText(trText("Search steps by name, parameters or window…", "Поиск по шагам, параметрам и окнам…"));
+    stepFilter_->setItemText(0, trText("All steps", "Все шаги"));
+    stepFilter_->setItemText(1, trText("Mouse clicks", "Клики мыши"));
+    stepFilter_->setItemText(2, trText("Keyboard", "Клавиатура"));
+    stepFilter_->setItemText(3, trText("Text and scripts", "Текст и код"));
+    stepFilter_->setItemText(4, trText("Waits", "Ожидания"));
+    stepFilter_->setItemText(5, trText("Wheel and movement", "Прокрутка и движение"));
+    stepFilter_->setItemText(6, trText("Element actions", "Действия с элементами"));
+    expandGroups_->setText(trText("Expand", "Развернуть"));
+    collapseGroups_->setText(trText("Collapse", "Свернуть"));
+    detachSteps_->setText(detachedSteps_ ? trText("Restore", "Вернуть") : trText("Detach", "Отделить"));
+    enlargeSteps_->setToolTip(trText("Increase list height", "Увеличить высоту списка"));
+    shrinkSteps_->setToolTip(trText("Decrease list height", "Уменьшить высоту списка"));
+    stepResizeGrip_->setToolTip(trText("Drag to resize list height", "Потяните, чтобы изменить высоту списка"));
+    createGroup_->setText(trText("New group", "Группа"));
+    createGroup_->setToolTip(trText("Name consecutive selected steps as a logical section.",
+        "Создать именованную группу из выделенных подряд шагов."));
+    renameGroup_->setText(trText("Rename group", "Имя группы"));
+    ungroupSteps_->setText(trText("Ungroup", "Разгруппировать"));
+    duplicateStep_->setText(trText("Duplicate", "Дублировать"));
+    deleteStep_->setText(trText("Delete", "Удалить"));
+    moveStepUp_->setText(trText("Move up", "Вверх"));
+    moveStepDown_->setText(trText("Move down", "Вниз"));
+    undoStep_->setText(trText("Undo", "Отменить"));
+    redoStep_->setText(trText("Redo", "Повторить"));
     help_->setText(trText(
         "Record, edit, multi-select and reorder actions or add local PowerShell code. Drafts are autosaved. Gamepads are not supported.",
         "Записывайте, редактируйте и выделяйте несколько шагов; добавляйте локальный код PowerShell. Черновик сохраняется автоматически."));
     chooseStepWindow_->setText(trText("Choose step window", "Окно шага"));
     clearStepWindow_->setText(trText("Clear", "Сброс"));
+    searchStepUi_->setText(trText("Find UI element", "Найти элемент"));
+    clearStepUi_->setText(trText("Clear element", "Сброс элемента"));
+    clearStepUi_->setToolTip(trText("Remove the accessibility binding from this click step.",
+        "Удалить привязку элемента для этого шага клика."));
+    searchStepUi_->setToolTip(trText("Browse open Windows applications and browser tabs directly here. No prior window selection needed. UIA is not the browser DOM.",
+        "Открыть поиск по приложениям Windows и вкладкам браузера. Сначала выбирать окно шага не нужно. UIA — не DOM браузера."));
     stepEnforce_->setText(trText("Require this window for playback (recorded window is informational by default)",
                                     "Требовать это окно при запуске (после записи — только информация)"));
     stepActivate_->setText(trText("Activate this window before the step", "Активировать окно перед шагом"));
+    stepActivate_->setToolTip(trText(
+        "Background mode works only with a native UIA/MSAA/Java element action, without tab switching or Focus. "
+        "OpenCV/OCR, mouse, keyboard and wheel input require a foreground window. Providers may still reject a background action.",
+        "Фоновый режим доступен только для действий UIA/MSAA/Java без смены вкладки и Focus. "
+        "OpenCV/OCR, мышь, клавиатура и колесо требуют активного окна. Приложение может не поддерживать фоновое действие."));
+    stepWindowTimeoutLabel_->setText(trText("Window timeout (ms)", "Ожидание окна (мс)"));
+    stepWindowWait_->setToolTip(trText("Wait up to this many milliseconds for the selected window; 0 = check immediately.",
+        "Сколько миллисекунд ожидать выбранное окно; 0 = проверить сразу."));
     chooseWindow_->setText(trText("Choose window…", "Выбрать окно…"));
     clearWindow_->setText(trText("Clear", "Сбросить"));
     chooseWindow_->setToolTip(trText("Restrict ALL actions to this foreground window. The window must be selected again after restarting; it is never saved as a system handle.",
@@ -913,7 +1322,9 @@ void InputLabWidget::setRussian(bool enabled) {
         "Готово. Добавьте действия, настройте их и нажмите Запуск."));
     refreshSavedPlans();
     updateFields();
-    refreshTable(table_->currentRow());
+    const auto selection = selectedActionRows();
+    refreshTable(selection.size() == 1 ? selection.front() : -1);
+    if (selection.size() > 1) refreshSelectedRows(selection);
 }
 
 bool InputLabWidget::isRunning() const noexcept { return running_ || countdown_ || recording_; }
@@ -1042,6 +1453,16 @@ void InputLabWidget::updateFields() {
 }
 
 QString InputLabWidget::actionName(const Action& action) const {
+    if (const auto* e = std::get_if<ElementTask>(&action)) {
+        const QStringList labels = russian_ ? QStringList{
+            QString::fromUtf8("Элемент: действие"), QString::fromUtf8("Элемент: двойное нажатие"),
+            QString::fromUtf8("Элемент: ввод текста"), QString::fromUtf8("Элемент: прокрутка"),
+            QString::fromUtf8("Элемент: ожидание"), QString::fromUtf8("Элемент: проверка")} :
+            QStringList{QStringLiteral("Element: action"), QStringLiteral("Element: double activation"),
+                        QStringLiteral("Element: set text"), QStringLiteral("Element: scroll"),
+                        QStringLiteral("Element: wait until visible"), QStringLiteral("Element: assert present")};
+        return labels.at(static_cast<int>(e->command));
+    }
     if (std::holds_alternative<Click>(action)) return type_->itemText(MouseClick);
     if (std::holds_alternative<clicknova::input::KeyTap>(action)) return type_->itemText(KeyTap);
     if (std::holds_alternative<clicknova::input::KeyDown>(action)) return type_->itemText(KeyDown);
@@ -1078,6 +1499,21 @@ QString InputLabWidget::actionDetails(const Action& action) const {
             if (a.text.size() > 80) preview += QStringLiteral("…");
             return QStringLiteral("\"%1\" · %2 %3").arg(preview).arg(a.text.size()).arg(trText("characters", "символов"));
         }
+        else if constexpr (std::is_same_v<T, ElementTask>) {
+            switch (a.command) {
+            case ElementCommand::SetText: return trText("Enter %1 characters at the resolved target", "Ввести %1 символов в найденную цель")
+                .arg(a.text.size());
+            case ElementCommand::Scroll: return QStringLiteral("%1: %2")
+                .arg(a.axis == Axis::Vertical ? trText("Vertical", "Вертикально") :
+                     trText("Horizontal", "Горизонтально")).arg(a.delta);
+            case ElementCommand::WaitVisible: return trText("Timeout: %1 ms · poll: %2 ms", "Тайм-аут: %1 мс · опрос: %2 мс")
+                .arg(a.timeoutMs).arg(a.pollMs);
+            case ElementCommand::AssertVisible: return trText("Check now, fail if absent", "Проверить сейчас, ошибка при отсутствии");
+            case ElementCommand::DoubleActivate: return trText("Resolve each of two activations", "Повторный поиск перед каждым нажатием");
+            case ElementCommand::Activate: return trText("Re-resolve before operation", "Повторный поиск перед действием");
+            }
+            return QStringLiteral("Element step");
+        }
         else if constexpr (std::is_same_v<T, clicknova::input::RunScript>)
             return trText("PowerShell · %1 characters", "PowerShell · %1 символов").arg(a.code.size());
         else if constexpr (std::is_same_v<T, clicknova::input::WaitUntil>)
@@ -1098,6 +1534,13 @@ clicknova::gui::Icon actionPictogram(const Action& action) {
         std::holds_alternative<clicknova::input::KeyDown>(action) ||
         std::holds_alternative<clicknova::input::KeyUp>(action) ||
         std::holds_alternative<clicknova::input::KeyHold>(action)) return Icon::Keyboard;
+    if (const auto* task = std::get_if<ElementTask>(&action)) {
+        if (task->command == ElementCommand::WaitVisible ||
+            task->command == ElementCommand::AssertVisible) return Icon::Wait;
+        if (task->command == ElementCommand::SetText) return Icon::Text;
+        if (task->command == ElementCommand::Scroll) return Icon::Mouse;
+        return Icon::Click;
+    }
     if (std::holds_alternative<clicknova::input::TypeText>(action) ||
         std::holds_alternative<clicknova::input::RunScript>(action)) return Icon::Text;
     if (std::holds_alternative<clicknova::input::Wait>(action) ||
@@ -1112,17 +1555,73 @@ void InputLabWidget::refreshTable(int selectedRow) {
     normalizeStepWindows();
     QSignalBlocker blocker(table_);
     table_->setRowCount(static_cast<int>(actions_.size()));
-    for (int row = 0; row < static_cast<int>(actions_.size()); ++row) {
+    const int count = static_cast<int>(actions_.size());
+    groupEndByStart_.assign(count, -1);
+    groupStartByRow_.assign(count, -1);
+    manualEndByStart_.assign(count, -1);
+    manualStartByRow_.assign(count, -1);
+    for (const auto& group : clicknova::input::namedStepRuns(stepWindows_)) {
+        const int start = static_cast<int>(group.first);
+        const int end = static_cast<int>(group.end);
+        manualEndByStart_[start] = end;
+        for (int row = start; row < end; ++row) manualStartByRow_[row] = start;
+    }
+    for (const auto& group : clicknova::input::visibleAutomaticRuns(actions_, stepWindows_)) {
+        const int start = static_cast<int>(group.first);
+        const int end = static_cast<int>(group.end);
+        groupEndByStart_[start] = end;
+        for (int row = start; row < end; ++row) groupStartByRow_[row] = start;
+    }
+    for (int row = 0; row < count; ++row) {
         const auto& action = actions_[static_cast<std::size_t>(row)];
-        auto* title = new QTableWidgetItem(QStringLiteral("%1. %2").arg(row + 1).arg(actionName(action)));
+        QString titleText = QStringLiteral("%1. %2").arg(row + 1).arg(actionName(action));
+        if (manualEndByStart_[row] > row) {
+            titleText = QStringLiteral("%1  %2–%3. 📁 %4 (%5)  ·  %6")
+                .arg(collapsedManualGroups_.contains(QString::fromStdString(stepWindows_[row].manualGroupId)) ?
+                     QStringLiteral("▸") : QStringLiteral("▾"))
+                .arg(row + 1).arg(manualEndByStart_[row])
+                .arg(QString::fromStdString(stepWindows_[row].manualGroupTitle))
+                .arg(manualEndByStart_[row] - row)
+                .arg(actionName(action));
+        } else if (groupEndByStart_[row] > row + 1) {
+            titleText = QStringLiteral("%1  %2–%3. %4  ×%5")
+                .arg(collapsedStepGroups_.contains(row) ? QStringLiteral("▸") : QStringLiteral("▾"))
+                .arg(row + 1).arg(groupEndByStart_[row]).arg(actionName(action))
+                .arg(groupEndByStart_[row] - row);
+        } else if (groupStartByRow_[row] >= 0 ||
+                   (manualStartByRow_[row] >= 0 && manualStartByRow_[row] != row)) {
+            titleText.prepend(QStringLiteral("    ↳  "));
+        }
+        auto* title = new QTableWidgetItem(titleText);
+        if (manualEndByStart_[row] > row) title->setToolTip(trText(
+            "Manual group: click arrow to collapse, right-click to rename or ungroup.",
+            "Ручная группа: нажмите стрелку, ПКМ — переименовать или разгруппировать."));
+        else if (groupEndByStart_[row] > row + 1) title->setToolTip(trText(
+            "Click the arrow (or double-click) to expand/collapse consecutive actions. All remain executable.",
+            "Нажмите стрелку (или дважды строку), чтобы свернуть повторяющиеся действия. Все шаги продолжают выполняться."));
         title->setIcon(clicknova::gui::icon(actionPictogram(action)));
+        // The title is presentation-only: automatic/manual groups add prefixes,
+        // counts and indentation which change as actions move or are inserted.
+        // Keep a canonical, independent action value for GUI regression checks
+        // and for clients that need to distinguish action order from grouping.
+        title->setData(Qt::UserRole,
+            QJsonDocument(clicknova::storage::encodeInputAction(action))
+                .toJson(QJsonDocument::Compact));
         table_->setItem(row, 0, title);
         QString details = actionDetails(action);
         if (static_cast<std::size_t>(row) < stepWindows_.size() &&
-            !stepWindows_[static_cast<std::size_t>(row)].title.empty())
-            details += QStringLiteral("  ·  ") + QString::fromStdString(stepWindows_[static_cast<std::size_t>(row)].title) +
-                (stepWindows_[static_cast<std::size_t>(row)].enforce ? QString() :
-                    trText(" (observed)", " (записано)"));
+            !stepWindows_[static_cast<std::size_t>(row)].title.empty()) {
+            const auto& target = stepWindows_[static_cast<std::size_t>(row)];
+            details += QStringLiteral("  ·  ") + QString::fromStdString(target.title) +
+                (target.enforce ? QString() : trText(" (observed)", " (записано)"));
+            if (!target.elementAutomationId.empty() || !target.elementName.empty())
+                details += QStringLiteral("  · %1 %2: ").arg(
+                    QString::fromLatin1(clicknova::accessibility::providerName(
+                        static_cast<clicknova::accessibility::Provider>(target.elementProvider))),
+                    uiOperationLabel(target.elementOperation, russian_)) +
+                    QString::fromStdString(target.elementAutomationId.empty() ?
+                        target.elementName : target.elementAutomationId);
+        }
         table_->setItem(row, 1, new QTableWidgetItem(details));
         auto* more = new QToolButton(table_);
         more->setObjectName(QStringLiteral("inputLabRowMenu"));
@@ -1146,14 +1645,257 @@ void InputLabWidget::refreshTable(int selectedRow) {
         table_->clearSelection();
         selectedRow = -1;
     }
+    applyStepVisibility();
     selectAction(selectedRow);
     scheduleAutosave();
+}
+
+int InputLabWidget::stepCategory(int row) const {
+    if (row < 0 || row >= static_cast<int>(actions_.size())) return -1;
+    const auto& a = actions_[static_cast<std::size_t>(row)];
+    if (std::holds_alternative<clicknova::input::Click>(a) || std::holds_alternative<clicknova::input::ButtonDown>(a) ||
+        std::holds_alternative<clicknova::input::ButtonUp>(a) || std::holds_alternative<clicknova::input::MouseHold>(a)) return 1;
+    if (std::holds_alternative<clicknova::input::KeyTap>(a) || std::holds_alternative<clicknova::input::KeyDown>(a) ||
+        std::holds_alternative<clicknova::input::KeyUp>(a) || std::holds_alternative<clicknova::input::KeyHold>(a)) return 2;
+    if (std::holds_alternative<clicknova::input::TypeText>(a) || std::holds_alternative<clicknova::input::RunScript>(a)) return 3;
+    if (std::holds_alternative<clicknova::input::Wait>(a) || std::holds_alternative<clicknova::input::WaitUntil>(a)) return 4;
+    if (std::holds_alternative<clicknova::input::Wheel>(a) || std::holds_alternative<clicknova::input::MovePointer>(a)) return 5;
+    if (std::holds_alternative<clicknova::input::ElementTask>(a)) return 6;
+    return 0;
+}
+
+void InputLabWidget::applyStepVisibility() {
+    if (!table_ || !stepCount_) return;
+    const QString needle = stepSearch_->text().trimmed();
+    const int category = stepFilter_->currentData().toInt();
+    const bool filtering = !needle.isEmpty() || category != 0;
+    const int count = static_cast<int>(actions_.size());
+    std::vector<bool> matches(static_cast<std::size_t>(count), false);
+    for (int row = 0; row < count; ++row) {
+        const bool typeMatches = category == 0 || stepCategory(row) == category;
+        const QString title = actionName(actions_[static_cast<std::size_t>(row)]);
+        const QString details = table_->item(row, 1) ? table_->item(row, 1)->text() : QString();
+        matches[static_cast<std::size_t>(row)] = typeMatches &&
+            (needle.isEmpty() || title.contains(needle, Qt::CaseInsensitive) ||
+             details.contains(needle, Qt::CaseInsensitive) ||
+             QString::number(row + 1).contains(needle));
+    }
+    int visible = 0;
+    for (int row = 0; row < count; ++row) {
+        const int parent = row < static_cast<int>(groupStartByRow_.size()) ? groupStartByRow_[row] : -1;
+        bool show = matches[static_cast<std::size_t>(row)];
+        const int manualHead = manualStartByRow_[row];
+        if (filtering && parent == row && groupEndByStart_[row] > row + 1) {
+            for (int child = row + 1; child < groupEndByStart_[row]; ++child)
+                show = show || matches[static_cast<std::size_t>(child)];
+        }
+        if (manualHead == row && manualEndByStart_[row] > row) {
+            if (!needle.isEmpty() && QString::fromStdString(stepWindows_[row].manualGroupTitle)
+                    .contains(needle, Qt::CaseInsensitive) && (category == 0 ||
+                        std::any_of(matches.begin() + row, matches.begin() + manualEndByStart_[row],
+                                    [](bool matched) { return matched; }))) show = true;
+            if (filtering) for (int child = row + 1; child < manualEndByStart_[row]; ++child)
+                show = show || matches[static_cast<std::size_t>(child)];
+        }
+        if (!filtering && manualHead >= 0 && manualHead != row &&
+            collapsedManualGroups_.contains(QString::fromStdString(stepWindows_[row].manualGroupId))) show = false;
+        if (!filtering && parent >= 0 && parent != row && collapsedStepGroups_.contains(parent)) show = false;
+        table_->setRowHidden(row, !show);
+        if (show) ++visible;
+        if (manualHead == row && manualEndByStart_[row] > row) {
+            auto* title = table_->item(row, 0);
+            if (title) title->setText(QStringLiteral("%1  %2–%3. 📁 %4 (%5)  ·  %6")
+                .arg(collapsedManualGroups_.contains(QString::fromStdString(stepWindows_[row].manualGroupId)) && !filtering ?
+                    QStringLiteral("▸") : QStringLiteral("▾"))
+                .arg(row + 1).arg(manualEndByStart_[row])
+                .arg(QString::fromStdString(stepWindows_[row].manualGroupTitle))
+                .arg(manualEndByStart_[row] - row)
+                .arg(actionName(actions_[static_cast<std::size_t>(row)])));
+        }
+        if (parent == row && groupEndByStart_[row] > row + 1) {
+            auto* title = table_->item(row, 0);
+            if (title) {
+                title->setText(QStringLiteral("%1  %2–%3. %4  ×%5")
+                    .arg(collapsedStepGroups_.contains(row) && !filtering ? QStringLiteral("▸") : QStringLiteral("▾"))
+                    .arg(row + 1).arg(groupEndByStart_[row])
+                    .arg(actionName(actions_[static_cast<std::size_t>(row)]))
+                    .arg(groupEndByStart_[row] - row));
+            }
+        }
+    }
+    // Never allow edits to continue targeting a row hidden by a filter/group.
+    const int current = table_->currentRow();
+    if (current >= 0 && current < count && table_->isRowHidden(current)) {
+        int next = -1;
+        if (!filtering && current < static_cast<int>(groupStartByRow_.size())) {
+            const int parent = groupStartByRow_[current];
+            if (parent >= 0 && !table_->isRowHidden(parent)) next = parent;
+            if (next < 0 && manualStartByRow_[current] >= 0 &&
+                !table_->isRowHidden(manualStartByRow_[current]))
+                next = manualStartByRow_[current];
+        }
+        if (next < 0) {
+            for (int row = 0; row < count; ++row) {
+                if (!table_->isRowHidden(row)) { next = row; break; }
+            }
+        }
+        if (next >= 0)
+            table_->setCurrentCell(next, 0, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        else {
+            table_->clearSelection();
+            table_->selectionModel()->clearCurrentIndex();
+            selectAction(-1);
+        }
+    }
+    stepCount_->setText(trText("Visible: %1 / %2 steps (all execute)",
+        "Показано: %1 из %2 шагов (выполняются все)").arg(visible).arg(count));
+}
+
+void InputLabWidget::toggleStepGroup(int row) {
+    if (row < 0 || row >= static_cast<int>(groupEndByStart_.size())) return;
+    if (manualEndByStart_[row] > row) {
+        const QString id = QString::fromStdString(stepWindows_[row].manualGroupId);
+        if (collapsedManualGroups_.contains(id)) collapsedManualGroups_.remove(id);
+        else collapsedManualGroups_.insert(id);
+        applyStepVisibility();
+        return;
+    }
+    if (groupEndByStart_[row] <= row + 1) return;
+    if (collapsedStepGroups_.contains(row)) collapsedStepGroups_.remove(row);
+    else collapsedStepGroups_.insert(row);
+    applyStepVisibility();
+}
+
+bool InputLabWidget::selectedManualGroup(int& first, int& end) const {
+    first = end = -1;
+    const auto selection = selectedActionRows();
+    if (selection.empty()) return false;
+    const int row = selection.front();
+    if (row < 0 || row >= static_cast<int>(manualStartByRow_.size())) return false;
+    first = manualStartByRow_[row];
+    if (first < 0 || first >= static_cast<int>(manualEndByStart_.size())) return false;
+    end = manualEndByStart_[first];
+    if (end <= first) return false;
+    // The selection must refer to a single named group.
+    for (const int other : selection)
+        if (other >= static_cast<int>(manualStartByRow_.size()) || manualStartByRow_[other] != first) return false;
+    return true;
+}
+
+void InputLabWidget::createManualGroup() {
+    if (isRunning()) return;
+    const auto selection = selectedActionRows();
+    if (selection.empty() || selection.back() - selection.front() + 1 != static_cast<int>(selection.size())) {
+        reportStatus(trText("Select consecutive steps to create a group.",
+            "Выделите идущие подряд шаги для создания группы."));
+        return;
+    }
+    bool ok = false;
+    const QString title = QInputDialog::getText(this, QStringLiteral("ClickNova"),
+        trText("Name the group", "Название группы"), QLineEdit::Normal,
+        trText("New section", "Новая группа"), &ok).trimmed();
+    if (!ok || title.isEmpty()) return;
+    if (title.size() > 80 || title.contains(QChar(0)) ||
+        std::any_of(title.begin(), title.end(), [](QChar ch) { return ch.category() == QChar::Other_Control; })) {
+        QMessageBox::warning(this, QStringLiteral("ClickNova"), trText(
+            "Group name must be 1–80 characters.", "Название группы: от 1 до 80 символов."));
+        return;
+    }
+    checkpointActions();
+    const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+    for (int row : selection) {
+        stepWindows_[row].manualGroupId = id;
+        stepWindows_[row].manualGroupTitle = title.toStdString();
+    }
+    const int start = selection.front();
+    refreshTable(start);
+    refreshSelectedRows(selection);
+    reportStatus(trText("Named group created.", "Именованная группа создана."));
+}
+
+void InputLabWidget::renameManualGroup() {
+    if (isRunning()) return;
+    int first = -1, end = -1;
+    if (!selectedManualGroup(first, end)) return;
+    const auto id = stepWindows_[first].manualGroupId;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, QStringLiteral("ClickNova"),
+        trText("Rename group", "Переименовать группу"), QLineEdit::Normal,
+        QString::fromStdString(stepWindows_[first].manualGroupTitle), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    if (name.size() > 80 || name.contains(QChar(0)) ||
+        std::any_of(name.begin(), name.end(), [](QChar ch) { return ch.category() == QChar::Other_Control; })) {
+        QMessageBox::warning(this, QStringLiteral("ClickNova"), trText(
+            "Group name must be 1–80 characters.", "Название группы: от 1 до 80 символов."));
+        return;
+    }
+    checkpointActions();
+    // Rename every span of the same logical group, including spans that were
+    // split by moving a step; step order remains untouched.
+    for (auto& step : stepWindows_)
+        if (step.manualGroupId == id) step.manualGroupTitle = name.toStdString();
+    refreshTable(first);
+}
+
+void InputLabWidget::ungroupManualSteps() {
+    if (isRunning()) return;
+    int first = -1, end = -1;
+    if (!selectedManualGroup(first, end)) return;
+    const auto id = stepWindows_[first].manualGroupId;
+    checkpointActions();
+    // Remove the logical group completely, rather than leaving orphaned
+    // labels on spans previously split by reorder operations.
+    for (auto& step : stepWindows_)
+        if (step.manualGroupId == id) {
+            step.manualGroupId.clear(); step.manualGroupTitle.clear();
+        }
+    collapsedManualGroups_.remove(QString::fromStdString(id));
+    refreshTable(first);
+}
+
+void InputLabWidget::resizeStepList(int pixels) {
+    if (!table_) return;
+    const int height = std::clamp(table_->height() + pixels, 180, 1150);
+    table_->setFixedHeight(height);
+    if (!detachedSteps_) attachedHeight_ = height;
+}
+
+void InputLabWidget::detachStepList() {
+    if (detachedSteps_) { detachedSteps_->raise(); detachedSteps_->activateWindow(); return; }
+    if (!stepsPanel_ || !stepsRootLayout_) return;
+    attachedHeight_ = table_->height();
+    const int originalIndex = stepsRootLayout_->indexOf(stepsPanel_);
+    auto* dialog = new QDialog(this, Qt::Window);
+    detachedSteps_ = dialog;
+    dialog->setObjectName(QStringLiteral("inputLabDetachedSteps"));
+    dialog->setWindowTitle(trText("ClickNova — Steps", "ClickNova — Шаги"));
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->resize(1000, 620);
+    auto* floatingLayout = new QVBoxLayout(dialog);
+    stepsRootLayout_->removeWidget(stepsPanel_);
+    floatingLayout->addWidget(stepsPanel_);
+    table_->setMinimumHeight(180);
+    table_->setMaximumHeight(QWIDGETSIZE_MAX);
+    table_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    detachSteps_->setText(trText("Restore", "Вернуть"));
+    connect(dialog, &QDialog::finished, this, [this, dialog, originalIndex] {
+        if (stepsPanel_ && stepsRootLayout_) {
+            dialog->layout()->removeWidget(stepsPanel_);
+            stepsRootLayout_->insertWidget(std::max(0, originalIndex), stepsPanel_);
+            table_->setFixedHeight(attachedHeight_);
+        }
+        detachedSteps_.clear();
+        detachSteps_->setText(trText("Detach", "Отделить"));
+    });
+    connect(detachSteps_, &QPushButton::clicked, dialog, &QDialog::close);
+    dialog->show();
 }
 
 void InputLabWidget::selectAction(int index) {
     if (index >= 0 && index < static_cast<int>(actions_.size()) && selectedActionRows().size() == 1)
         loadEditor(actions_[static_cast<std::size_t>(index)]);
-    editorGroup_->setEnabled(index >= 0 && selectedActionRows().size() == 1 && !isRunning());
+    editorGroup_->setEnabled(index >= 0 && selectedActionRows().size() == 1 && !isRunning() &&
+        !std::holds_alternative<ElementTask>(actions_[static_cast<std::size_t>(index)]));
     refreshStepWindowEditor(index);
     updateButtons();
 }
@@ -1162,23 +1904,54 @@ void InputLabWidget::updateSelected() {
     if (updating_ || isRunning()) return;
     int row = table_->currentRow();
     if (row < 0 || row >= static_cast<int>(actions_.size()) || selectedActionRows().size() != 1) return;
+    if (std::holds_alternative<ElementTask>(actions_[static_cast<std::size_t>(row)])) return;
     if (!numericInputsValid()) return;
     Action edited = currentEditorAction();
     if (clicknova::storage::encodeInputAction(edited) ==
         clicknova::storage::encodeInputAction(actions_[static_cast<std::size_t>(row)])) return;
+    const bool changedType = actions_[static_cast<std::size_t>(row)].index() != edited.index();
     checkpointActions();
     actions_[static_cast<std::size_t>(row)] = std::move(edited);
+    auto& target = stepWindows_[static_cast<std::size_t>(row)];
+    if ((!target.elementName.empty() || !target.elementAutomationId.empty()) &&
+        (!std::holds_alternative<Click>(actions_[static_cast<std::size_t>(row)]) ||
+         (std::get<Click>(actions_[static_cast<std::size_t>(row)]).button != Button::Left ||
+          (target.elementOperation != 0 &&
+           std::get<Click>(actions_[static_cast<std::size_t>(row)]).count != 1)))) {
+        target.elementName.clear();
+        target.elementAutomationId.clear();
+        target.elementClass.clear();
+        target.elementRole = 0;
+        target.elementProvider = 0;
+        target.elementBrowser = false;
+        target.elementTab.clear();
+        target.elementOperation = 0;
+        target.elementValue.clear();
+        refreshStepWindowEditor(row);
+    }
     // Preserve selection while replacing visible descriptions.
     QSignalBlocker blocker(table_);
     table_->item(row, 0)->setText(QStringLiteral("%1. %2").arg(row + 1).arg(actionName(actions_[static_cast<std::size_t>(row)])));
     table_->item(row, 0)->setIcon(clicknova::gui::icon(actionPictogram(actions_[static_cast<std::size_t>(row)])));
+    table_->item(row, 0)->setData(Qt::UserRole,
+        QJsonDocument(clicknova::storage::encodeInputAction(actions_[static_cast<std::size_t>(row)]))
+            .toJson(QJsonDocument::Compact));
     QString details = actionDetails(actions_[static_cast<std::size_t>(row)]);
-    if (!stepWindows_[static_cast<std::size_t>(row)].title.empty())
-        details += QStringLiteral("  ·  ") + QString::fromStdString(stepWindows_[static_cast<std::size_t>(row)].title) +
-            (stepWindows_[static_cast<std::size_t>(row)].enforce ? QString() :
-                trText(" (observed)", " (записано)"));
+    if (!stepWindows_[static_cast<std::size_t>(row)].title.empty()) {
+        // Reuse the binding reference above, avoiding MSVC C4456 shadowing.
+        details += QStringLiteral("  ·  ") + QString::fromStdString(target.title) +
+            (target.enforce ? QString() : trText(" (observed)", " (записано)"));
+        if (!target.elementAutomationId.empty() || !target.elementName.empty())
+            details += QStringLiteral("  · %1 %2: ").arg(
+                    QString::fromLatin1(clicknova::accessibility::providerName(
+                        static_cast<clicknova::accessibility::Provider>(target.elementProvider))),
+                    uiOperationLabel(target.elementOperation, russian_)) +
+                QString::fromStdString(target.elementAutomationId.empty() ?
+                    target.elementName : target.elementAutomationId);
+    }
     table_->item(row, 1)->setText(details);
-    scheduleAutosave();
+    if (changedType) refreshTable(row); // A changed type can split/merge groups.
+    else { applyStepVisibility(); scheduleAutosave(); } // Do not reset cursor while entering text.
 }
 
 void InputLabWidget::addAction() {
@@ -1187,6 +1960,8 @@ void InputLabWidget::addAction() {
     actions_.push_back(currentEditorAction());
     stepWindows_.push_back({});
     refreshTable(static_cast<int>(actions_.size()) - 1);
+    reportActionChange(QStringLiteral("Added steps: %1 · Total: %2"),
+        QStringLiteral("Добавлено шагов: %1 · Всего: %2"), 1);
 }
 
 void InputLabWidget::addActionOfType(int actionType) {
@@ -1298,6 +2073,12 @@ void InputLabWidget::pasteActionAt(int row) {
         const auto binding = clicknova::storage::decodeStepWindow(obj);
         if (action && binding) { pasted.push_back(*action); pastedWindows.push_back(*binding); }
     }
+    // Clipboard steps are independent inserts, never an accidental continuation
+    // of a group with a matching UUID in another scenario.
+    for (auto& binding : pastedWindows) {
+        binding.manualGroupId.clear();
+        binding.manualGroupTitle.clear();
+    }
     if (pasted.empty() || pasted.size() + actions_.size() > 512) {
         reportStatus(trText("Clipboard is empty or the 512-step limit was reached.",
             "Буфер пуст или превышен предел в 512 шагов."));
@@ -1311,6 +2092,8 @@ void InputLabWidget::pasteActionAt(int row) {
     std::vector<int> selection;
     for (int i = 0; i < static_cast<int>(pasted.size()); ++i) selection.push_back(index + i);
     refreshSelectedRows(selection);
+    reportActionChange(QStringLiteral("Pasted steps: %1 · Total: %2"),
+        QStringLiteral("Вставлено шагов: %1 · Всего: %2"), static_cast<int>(pasted.size()));
 }
 
 void InputLabWidget::insertActionAt(int row, int actionType) {
@@ -1319,8 +2102,19 @@ void InputLabWidget::insertActionAt(int row, int actionType) {
     const int index = std::clamp(row, 0, static_cast<int>(actions_.size()));
     checkpointActions();
     actions_.insert(actions_.begin() + index, std::move(action));
-    stepWindows_.insert(stepWindows_.begin() + index, {});
+    StepWindow newBinding;
+    // An insertion strictly between members of a named group belongs to it.
+    // Inserting at a boundary creates an independent, ungrouped step.
+    if (index > 0 && index < static_cast<int>(stepWindows_.size()) &&
+        !stepWindows_[index - 1].manualGroupId.empty() &&
+        stepWindows_[index - 1].manualGroupId == stepWindows_[index].manualGroupId) {
+        newBinding.manualGroupId = stepWindows_[index - 1].manualGroupId;
+        newBinding.manualGroupTitle = stepWindows_[index - 1].manualGroupTitle;
+    }
+    stepWindows_.insert(stepWindows_.begin() + index, std::move(newBinding));
     refreshTable(index);
+    reportActionChange(QStringLiteral("Added steps: %1 · Total: %2"),
+        QStringLiteral("Добавлено шагов: %1 · Всего: %2"), 1);
 }
 
 void InputLabWidget::deleteRow(int row) {
@@ -1329,6 +2123,8 @@ void InputLabWidget::deleteRow(int row) {
     actions_.erase(actions_.begin() + row);
     stepWindows_.erase(stepWindows_.begin() + row);
     refreshTable(std::min(row, static_cast<int>(actions_.size()) - 1));
+    reportActionChange(QStringLiteral("Deleted steps: %1 · Total: %2"),
+        QStringLiteral("Удалено шагов: %1 · Всего: %2"), 1);
 }
 
 void InputLabWidget::duplicateRow(int row) {
@@ -1339,6 +2135,8 @@ void InputLabWidget::duplicateRow(int row) {
     actions_.insert(actions_.begin() + row + 1, std::move(duplicate));
     stepWindows_.insert(stepWindows_.begin() + row + 1, duplicateWindow);
     refreshTable(row + 1);
+    reportActionChange(QStringLiteral("Duplicated steps: %1 · Total: %2"),
+        QStringLiteral("Дублировано шагов: %1 · Всего: %2"), 1);
 }
 
 void InputLabWidget::moveActionRow(int from, int to) {
@@ -1359,6 +2157,8 @@ void InputLabWidget::moveActionRow(int from, int to) {
     stepWindows_.erase(stepWindows_.begin() + from);
     stepWindows_.insert(stepWindows_.begin() + to, std::move(bound));
     refreshTable(to);
+    reportActionChange(QStringLiteral("Moved steps: %1 · Total: %2"),
+        QStringLiteral("Перемещено шагов: %1 · Всего: %2"), 1);
 }
 
 std::vector<int> InputLabWidget::selectedActionRows() const {
@@ -1397,6 +2197,8 @@ void InputLabWidget::deleteSelectedRows() {
         stepWindows_.erase(stepWindows_.begin() + *it);
     }
     refreshTable(std::min(rows.front(), static_cast<int>(actions_.size()) - 1));
+    reportActionChange(QStringLiteral("Deleted steps: %1 · Total: %2"),
+        QStringLiteral("Удалено шагов: %1 · Всего: %2"), static_cast<int>(rows.size()));
 }
 
 void InputLabWidget::duplicateSelectedRows() {
@@ -1424,6 +2226,8 @@ void InputLabWidget::duplicateSelectedRows() {
     stepWindows_ = std::move(resultWindows);
     refreshTable(selected.front());
     refreshSelectedRows(selected);
+    reportActionChange(QStringLiteral("Duplicated steps: %1 · Total: %2"),
+        QStringLiteral("Дублировано шагов: %1 · Всего: %2"), static_cast<int>(rows.size()));
 }
 
 void InputLabWidget::copySelectedRows() {
@@ -1445,6 +2249,8 @@ void InputLabWidget::copySelectedRows() {
     auto* mime = new QMimeData;
     mime->setData(QString::fromLatin1(kStepMime), bytes);
     QApplication::clipboard()->setMimeData(mime);
+    reportActionChange(QStringLiteral("Copied steps: %1 · Total: %2"),
+        QStringLiteral("Скопировано шагов: %1 · Всего: %2"), static_cast<int>(rows.size()));
 }
 
 void InputLabWidget::moveSelectedRows(int direction) {
@@ -1492,6 +2298,8 @@ void InputLabWidget::moveSelectedRows(int direction) {
         if (selected[static_cast<std::size_t>(i)]) newSelection.push_back(i);
     refreshTable(newSelection.front());
     refreshSelectedRows(newSelection);
+    reportActionChange(QStringLiteral("Moved steps: %1 · Total: %2"),
+        QStringLiteral("Перемещено шагов: %1 · Всего: %2"), static_cast<int>(rows.size()));
 }
 
 void InputLabWidget::moveSelectedRowsTo(const std::vector<int>& rows, int insertion) {
@@ -1536,6 +2344,8 @@ void InputLabWidget::moveSelectedRowsTo(const std::vector<int>& rows, int insert
     for (int i = 0; i < static_cast<int>(extracted.size()); ++i) newSelection.push_back(before + i);
     refreshTable(before);
     refreshSelectedRows(newSelection);
+    reportActionChange(QStringLiteral("Moved steps: %1 · Total: %2"),
+        QStringLiteral("Перемещено шагов: %1 · Всего: %2"), static_cast<int>(extracted.size()));
 }
 
 void InputLabWidget::normalizeStepWindows() {
@@ -1557,20 +2367,43 @@ void InputLabWidget::refreshStepWindowEditor(int row) {
         stepWindowWait_->setText(QStringLiteral("0"));
     } else {
         const auto& binding = stepWindows_[static_cast<std::size_t>(row)];
-        stepWindowStatus_->setText(binding.title.empty() ?
+        const QString elementText = !binding.elementAutomationId.empty() ?
+            QString::fromStdString(binding.elementAutomationId) :
+            QString::fromStdString(binding.elementName);
+        const QString actionName = uiOperationLabel(binding.elementOperation, russian_);
+        stepWindowStatus_->setText((binding.title.empty() ?
             trText("Uses default foreground window", "Окно по умолчанию") :
-            QString::fromStdString(binding.title) + (binding.enforce ? QString() :
-                trText(" (recorded only)", " (только из записи)")));
+            QString::fromStdString(binding.title) + (binding.enforce ?
+                (clicknova::input::backgroundElementAction(binding) ?
+                    trText(" (native background action)", " (фоновое нативное действие)") : QString()) :
+                trText(" (recorded only)", " (только из записи)"))) +
+            (elementText.isEmpty() ? QString() :
+                QStringLiteral(" · %1 %2: ").arg(
+                    QString::fromLatin1(clicknova::accessibility::providerName(
+                        static_cast<clicknova::accessibility::Provider>(binding.elementProvider))),
+                    actionName) + elementText +
+                (binding.elementTab.empty() ? QString() :
+                    trText(" · Tab: ", " · Вкладка: ") + QString::fromStdString(binding.elementTab))));
         stepEnforce_->setChecked(!binding.title.empty() && binding.enforce);
         stepActivate_->setChecked(binding.activate);
         stepWindowWait_->setText(QString::number(binding.waitMs));
     }
     for (auto* widget : {static_cast<QWidget*>(chooseStepWindow_), static_cast<QWidget*>(clearStepWindow_)})
         widget->setEnabled(single && !isRunning());
+    // Discovery is independent of selecting a step; binding requires a compatible action.
+    searchStepUi_->setEnabled(!isRunning());
+    clearStepUi_->setEnabled(single && !isRunning() &&
+        (!stepWindows_[static_cast<std::size_t>(row)].elementAutomationId.empty() ||
+         !stepWindows_[static_cast<std::size_t>(row)].elementName.empty()));
     const bool hasWindow = single && !stepWindows_[static_cast<std::size_t>(row)].title.empty();
     stepEnforce_->setEnabled(hasWindow && !isRunning());
     const bool requiresWindow = hasWindow && stepWindows_[static_cast<std::size_t>(row)].enforce;
-    stepActivate_->setEnabled(requiresWindow && !isRunning());
+    const StepWindow* selectedBinding = single ? &stepWindows_[static_cast<std::size_t>(row)] : nullptr;
+    const bool foregroundOnly = selectedBinding &&
+        (!selectedBinding->elementAutomationId.empty() || !selectedBinding->elementName.empty()) &&
+        (selectedBinding->elementProvider >= 3 || selectedBinding->elementOperation == 8 ||
+         selectedBinding->elementBrowser || !selectedBinding->elementTab.empty());
+    stepActivate_->setEnabled(requiresWindow && !isRunning() && !foregroundOnly);
     stepWindowWait_->setEnabled(requiresWindow && !isRunning());
 }
 
@@ -1580,10 +2413,1263 @@ void InputLabWidget::chooseStepWindow() {
     if (!selected) return;
     const auto row = static_cast<std::size_t>(selectedActionRows().front());
     checkpointActions();
+    stepWindows_[row].elementName.clear();
+    stepWindows_[row].elementAutomationId.clear();
+    stepWindows_[row].elementClass.clear();
+    stepWindows_[row].elementRole = 0;
+    stepWindows_[row].elementProvider = 0;
+    stepWindows_[row].elementBrowser = false;
+    stepWindows_[row].elementTab.clear();
+    stepWindows_[row].elementOperation = 0;
+    stepWindows_[row].elementValue.clear();
+    if (std::holds_alternative<ElementTask>(actions_[row]))
+        actions_[row] = clicknova::input::Wait{0};
     stepWindows_[row].title = QString::fromStdWString(selected->title).toUtf8().toStdString();
     stepWindows_[row].process = QString::fromStdWString(selected->process).toUtf8().toStdString();
     stepWindows_[row].enforce = true;
     refreshTable(static_cast<int>(row));
+}
+
+void InputLabWidget::searchStepUiElements() {
+    if (isRunning()) return;
+    std::optional<clicknova::platform::WindowTarget> preferred;
+    const auto selectedRows = selectedActionRows();
+    if (selectedRows.size() == 1) {
+        const auto& binding = stepWindows_[static_cast<std::size_t>(selectedRows.front())];
+        if (!binding.title.empty())
+            preferred = clicknova::platform::findWindow(
+                QString::fromStdString(binding.title).toStdWString(),
+                QString::fromStdString(binding.process).toStdWString());
+    }
+    if (!preferred) preferred = targetWindow_;
+
+    // Search is read-only; a separate explicit action is bound to a single
+    // left-click step, never executed while browsing the accessibility tree.
+    QDialog dialog(this);
+    dialog.setWindowTitle(trText("Find applications, tabs and elements",
+                                "Поиск приложений, вкладок и элементов"));
+    dialog.resize(1150, 740);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* target = new QLabel(trText("Choose any open application or browser tab below; no step window is required.",
+        "Выберите приложение или вкладку прямо здесь — предварительно задавать окно шага не нужно."), &dialog);
+    target->setObjectName(QStringLiteral("uiaSearchTarget"));
+    target->setWordWrap(true);
+    layout->addWidget(target);
+    auto* notice = new QLabel(trText(
+        "Auto-detect UIA, MSAA and Java Access Bridge (not browser DOM). Search is read-only. Available actions depend on the provider; selectors are rechecked during playback.",
+        "Автопоиск через UIA, MSAA и Java Access Bridge (не DOM браузера). Поиск ничего не нажимает. Доступные действия зависят от источника; при выполнении элемент проверяется заново."), &dialog);
+    notice->setObjectName(QStringLiteral("uiaSearchExplanation"));
+    notice->setWordWrap(true);
+    layout->addWidget(notice);
+    auto* filterRow = new QHBoxLayout;
+    auto* query = new QLineEdit(&dialog);
+    query->setPlaceholderText(trText("Name or selector (empty = all)",
+                                     "Имя или ID (пусто = все)"));
+    query->setToolTip(trText("Search by accessibility name or selector, case-insensitively. Empty search shows meaningful controls.",
+        "Поиск по имени или идентификатору элемента без учёта регистра. Пустой запрос показывает содержательные элементы."));
+    auto* role = new QComboBox(&dialog);
+    const std::array<const char*, 13> english = {
+        "All", "Button", "Edit", "Checkbox", "Combobox", "Link", "Text", "Menu item",
+        "Radio button", "List item", "Tree item", "Slider", "Spinner"};
+    const std::array<const char*, 13> russian = {
+        "Все", "Кнопка", "Поле ввода", "Флажок", "Список", "Ссылка", "Текст", "Пункт меню",
+        "Радиокнопка", "Элемент списка", "Элемент дерева", "Ползунок", "Счётчик"};
+    for (int i = 0; i < 13; ++i) role->addItem(QString::fromUtf8(russian_ ? russian[i] : english[i]), i);
+    role->setToolTip(trText("Filter by actual accessibility control type. 'All' means no type filter.",
+        "Фильтр по реальному типу элемента. «Все» означает отсутствие фильтра."));
+    // The hidden selector preserves the existing selection/binding path.
+    // Users interact with the hierarchical tree below, never with engine lists.
+    auto* scope = new QComboBox(&dialog);
+    scope->setObjectName(QStringLiteral("uiaSearchSource"));
+    scope->setMinimumWidth(305);
+    scope->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    scope->setMinimumContentsLength(27);
+    scope->setToolTip(trText("Auto-detected browser tabs from UI Automation, all other open applications, and paired browser extensions. DevTools is optional.",
+        "Автоматически найденные вкладки браузеров через UIA, остальные приложения и вкладки расширений. DevTools необязателен."));
+    auto* refreshSources = new QPushButton(trText("Refresh targets", "Обновить окна"), &dialog);
+    refreshSources->setObjectName(QStringLiteral("uiaRefreshSources"));
+    auto* find = new QPushButton(trText("Search", "Поиск"), &dialog);
+    filterRow->addWidget(query, 1);
+    filterRow->addWidget(role);
+    scope->hide(); // Internal index shared by native/visual search and binding.
+    filterRow->addWidget(refreshSources);
+    filterRow->addWidget(find);
+    layout->addLayout(filterRow);
+    // Native image matching and OCR only operate on a visible foreground
+    // client area. These controls are disabled when optional native libraries
+    // were not available at CMake configuration time.
+    auto* visualRow = new QHBoxLayout;
+    auto* useImage = new QCheckBox(trText("Find image with OpenCV", "Поиск изображения OpenCV"), &dialog);
+    useImage->setObjectName(QStringLiteral("uiaVisualImageEnabled"));
+    useImage->setEnabled(clicknova::accessibility::visual::imageAvailable());
+    auto* templateFile = new QLineEdit(&dialog);
+    templateFile->setObjectName(QStringLiteral("uiaVisualTemplatePath"));
+    templateFile->setReadOnly(true);
+    templateFile->setPlaceholderText(trText("Select button image (PNG/JPEG/BMP)",
+        "Выберите образец кнопки (PNG/JPEG/BMP)"));
+    auto* pickTemplate = new QPushButton(trText("Browse image…", "Выбрать образец…"), &dialog);
+    pickTemplate->setObjectName(QStringLiteral("uiaVisualBrowseImage"));
+    pickTemplate->setEnabled(useImage->isEnabled());
+    connect(pickTemplate, &QPushButton::clicked, &dialog, [=, &dialog] {
+        const QString path = QFileDialog::getOpenFileName(&dialog,
+            trText("Choose image template", "Выберите образец изображения"), QString(),
+            QStringLiteral("Images (*.png *.jpg *.jpeg *.bmp)"));
+        if (!path.isEmpty()) { templateFile->setText(path); useImage->setChecked(true); }
+    });
+    auto* useOcr = new QCheckBox(trText("Find text with OCR", "Найти текст через OCR"), &dialog);
+    useOcr->setObjectName(QStringLiteral("uiaVisualOcrEnabled"));
+    useOcr->setEnabled(clicknova::accessibility::visual::ocrAvailable());
+    auto* visualState = new QLabel(&dialog);
+    visualState->setObjectName(QStringLiteral("uiaVisualAvailability"));
+    visualState->setText(!useImage->isEnabled() ?
+        trText("OpenCV not installed in this build", "В этой сборке OpenCV не подключён") :
+        !useOcr->isEnabled() ? trText("OCR needs Tesseract", "Для OCR нужен Tesseract") :
+        trText("Visible foreground window only", "Только видимое активное окно"));
+    visualRow->addWidget(useImage);
+    visualRow->addWidget(templateFile, 1);
+    visualRow->addWidget(pickTemplate);
+    visualRow->addWidget(useOcr);
+    visualRow->addWidget(visualState);
+    layout->addLayout(visualRow);
+    auto* recognitionSettings = new QHBoxLayout;
+    auto* imageScore = new QSpinBox(&dialog);
+    imageScore->setObjectName(QStringLiteral("uiaVisualImageConfidence"));
+    imageScore->setRange(50, 99);
+    imageScore->setValue(90);
+    imageScore->setSuffix(QStringLiteral("%"));
+    imageScore->setToolTip(trText("Minimum image match confidence", "Минимальная точность совпадения изображения"));
+    auto* ocrScore = new QSpinBox(&dialog);
+    ocrScore->setObjectName(QStringLiteral("uiaVisualOcrConfidence"));
+    ocrScore->setRange(30, 99);
+    ocrScore->setValue(60);
+    ocrScore->setSuffix(QStringLiteral("%"));
+    ocrScore->setToolTip(trText("Minimum OCR line confidence", "Минимальная точность распознавания текста"));
+    auto* searchRadius = new QSpinBox(&dialog);
+    searchRadius->setObjectName(QStringLiteral("uiaVisualSearchRadius"));
+    searchRadius->setRange(1, 30);
+    searchRadius->setValue(8);
+    searchRadius->setSuffix(QStringLiteral("%"));
+    searchRadius->setToolTip(trText("Maximum distance from the originally chosen position during playback, as percent of the window size", "Максимальное смещение от исходного положения при выполнении в процентах от размера окна"));
+    recognitionSettings->addWidget(new QLabel(trText("Image sensitivity:", "Точность OpenCV:"), &dialog));
+    recognitionSettings->addWidget(imageScore);
+    recognitionSettings->addWidget(new QLabel(trText("OCR confidence:", "Точность OCR:"), &dialog));
+    recognitionSettings->addWidget(ocrScore);
+    recognitionSettings->addWidget(new QLabel(trText("Re-search radius:", "Радиус повторного поиска:"), &dialog));
+    recognitionSettings->addWidget(searchRadius);
+    recognitionSettings->addStretch();
+    layout->addLayout(recognitionSettings);
+    // Chromium's opt-in localhost DevTools endpoint provides real page URLs;
+    // it is NOT a privilege to bind a page to an unrelated native window.
+    auto* devToolsRow = new QHBoxLayout;
+    auto* devToolsEnabled = new QCheckBox(trText("Additional browser tabs via local DevTools", "Вкладки через локальный DevTools"), &dialog);
+    devToolsEnabled->setObjectName(QStringLiteral("uiaDevToolsEnabled"));
+    devToolsEnabled->setToolTip(trText("Requires Chromium launched by the user with --remote-debugging-port and a dedicated profile. Only 127.0.0.1 is contacted.",
+        "Нужно запустить Chromium с --remote-debugging-port и отдельным профилем. Подключение только к 127.0.0.1."));
+    auto* devToolsPort = new QSpinBox(&dialog);
+    devToolsPort->setObjectName(QStringLiteral("uiaDevToolsPort"));
+    devToolsPort->setRange(1024, 65535);
+    devToolsPort->setValue(9222);
+    devToolsPort->setPrefix(QStringLiteral("localhost:"));
+    devToolsPort->setEnabled(false);
+    auto* fetchFavicons = new QCheckBox(trText("Fetch first-party site icons", "Загружать иконки сайтов"), &dialog);
+    fetchFavicons->setObjectName(QStringLiteral("uiaFetchFavicons"));
+    fetchFavicons->setChecked(true);
+    fetchFavicons->setToolTip(trText("Requests /favicon.ico or the first-party favicon provided by the browser, directly from each website. Uncheck to avoid these network requests.",
+        "ClickNova запрашивает /favicon.ico или значок с того же сайта. Снимите флажок, чтобы не отправлять эти запросы."));
+    auto* devToolsState = new QLabel(trText("DevTools is optional: UIA tabs remain available without it.",
+        "DevTools необязателен: вкладки UIA доступны и без него."), &dialog);
+    devToolsState->setObjectName(QStringLiteral("uiaDevToolsState"));
+    devToolsRow->addWidget(devToolsEnabled);
+    devToolsRow->addWidget(devToolsPort);
+    devToolsRow->addWidget(fetchFavicons);
+    auto* devToolsHelp = new QPushButton(QStringLiteral("?"), &dialog);
+    devToolsHelp->setObjectName(QStringLiteral("uiaDevToolsHelp"));
+    devToolsHelp->setFixedWidth(30);
+    connect(devToolsHelp, &QPushButton::clicked, &dialog, [this, &dialog] {
+        QMessageBox::information(&dialog, QStringLiteral("ClickNova — DevTools"), trText(
+            "Optional for Chrome/Edge/Brave and compatible Chromium browsers. Start a SEPARATE browser profile with:\n\n"
+            "chrome.exe --remote-debugging-port=9222 --user-data-dir=\"%TEMP%\\ClickNova-CDP\"\n\n"
+            "Then enable DevTools and refresh the list. This local debugging port grants other local processes extensive control over that browser profile. Avoid sensitive accounts; close the debug browser after use. UIA-only tabs still work without DevTools. Tabs not safely matched to a Windows window are for discovery only.",
+            "Для Chrome/Edge/Brave и совместимых браузеров. Запустите браузер с ОТДЕЛЬНЫМ профилем:\n\n"
+            "chrome.exe --remote-debugging-port=9222 --user-data-dir=\"%TEMP%\\ClickNova-CDP\"\n\n"
+            "Затем включите DevTools и обновите список. Этот локальный порт предоставляет другим процессам расширенный доступ к отладочному профилю: не используйте в нём важные учётные записи и закрывайте после работы. Вкладки UIA доступны и без DevTools. Вкладки без надёжной связи с окном Windows можно только просматривать."));
+    });
+    devToolsRow->addWidget(devToolsHelp);
+    devToolsRow->addWidget(devToolsState, 1);
+    layout->addLayout(devToolsRow);
+    // Read-only WebExtensions inventory: normal Chrome/Edge/Brave/Opera/Vivaldi
+    // and Firefox tabs, without DevTools. The extension needs explicit pairing.
+    auto* extensionBridge = new clicknova::gui::BrowserExtensionBridge(&dialog);
+    const bool extensionReady = extensionBridge->start();
+    auto* extensionRow = new QHBoxLayout;
+    auto* extensionStatus = new QLabel(extensionReady ?
+        trText("Browser extensions: waiting for paired browsers", "Расширения: ожидание подключённых браузеров") :
+        trText("Extension bridge unavailable (port 48231 in use)", "Мост расширений недоступен (порт 48231 занят)"), &dialog);
+    extensionStatus->setObjectName(QStringLiteral("uiaExtensionBridgeStatus"));
+    auto* pairingCode = new QLineEdit(extensionBridge->pairingKey(), &dialog);
+    pairingCode->setObjectName(QStringLiteral("uiaExtensionPairingKey"));
+    pairingCode->setReadOnly(true);
+    pairingCode->setMinimumWidth(145);
+    pairingCode->setToolTip(trText("Private pairing key. Paste it into the ClickNova Tabs Bridge browser extension. Do not publish it.",
+        "Секретный код сопряжения: вставьте в расширение ClickNova Tabs Bridge и не публикуйте."));
+    auto* copyPairing = new QPushButton(trText("Copy key", "Копировать код"), &dialog);
+    copyPairing->setObjectName(QStringLiteral("uiaCopyExtensionKey"));
+    connect(copyPairing, &QPushButton::clicked, &dialog, [pairingCode] {
+        if (auto* clipboard = QGuiApplication::clipboard()) clipboard->setText(pairingCode->text());
+    });
+    auto* extensionHelp = new QPushButton(QStringLiteral("?"), &dialog);
+    extensionHelp->setObjectName(QStringLiteral("uiaExtensionHelp"));
+    extensionHelp->setFixedWidth(30);
+    connect(extensionHelp, &QPushButton::clicked, &dialog, [this, &dialog] {
+        QMessageBox::information(&dialog, QStringLiteral("ClickNova — Browser Extension"), trText(
+            "ClickNova automatically recognizes supported browsers and unknown browsers whose tab strip and address bar are accessible through Windows UI Automation. To also list background tabs hidden from UIA, install ClickNova Tabs Bridge once per browser: extensions/chromium for WebExtensions-compatible Chromium browsers; extensions/firefox for Firefox-compatible browsers. Enter the key above only once. The paired extension reconnects when this dialog opens; allow up to 30 seconds for its periodic sync. Not every browser supports WebExtensions or exposes its tabs to Windows; access to absolutely every browser cannot be guaranteed. Hidden/private tabs and browser internals are excluded. Metadata-only tabs are not native click targets.",
+            "ClickNova автоматически определяет известные браузеры и неизвестные браузеры, показывающие вкладки и адресную строку через Windows UI Automation. Чтобы видеть также фоновые вкладки, скрытые от UIA, установите ClickNova Tabs Bridge один раз в каждый браузер: extensions/chromium для совместимых Chromium-браузеров или extensions/firefox для Firefox-совместимых. Код выше вводится один раз. После этого расширение подключается при открытии окна поиска; периодическое обновление может занять до 30 секунд. Не все браузеры поддерживают WebExtensions или раскрывают вкладки Windows, поэтому гарантировать абсолютно любой браузер нельзя. Приватные и внутренние вкладки исключены. Вкладки «только список» не используются как цели нажатий."));
+    });
+    extensionRow->addWidget(extensionStatus);
+    extensionRow->addWidget(pairingCode, 1);
+    extensionRow->addWidget(copyPairing);
+    extensionRow->addWidget(extensionHelp);
+    layout->addLayout(extensionRow);
+    auto* network = new QNetworkAccessManager(&dialog);
+    auto* showTechnical = new QCheckBox(trText("Include unnamed technical containers",
+        "Показать безымянные технические контейнеры"), &dialog);
+    showTechnical->setObjectName(QStringLiteral("uiaIncludeAnonymous"));
+    showTechnical->setChecked(false);
+    showTechnical->setToolTip(trText("Usually these are layout panes without an accessible name or ID. Hide them to find buttons and fields more quickly.",
+        "Чаще всего это панели компоновки без имени и ID. Скройте их, чтобы быстрее находить кнопки и поля."));
+    layout->addWidget(showTechnical);
+    auto* results = new QTableWidget(&dialog);
+    results->setObjectName(QStringLiteral("uiaSearchResults"));
+    results->setColumnCount(5);
+    results->setHorizontalHeaderLabels({trText("Name", "Имя"), QStringLiteral("AutomationId"),
+        trText("Actual type", "Тип элемента"), trText("Class", "Класс"),
+        trText("Enabled", "Включён")});
+    results->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    results->setSelectionBehavior(QAbstractItemView::SelectRows);
+    results->setSelectionMode(QAbstractItemView::SingleSelection);
+    results->verticalHeader()->hide();
+    results->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    results->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+    results->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
+    results->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
+    results->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
+    results->setColumnWidth(1, 170);
+    results->setColumnWidth(2, 145);
+    results->setColumnWidth(3, 130);
+    results->setColumnWidth(4, 95);
+    results->horizontalHeaderItem(0)->setToolTip(trText("Accessible Name is provided by the application. It may be empty even for visible controls.",
+        "Доступное имя передаёт приложение. Оно бывает пустым даже у видимых элементов."));
+    results->horizontalHeaderItem(1)->setToolTip(trText("AutomationId is an optional developer-defined identifier, NOT a Windows window handle.",
+        "AutomationId — необязательный идентификатор разработчика, НЕ дескриптор окна Windows."));
+    results->horizontalHeaderItem(2)->setToolTip(trText("Control type and discovery provider; 'All' is only a search filter.",
+        "Тип элемента и источник поиска. «Все» — только фильтр поиска."));
+    results->horizontalHeaderItem(3)->setToolTip(trText("Underlying Windows accessibility class; often empty for web elements.",
+        "Класс элемента Windows. У веб-элементов он нередко отсутствует."));
+    results->horizontalHeaderItem(4)->setToolTip(trText("Whether the OS reports the element enabled; not a promise that ClickNova can act on it.",
+        "Сообщает ли ОС, что элемент включён. Это не гарантия доступности действия ClickNova."));
+    // One workspace: target hierarchy on the left, live accessible elements on
+    // the right. Browser tabs are children of their actual Windows host, not
+    // guessed from a favicon, URL or untrusted extension label.
+    auto* workspace = new QSplitter(Qt::Horizontal, &dialog);
+    workspace->setObjectName(QStringLiteral("unifiedSearchWorkspace"));
+    auto* leftPanel = new QWidget(workspace);
+    auto* leftLayout = new QVBoxLayout(leftPanel);
+    leftLayout->setContentsMargins(0, 0, 4, 0);
+    auto* targetFilter = new QLineEdit(leftPanel);
+    targetFilter->setObjectName(QStringLiteral("unifiedTargetFilter"));
+    targetFilter->setPlaceholderText(trText("Filter applications and tabs…", "Фильтр программ и вкладок…"));
+    leftLayout->addWidget(targetFilter);
+    auto* sourceTree = new QTreeWidget(leftPanel);
+    sourceTree->setObjectName(QStringLiteral("unifiedTargetTree"));
+    sourceTree->setHeaderHidden(true);
+    sourceTree->setUniformRowHeights(true);
+    sourceTree->setSelectionMode(QAbstractItemView::SingleSelection);
+    sourceTree->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    sourceTree->setToolTip(trText("Select an application or a UIA browser tab. Disconnected websites are shown as metadata only.",
+        "Выберите программу или UIA-вкладку. Сайты без связи с окном показаны только для просмотра."));
+    leftLayout->addWidget(sourceTree, 1);
+    workspace->addWidget(leftPanel);
+    workspace->addWidget(results);
+    workspace->setStretchFactor(0, 1);
+    workspace->setStretchFactor(1, 2);
+    workspace->setSizes({340, 700});
+    layout->addWidget(workspace, 1);
+    auto* actionRow = new QHBoxLayout;
+    auto* operation = new QComboBox(&dialog);
+    operation->setObjectName(QStringLiteral("uiaBindingOperation"));
+    const std::array<const char*, 10> operationEn = {
+        "Press (Invoke)", "Set text (Value)", "Check", "Uncheck", "Select item",
+        "Expand", "Collapse", "Set numeric value", "Focus", "Scroll into view"};
+    const std::array<const char*, 10> operationRu = {
+        "Нажать (Invoke)", "Ввести текст (Value)", "Установить флажок", "Снять флажок", "Выбрать элемент",
+        "Раскрыть", "Свернуть", "Задать число", "Фокус", "Прокрутить к элементу"};
+    for (int i = 0; i < 10; ++i)
+        operation->addItem(QString::fromUtf8(russian_ ? operationRu[i] : operationEn[i]), i);
+    operation->setToolTip(trText("Only operations supported by the selected element and its backend can be bound.",
+        "Доступны только действия, поддерживаемые элементом и его источником."));
+    auto* actionValue = new QLineEdit(&dialog);
+    actionValue->setObjectName(QStringLiteral("uiaBindingValue"));
+    actionValue->setMaxLength(2048);
+    actionValue->setPlaceholderText(trText("Text or decimal number for selected operation",
+        "Текст или десятичное число для выбранной операции"));
+    actionValue->setToolTip(trText("ValuePattern replaces the field content; empty text clears it. Numeric values use a dot (e.g. 2.5). Never used for passwords.",
+        "ValuePattern заменяет содержимое поля; пустая строка очищает его. Число через точку (например, 2.5). Пароли запрещены."));
+    actionRow->addWidget(new QLabel(trText("Operation", "Действие"), &dialog));
+    actionRow->addWidget(operation);
+    actionRow->addWidget(actionValue, 1);
+    layout->addLayout(actionRow);
+    auto* taskRow = new QHBoxLayout;
+    auto* taskKind = new QComboBox(&dialog);
+    taskKind->setObjectName(QStringLiteral("elementTaskKind"));
+    const char* namesEn[] = {"Perform operation", "Double activate", "Set text", "Scroll element",
+                             "Wait for element", "Check element exists"};
+    const char* namesRu[] = {"Выполнить действие", "Двойное нажатие", "Ввести текст", "Прокрутить элемент",
+                             "Дождаться элемента", "Проверить наличие"};
+    for (int i = 0; i < 6; ++i) taskKind->addItem(QString::fromUtf8(russian_ ? namesRu[i] : namesEn[i]), i);
+    auto* scrollAxis = new QComboBox(&dialog);
+    scrollAxis->addItems({trText("Vertical", "Вертикально"), trText("Horizontal", "Горизонтально")});
+    scrollAxis->setObjectName(QStringLiteral("elementScrollAxis"));
+    auto* scrollAmount = new QSpinBox(&dialog);
+    scrollAmount->setRange(-1200, 1200);
+    scrollAmount->setValue(-120);
+    scrollAmount->setObjectName(QStringLiteral("elementScrollAmount"));
+    auto* timeout = new QSpinBox(&dialog);
+    timeout->setRange(0, 600000);
+    timeout->setSuffix(QStringLiteral(" ms"));
+    timeout->setValue(5000);
+    timeout->setObjectName(QStringLiteral("elementWaitTimeout"));
+    auto* polling = new QSpinBox(&dialog);
+    polling->setRange(20, 5000);
+    polling->setSuffix(QStringLiteral(" ms"));
+    polling->setValue(100);
+    polling->setObjectName(QStringLiteral("elementWaitPoll"));
+    auto* doubleInterval = new QSpinBox(&dialog);
+    doubleInterval->setRange(10, std::min(1000, static_cast<int>(GetDoubleClickTime())));
+    doubleInterval->setSuffix(QStringLiteral(" ms"));
+    doubleInterval->setValue(100);
+    doubleInterval->setObjectName(QStringLiteral("elementDoubleInterval"));
+    taskRow->addWidget(new QLabel(trText("Step", "Шаг"), &dialog));
+    taskRow->addWidget(taskKind, 2);
+    taskRow->addWidget(scrollAxis);
+    taskRow->addWidget(scrollAmount);
+    taskRow->addWidget(timeout);
+    taskRow->addWidget(polling);
+    taskRow->addWidget(doubleInterval);
+    layout->addLayout(taskRow);
+    if (selectedActionRows().size() == 1) {
+        if (const auto* previous = std::get_if<ElementTask>(
+                &actions_[static_cast<std::size_t>(selectedActionRows().front())])) {
+            taskKind->setCurrentIndex(static_cast<int>(previous->command));
+            if (previous->command == ElementCommand::SetText) actionValue->setText(QString::fromStdU16String(previous->text));
+            scrollAxis->setCurrentIndex(static_cast<int>(previous->axis));
+            scrollAmount->setValue(previous->delta);
+            timeout->setValue(previous->timeoutMs);
+            polling->setValue(previous->pollMs);
+            doubleInterval->setValue(previous->doubleIntervalMs);
+        }
+    }
+    auto* state = new QLabel(trText("Choose an element and bind a universal step. Text is saved in plain text: never use passwords.",
+        "Выберите элемент и тип действия. Текст сохраняется в сценарии открытым текстом: не используйте пароли."), &dialog);
+    state->setWordWrap(true);
+    layout->addWidget(state);
+    auto* close = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto* bind = close->addButton(trText("Bind element action", "Привязать действие элемента"), QDialogButtonBox::ActionRole);
+    bind->setObjectName(QStringLiteral("uiaBindToStep"));
+    bind->setEnabled(false);
+    connect(close, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(close);
+    auto lastResults = std::make_shared<clicknova::accessibility::Result>();
+    auto lastTarget = std::make_shared<std::optional<UiSearchTarget>>();
+    auto choices = std::make_shared<std::vector<UiSearchTarget>>();
+    auto browserTabs = std::make_shared<std::vector<UiSearchTarget>>();
+    // A browser is not defined by its .exe name. UIA-detected unknown
+    // executables are classified as browsers when selectable web tabs exist.
+    auto detectedBrowserWindows = std::make_shared<QSet<quintptr>>();
+    auto devToolsPages = std::make_shared<QVector<clicknova::gui::BrowserPage>>();
+    auto extensionPages = std::make_shared<QVector<clicknova::gui::BrowserPage>>();
+    auto attemptedExtensionIcons = std::make_shared<QSet<QString>>();
+    auto siteIcons = std::make_shared<QHash<QString, QIcon>>();
+    auto windows = std::make_shared<std::vector<clicknova::platform::WindowTarget>>();
+    auto generation = std::make_shared<int>(0);
+    auto tabLoading = std::make_shared<bool>(false);
+
+    const auto populateSources = [=, this] {
+        const int previous = scope->currentData().toInt();
+        std::optional<UiSearchTarget> previousTarget;
+        if (previous >= 0 && previous < static_cast<int>(choices->size()))
+            previousTarget = (*choices)[static_cast<std::size_t>(previous)];
+        QSignalBlocker scopeBlock(scope);
+        QSignalBlocker treeBlock(sourceTree);
+        scope->clear();
+        sourceTree->clear();
+        choices->clear();
+        std::vector<QTreeWidgetItem*> choiceNodes;
+        QTreeWidgetItem* group = nullptr;
+        const auto heading = [&](const QString& text) {
+            group = new QTreeWidgetItem(sourceTree, QStringList{text});
+            group->setFlags(group->flags() & ~Qt::ItemIsSelectable);
+            group->setIcon(0, clicknova::gui::icon(clicknova::gui::Icon::Folder));
+            group->setExpanded(true);
+        };
+        const auto addTarget = [&](const UiSearchTarget& item, const QString& name,
+                                   const QIcon& icon, QTreeWidgetItem* host = nullptr) -> QTreeWidgetItem* {
+            const int index = static_cast<int>(choices->size());
+            choices->push_back(item);
+            scope->addItem(icon, name, index);
+            scope->setItemData(scope->count() - 1, name, Qt::ToolTipRole);
+            auto* node = new QTreeWidgetItem(host ? host : group, QStringList{name});
+            node->setData(0, Qt::UserRole, index);
+            node->setIcon(0, icon);
+            node->setToolTip(0, name);
+            if (item.devToolsOnly) {
+                node->setForeground(0, QColor(QStringLiteral("#98a9bd")));
+                node->setToolTip(0, name + trText("\nInformation only: no secure native target",
+                    "\nТолько сведения: нет надёжной привязки к окну"));
+            }
+            choiceNodes.push_back(node);
+            return node;
+        };
+        const auto isBrowserWindow = [&](const clicknova::platform::WindowTarget& window) {
+            return clicknova::accessibility::browserExecutable(window.process) ||
+                detectedBrowserWindows->contains(window.handle);
+        };
+        heading(trText("Windows applications", "Приложения Windows"));
+        for (const auto& window : *windows) {
+            if (isBrowserWindow(window)) continue;
+            const QString name = QString::fromStdWString(window.title);
+            addTarget({window, {}, false}, name + QStringLiteral(" · ") +
+                QString::fromStdWString(window.process), searchWindowIcon(window));
+        }
+        heading(trText("Browsers and websites (UIA, automatically detected)",
+            "Браузеры и сайты (UIA, автоопределение)"));
+        for (const auto& window : *windows) {
+            if (!isBrowserWindow(window)) continue;
+            auto* browserNode = addTarget({window, {}, true}, QString::fromStdWString(window.title) +
+                QStringLiteral(" · ") + QString::fromStdWString(window.process), searchWindowIcon(window));
+            browserNode->setExpanded(true);
+            for (const auto& tab : *browserTabs) {
+                if (tab.window.handle != window.handle || tab.window.processId != window.processId) continue;
+                UiSearchTarget choice = tab;
+                const QString tabTitle = QString::fromStdWString(tab.tab);
+                const int matched = clicknova::gui::uniquePageForTitle(*devToolsPages, tabTitle);
+                const int extensionMatch = clicknova::gui::uniqueExtensionPageForTab(
+                    *extensionPages, tabTitle, QString::fromStdWString(tab.window.process));
+                const int uiaMatches = static_cast<int>(std::count_if(browserTabs->begin(), browserTabs->end(),
+                    [&](const UiSearchTarget& other) {
+                        return QString::fromStdWString(other.tab).compare(tabTitle, Qt::CaseInsensitive) == 0;
+                    }));
+                // Metadata can decorate an existing UIA tab (favicon + URL),
+                // but cannot designate a native target by itself. Refuse
+                // ambiguous title matches and mismatched browser processes.
+                const QString process = QString::fromStdWString(tab.window.process).toLower();
+                if (uiaMatches == 1 && extensionMatch >= 0)
+                    choice.pageUrl = (*extensionPages)[extensionMatch].url.toString();
+                else if (matched >= 0 && uiaMatches == 1 &&
+                         clicknova::accessibility::browserExecutable(tab.window.process) &&
+                         !process.contains(QStringLiteral("firefox")))
+                    choice.pageUrl = (*devToolsPages)[matched].url.toString();
+                const QString text = QString::fromStdWString(tab.tab) +
+                    (choice.pageUrl.isEmpty() ? QString() : QStringLiteral(" · ") + choice.pageUrl);
+                addTarget(choice, text, siteIcons->value(choice.pageUrl, browserSiteIcon()), browserNode);
+            }
+        }
+        if (!devToolsPages->empty()) {
+            heading(trText("Additional websites via DevTools (view only when not in UIA)",
+                "Дополнительные сайты DevTools (без UIA — только просмотр)"));
+            for (const auto& page : *devToolsPages) {
+                const QString pageUrl = page.url.toString();
+                const int matchingPage = clicknova::gui::uniquePageForTitle(*devToolsPages, page.title);
+                const int matchedWindows = static_cast<int>(std::count_if(browserTabs->begin(), browserTabs->end(),
+                    [&](const UiSearchTarget& tab) {
+                        return QString::fromStdWString(tab.tab).compare(page.title, Qt::CaseInsensitive) == 0 &&
+                            clicknova::accessibility::browserExecutable(tab.window.process) &&
+                            !QString::fromStdWString(tab.window.process).contains(QStringLiteral("firefox"), Qt::CaseInsensitive);
+                    }));
+                const bool matchedUiA = matchingPage >= 0 && matchedWindows == 1;
+                if (matchedUiA) continue;
+                UiSearchTarget candidate;
+                candidate.tab = page.title.toStdWString();
+                candidate.browser = true;
+                candidate.pageUrl = pageUrl;
+                candidate.devToolsOnly = true;
+                addTarget(candidate, page.title + QStringLiteral(" · ") + pageUrl +
+                    trText(" (metadata only)", " (только список)"),
+                    siteIcons->value(pageUrl, browserSiteIcon()));
+            }
+        }
+        if (!extensionPages->isEmpty()) {
+            heading(trText("Websites from paired browser extensions (metadata only)",
+                "Сайты подключённых расширений (только список)"));
+            for (const auto& page : *extensionPages) {
+                // A page that already decorates a unique native UIA tab
+                // belongs there; do not display it again as metadata only.
+                const int matchedTabs = static_cast<int>(std::count_if(browserTabs->begin(), browserTabs->end(),
+                    [&](const UiSearchTarget& tab) {
+                        return QString::fromStdWString(tab.tab).compare(page.title, Qt::CaseInsensitive) == 0 &&
+                            clicknova::gui::uniqueExtensionPageForTab(*extensionPages, page.title,
+                                QString::fromStdWString(tab.window.process)) >= 0;
+                    }));
+                if (matchedTabs == 1) continue;
+                UiSearchTarget candidate;
+                candidate.tab = page.title.toStdWString();
+                candidate.browser = true;
+                candidate.pageUrl = page.url.toString();
+                candidate.devToolsOnly = true; // No unsafe window guessing.
+                addTarget(candidate,
+                    page.browser + QStringLiteral(" · ") +
+                    page.title + QStringLiteral(" · ") + candidate.pageUrl +
+                    trText(" (metadata only)", " (только список)"),
+                    siteIcons->value(candidate.pageUrl, browserSiteIcon()));
+            }
+        }
+        if (choices->empty())
+            heading(trText("No open applications found", "Открытые приложения не найдены"));
+        int selected = -1;
+        for (int i = 0; i < static_cast<int>(choices->size()); ++i) {
+            const auto& item = (*choices)[static_cast<std::size_t>(i)];
+            const bool same = previousTarget &&
+                item.window.handle == previousTarget->window.handle &&
+                item.window.processId == previousTarget->window.processId && item.tab == previousTarget->tab &&
+                // URL/favicon changes must not reset a real UIA tab selection.
+                (item.window.handle != 0 || item.pageUrl == previousTarget->pageUrl);
+            const bool preferredMatch = !previousTarget && preferred &&
+                item.window.handle == preferred->handle && item.tab.empty();
+            if (same || preferredMatch) { selected = i; break; }
+        }
+        if (selected < 0 && !choices->empty()) selected = 0;
+        const int entry = selected >= 0 ? scope->findData(selected) : -1;
+        scope->setCurrentIndex(entry);
+        if (selected >= 0 && selected < static_cast<int>(choiceNodes.size())) {
+            auto* node = choiceNodes[static_cast<std::size_t>(selected)];
+            sourceTree->setCurrentItem(node);
+        }
+        // Preserve the user's filter across live window/favicon updates.
+        const auto needle = targetFilter->text().trimmed();
+        std::function<bool(QTreeWidgetItem*, bool)> filterTree =
+            [&](QTreeWidgetItem* node, bool inheritedMatch) {
+                const bool selfMatch = !needle.isEmpty() &&
+                    node->text(0).contains(needle, Qt::CaseInsensitive);
+                bool anyChild = false;
+                for (int i = 0; i < node->childCount(); ++i)
+                    anyChild = filterTree(node->child(i), inheritedMatch || selfMatch) || anyChild;
+                const bool visible = needle.isEmpty() || inheritedMatch || selfMatch || anyChild;
+                node->setHidden(!visible);
+                if (visible && anyChild) node->setExpanded(true);
+                return visible;
+            };
+        for (int i = 0; i < sourceTree->topLevelItemCount(); ++i)
+            filterTree(sourceTree->topLevelItem(i), false);
+        find->setEnabled(selected >= 0 && !(*choices)[static_cast<std::size_t>(selected)].devToolsOnly);
+        if (selected >= 0 && selected < static_cast<int>(choices->size())) {
+            const auto& current = (*choices)[static_cast<std::size_t>(selected)];
+            if (current.devToolsOnly) {
+                state->setText(trText("Website discovered via browser metadata: it cannot be safely mapped to a Windows UIA tab.",
+                    "Сайт найден через браузер: вкладка не имеет однозначной связи с окном UIA."));
+            }
+            target->setText(trText("Target: %1 · %2", "Цель: %1 · %2").arg(
+                current.devToolsOnly ? current.pageUrl : QString::fromStdWString(current.window.title),
+                current.tab.empty() ? QString::fromStdWString(current.window.process) :
+                    QString::fromStdWString(current.tab)));
+        }
+    };
+    // Extension-reported favicon URLs are passed through browserIconUrl() so
+    // icon downloads never contact a third-party host for a visited URL.
+    auto requestExtensionIcons = [=, &dialog] {
+        if (!fetchFavicons->isChecked()) return;
+        int issued = 0;
+        QVector<clicknova::gui::BrowserPage> pages = *extensionPages;
+        // Without an extension UIA cannot list the URLs of background tabs.
+        // The active address bar is reliable enough to request its first-party
+        // favicon without activating any additional tabs.
+        for (const auto& tab : *browserTabs) {
+            if (tab.pageUrl.isEmpty()) continue;
+            clicknova::gui::BrowserPage page;
+            page.url = QUrl(tab.pageUrl);
+            pages.push_back(std::move(page));
+        }
+        for (const auto& page : pages) {
+            const QUrl url = clicknova::gui::browserIconUrl(page);
+            const QString pageUrl = page.url.toString();
+            if (!url.isValid() || url.isEmpty() || siteIcons->contains(pageUrl) ||
+                attemptedExtensionIcons->contains(pageUrl) || issued >= 20) continue;
+            attemptedExtensionIcons->insert(pageUrl);
+            ++issued;
+            QNetworkRequest request(url);
+            request.setTransferTimeout(2500);
+            request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                QNetworkRequest::ManualRedirectPolicy);
+            auto* reply = network->get(request);
+            connect(reply, &QNetworkReply::readyRead, &dialog, [reply] {
+                if (reply->bytesAvailable() > 128 * 1024) reply->abort();
+            });
+            connect(reply, &QNetworkReply::finished, &dialog, [=] {
+                reply->deleteLater();
+                if (reply->error() != QNetworkReply::NoError ||
+                    reply->bytesAvailable() > 128 * 1024 || !fetchFavicons->isChecked()) return;
+                QBuffer buffer;
+                buffer.setData(reply->readAll());
+                if (!buffer.open(QIODevice::ReadOnly)) return;
+                QImageReader reader(&buffer);
+                const QSize dimensions = reader.size();
+                if (!dimensions.isValid() || dimensions.width() > 512 ||
+                    dimensions.height() > 512 || dimensions.width() < 1 || dimensions.height() < 1) return;
+                reader.setScaledSize(dimensions.scaled(32, 32, Qt::KeepAspectRatio));
+                const QImage image = reader.read();
+                if (image.isNull()) return;
+                (*siteIcons)[pageUrl] = QIcon(QPixmap::fromImage(image));
+                if (scope->isEnabled()) populateSources();
+            });
+        }
+    };
+    const auto loadSources = [=, this, &dialog] {
+        ++*generation;
+        const int version = *generation;
+        *windows = clicknova::platform::listWindows();
+        browserTabs->clear();
+        detectedBrowserWindows->clear();
+        devToolsPages->clear();
+        populateSources();
+        *lastTarget = std::nullopt;
+        lastResults->elements.clear();
+        results->setRowCount(0);
+        bind->setEnabled(false);
+        const auto browsers = *windows;
+        refreshSources->setEnabled(false);
+        *tabLoading = true;
+        if (devToolsEnabled->isChecked()) {
+            devToolsState->setText(trText("Reading local browser tabs…", "Читаем вкладки браузера…"));
+            QNetworkRequest request(clicknova::gui::devToolsListUrl(
+                static_cast<quint16>(devToolsPort->value())));
+            request.setTransferTimeout(2500);
+            auto* reply = network->get(request);
+            connect(reply, &QNetworkReply::readyRead, &dialog, [reply] {
+                if (reply->bytesAvailable() > 512 * 1024) reply->abort();
+            });
+            connect(reply, &QNetworkReply::finished, &dialog, [=, this, &dialog] {
+                reply->deleteLater();
+                if (*generation != version) return;
+                if (reply->error() != QNetworkReply::NoError || reply->bytesAvailable() > 512 * 1024) {
+                    devToolsState->setText(trText("DevTools unavailable (UIA remains available)",
+                        "DevTools недоступен (UIA работает отдельно)"));
+                    return;
+                }
+                *devToolsPages = clicknova::gui::parseDevToolsPages(reply->readAll());
+                devToolsState->setText(trText("DevTools websites: %1", "Сайтов DevTools: %1")
+                    .arg(devToolsPages->size()));
+                if (scope->isEnabled()) populateSources();
+                if (!fetchFavicons->isChecked()) return;
+                // Only request first-party favicons. Limit concurrent network
+                // traffic and decoded image size. Never send URLs to an icon proxy.
+                auto iconQueue = std::make_shared<QQueue<QPair<QString, QUrl>>>();
+                QSet<QString> seen;
+                for (const auto& page : *devToolsPages) {
+                    const QString pageUrl = page.url.toString();
+                    const QUrl iconUrl = clicknova::gui::browserIconUrl(page);
+                    if (!iconUrl.isValid() || seen.contains(iconUrl.toString()) ||
+                        siteIcons->contains(pageUrl)) continue;
+                    seen.insert(iconUrl.toString());
+                    iconQueue->enqueue(qMakePair(pageUrl, iconUrl));
+                }
+                auto activeIcons = std::make_shared<int>(0);
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> weakPump(pump);
+                *pump = [=, this, &dialog] {
+                    while (*activeIcons < 4 && !iconQueue->isEmpty() && *generation == version) {
+                        const auto pending = iconQueue->dequeue();
+                        ++*activeIcons;
+                        QNetworkRequest iconRequest(pending.second);
+                        iconRequest.setTransferTimeout(2500);
+                        iconRequest.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                            QNetworkRequest::ManualRedirectPolicy);
+                        auto* iconReply = network->get(iconRequest);
+                        const auto keepPumpAlive = weakPump.lock();
+                        connect(iconReply, &QNetworkReply::readyRead, &dialog, [iconReply] {
+                            if (iconReply->bytesAvailable() > 128 * 1024) iconReply->abort();
+                        });
+                        connect(iconReply, &QNetworkReply::finished, &dialog, [=, this] {
+                            (void)keepPumpAlive;
+                            iconReply->deleteLater();
+                            --*activeIcons;
+                            if (*generation == version &&
+                                iconReply->error() == QNetworkReply::NoError &&
+                                iconReply->bytesAvailable() <= 128 * 1024) {
+                                const QByteArray image = iconReply->readAll();
+                                QBuffer buffer;
+                                buffer.setData(image);
+                                if (buffer.open(QIODevice::ReadOnly)) {
+                                    QImageReader reader(&buffer);
+                                    const QSize dimensions = reader.size();
+                                    if (dimensions.isValid() && dimensions.width() <= 512 &&
+                                        dimensions.height() <= 512 && dimensions.width() > 0 &&
+                                        dimensions.height() > 0) {
+                                        reader.setScaledSize(dimensions.scaled(32, 32, Qt::KeepAspectRatio));
+                                        const QImage decoded = reader.read();
+                                        if (!decoded.isNull()) {
+                                            const QIcon icon(QPixmap::fromImage(decoded));
+                                            for (const auto& page : *devToolsPages)
+                                                if (clicknova::gui::browserIconUrl(page) == pending.second)
+                                                    (*siteIcons)[page.url.toString()] = icon;
+                                            for (int index = 0; index < scope->count(); ++index) {
+                                                bool ok = false;
+                                                const int choiceIndex = scope->itemData(index).toInt(&ok);
+                                                if (ok && choiceIndex >= 0 && choiceIndex < static_cast<int>(choices->size())) {
+                                                    const auto& choice = (*choices)[static_cast<std::size_t>(choiceIndex)];
+                                                    if (siteIcons->contains(choice.pageUrl)) {
+                                                        scope->setItemIcon(index, siteIcons->value(choice.pageUrl));
+                                                        const auto nodes = sourceTree->findItems(QStringLiteral("*"),
+                                                            Qt::MatchWildcard | Qt::MatchRecursive, 0);
+                                                        for (auto* node : nodes)
+                                                            if (node->data(0, Qt::UserRole).isValid() &&
+                                                                node->data(0, Qt::UserRole).toInt() == choiceIndex)
+                                                                node->setIcon(0, siteIcons->value(choice.pageUrl));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (auto next = weakPump.lock()) (*next)();
+                        });
+                    }
+                };
+                (*pump)();
+            });
+        } else {
+            devToolsState->setText(trText("Automatic UIA discovery is active (DevTools optional)",
+                "Автоматическое обнаружение UIA включено (DevTools необязателен)"));
+        }
+        auto sites = std::make_shared<std::vector<UiSearchTarget>>();
+        auto browserHandles = std::make_shared<QSet<quintptr>>();
+        auto* worker = QThread::create([browsers, sites, browserHandles] {
+            // Enumerate all open top-level application windows, not just a
+            // hard-coded list of executable names. Unknown applications need
+            // both a browser-like address bar and selectable UIA TabItems.
+            for (const auto& window : browsers) {
+                const auto tabs = clicknova::accessibility::listBrowserTabs(window);
+                if (!tabs.empty()) browserHandles->insert(window.handle);
+                for (const auto& tab : tabs) {
+                    UiSearchTarget candidate{window, tab.title, true};
+                    if (tab.active && !tab.activeUrl.empty())
+                        candidate.pageUrl = QString::fromStdWString(tab.activeUrl);
+                    sites->push_back(std::move(candidate));
+                }
+            }
+        });
+        connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+        connect(worker, &QThread::finished, &dialog, [=] {
+            if (*generation != version) return;
+            *tabLoading = false;
+            *browserTabs = std::move(*sites);
+            *detectedBrowserWindows = std::move(*browserHandles);
+            refreshSources->setEnabled(true);
+            if (scope->isEnabled()) populateSources();
+            requestExtensionIcons(); // active UIA tab may have a first-party favicon
+        });
+        worker->start();
+    };
+    connect(refreshSources, &QPushButton::clicked, &dialog, [=] {
+        *extensionPages = extensionBridge->pages();
+        extensionStatus->setText(trText("Paired browser tabs: %1", "Вкладок расширений: %1")
+            .arg(extensionPages->size()));
+        loadSources();
+        requestExtensionIcons();
+    });
+    extensionBridge->onPagesChanged([=] {
+        *extensionPages = extensionBridge->pages();
+        extensionStatus->setText(trText("Paired browser tabs: %1", "Вкладок расширений: %1")
+            .arg(extensionPages->size()));
+        if (scope->isEnabled()) populateSources();
+        requestExtensionIcons();
+    });
+    connect(devToolsEnabled, &QCheckBox::toggled, &dialog, [=](bool enabled) {
+        devToolsPort->setEnabled(enabled);
+        loadSources();
+    });
+    connect(devToolsPort, QOverload<int>::of(&QSpinBox::valueChanged), &dialog,
+        [=](int) { if (devToolsEnabled->isChecked()) loadSources(); });
+    connect(fetchFavicons, &QCheckBox::toggled, &dialog,
+        [=](bool enabled) {
+            if (!enabled) siteIcons->clear();
+            else {
+                attemptedExtensionIcons->clear();
+                requestExtensionIcons();
+            }
+            if (devToolsEnabled->isChecked()) loadSources();
+            else if (scope->isEnabled()) populateSources();
+        });
+    connect(scope, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [=, this](int) {
+        const int index = scope->currentData().toInt();
+        lastResults->elements.clear();
+        *lastTarget = std::nullopt;
+        results->setRowCount(0);
+        bind->setEnabled(false);
+        if (index < 0 || index >= static_cast<int>(choices->size())) return;
+        const auto& choice = (*choices)[static_cast<std::size_t>(index)];
+        find->setEnabled(!choice.devToolsOnly);
+        if (choice.devToolsOnly) {
+            target->setText(trText("Website: %1", "Сайт: %1").arg(choice.pageUrl));
+            state->setText(trText("This website is available as browser metadata only. UIA search/binding requires a uniquely matched Windows tab.",
+                "Этот сайт доступен в списке браузера. Для поиска и привязки UIA требуется однозначно определённая вкладка Windows."));
+            return;
+        }
+        target->setText(trText("Target: %1 · %2", "Цель: %1 · %2").arg(
+            QString::fromStdWString(choice.window.title),
+            choice.tab.empty() ? QString::fromStdWString(choice.window.process) :
+                QString::fromStdWString(choice.tab)));
+        state->setText(trText("Press Search to inspect the selected target (no actions are performed).",
+            "Нажмите «Поиск», чтобы просмотреть элементы выбранной цели."));
+    });
+    // Selecting a real target updates the existing binding/search machinery.
+    // User selection changes the target; a separate button or double click
+    // requests an inspection. Metadata-only pages never acquire a guessed HWND.
+    connect(sourceTree, &QTreeWidget::currentItemChanged, &dialog,
+            [=](QTreeWidgetItem* current, QTreeWidgetItem*) {
+        if (!current || !current->data(0, Qt::UserRole).isValid()) return;
+        const int choiceIndex = current->data(0, Qt::UserRole).toInt();
+        if (choiceIndex < 0 || choiceIndex >= static_cast<int>(choices->size())) return;
+        const int comboIndex = scope->findData(choiceIndex);
+        if (comboIndex < 0) return;
+        scope->setCurrentIndex(comboIndex);
+    });
+    connect(targetFilter, &QLineEdit::textChanged, &dialog, [=](const QString& value) {
+        const QString needle = value.trimmed();
+        std::function<bool(QTreeWidgetItem*, bool)> apply =
+            [&](QTreeWidgetItem* item, bool parentMatch) {
+                const bool selfMatch = !needle.isEmpty() &&
+                    item->text(0).contains(needle, Qt::CaseInsensitive);
+                bool childVisible = false;
+                for (int i = 0; i < item->childCount(); ++i)
+                    childVisible = apply(item->child(i), parentMatch || selfMatch) || childVisible;
+                const bool visible = needle.isEmpty() || parentMatch || selfMatch || childVisible;
+                item->setHidden(!visible);
+                if (childVisible) item->setExpanded(true);
+                return visible;
+            };
+        for (int i = 0; i < sourceTree->topLevelItemCount(); ++i)
+            apply(sourceTree->topLevelItem(i), false);
+    });
+    connect(sourceTree, &QTreeWidget::itemDoubleClicked, &dialog,
+            [=](QTreeWidgetItem* item, int) {
+        if (!item || !item->data(0, Qt::UserRole).isValid() || !find->isEnabled()) return;
+        // A second click explicitly requests a scan; avoid entering a game or
+        // switching tabs simply by expanding the target hierarchy.
+        find->click();
+    });
+    loadSources();
+    auto* extensionRefreshTimer = new QTimer(&dialog);
+    extensionRefreshTimer->setInterval(12000);
+    connect(extensionRefreshTimer, &QTimer::timeout, &dialog, [=] {
+        const auto live = extensionBridge->pages();
+        if (live.size() != extensionPages->size()) {
+            *extensionPages = live;
+            extensionStatus->setText(trText("Paired browser tabs: %1", "Вкладок расширений: %1")
+                .arg(extensionPages->size()));
+            if (scope->isEnabled()) populateSources();
+        }
+        // Continue bounded favicon batches for browsers with many open tabs.
+        requestExtensionIcons();
+    });
+    extensionRefreshTimer->start();
+    // Keep discovering browsers opened after this dialog was shown. Do not
+    // discard an in-progress search or currently displayed UIA results.
+    auto* autoUiATimer = new QTimer(&dialog);
+    autoUiATimer->setInterval(30000);
+    connect(autoUiATimer, &QTimer::timeout, &dialog, [=] {
+        if (!*tabLoading && scope->isEnabled() && lastResults->elements.empty())
+            loadSources();
+    });
+    autoUiATimer->start();
+    auto refreshBinding = [=] {
+        using namespace clicknova::accessibility;
+        const auto kind = static_cast<ElementCommand>(taskKind->currentIndex());
+        const int index = results->currentRow();
+        const auto op = static_cast<Operation>(operation->currentData().toInt());
+        const bool takesValue = kind == ElementCommand::SetText ||
+            (kind == ElementCommand::Activate &&
+             (op == Operation::SetValue || op == Operation::SetRangeValue));
+        actionValue->setVisible(takesValue);
+        operation->setVisible(kind == ElementCommand::Activate);
+        scrollAxis->setVisible(kind == ElementCommand::Scroll);
+        scrollAmount->setVisible(kind == ElementCommand::Scroll);
+        timeout->setVisible(kind == ElementCommand::WaitVisible);
+        polling->setVisible(kind == ElementCommand::WaitVisible);
+        doubleInterval->setVisible(kind == ElementCommand::DoubleActivate);
+        const bool canModify = selectedActionRows().size() == 1 && (
+            std::holds_alternative<ElementTask>(actions_[static_cast<std::size_t>(selectedActionRows().front())]) ||
+            (std::get_if<Click>(&actions_[static_cast<std::size_t>(selectedActionRows().front())]) &&
+             std::get<Click>(actions_[static_cast<std::size_t>(selectedActionRows().front())]).button == Button::Left &&
+             std::get<Click>(actions_[static_cast<std::size_t>(selectedActionRows().front())]).count == 1));
+        const bool chosen = *lastTarget && index >= 0 &&
+            static_cast<std::size_t>(index) < lastResults->elements.size();
+        bool valid = false;
+        if (chosen && canModify) {
+            const auto& e = lastResults->elements[static_cast<std::size_t>(index)];
+            const bool hasSelector = !e.name.empty() || !e.automationId.empty();
+            bool supported = false;
+            switch (kind) {
+            case ElementCommand::Activate:
+                supported = supportsProvider(op, e.role, e.provider) &&
+                    validValue(op, takesValue ? actionValue->text().toUtf8().toStdString() : std::string{});
+                break;
+            case ElementCommand::DoubleActivate:
+                supported = e.provider < Provider::Visual ||
+                    supportsProvider(Operation::Invoke, e.role, e.provider);
+                break;
+            case ElementCommand::SetText:
+                supported = (e.provider >= Provider::Visual ||
+                    supportsProvider(Operation::SetValue, e.role, e.provider)) &&
+                    !actionValue->text().isEmpty() && actionValue->text().size() <= 2048;
+                break;
+            case ElementCommand::Scroll:
+                supported = supportsProvider(Operation::Scroll, e.role, e.provider) &&
+                    scrollAmount->value() != 0;
+                break;
+            case ElementCommand::WaitVisible:
+            case ElementCommand::AssertVisible:
+                supported = true;
+                break;
+            }
+            valid = hasSelector && supported &&
+                (e.enabled || kind == ElementCommand::WaitVisible || kind == ElementCommand::AssertVisible);
+        }
+        bind->setEnabled(valid);
+    };
+    connect(results, &QTableWidget::itemSelectionChanged, &dialog, [=] {
+        const int row = results->currentRow();
+        if (row >= 0 && static_cast<std::size_t>(row) < lastResults->elements.size()) {
+            using clicknova::accessibility::Role;
+            using clicknova::accessibility::Operation;
+            const auto& selectedElement = lastResults->elements[static_cast<std::size_t>(row)];
+            const Role selectedRole = selectedElement.role;
+            const auto from = selectedElement.provider;
+            auto supported = [=](Operation op) {
+                return clicknova::accessibility::supportsProvider(op, selectedRole, from);
+            };
+            Operation suggested = Operation::Focus;
+            if (supported(Operation::Invoke)) suggested = Operation::Invoke;
+            else if (selectedRole == Role::Edit && supported(Operation::SetValue)) suggested = Operation::SetValue;
+            else if (selectedRole == Role::CheckBox && supported(Operation::Check)) suggested = Operation::Check;
+            else if (supported(Operation::Select)) suggested = Operation::Select;
+            else if (supported(Operation::Expand)) suggested = Operation::Expand;
+            else if (supported(Operation::SetRangeValue)) suggested = Operation::SetRangeValue;
+            operation->setCurrentIndex(static_cast<int>(suggested));
+        }
+        refreshBinding();
+    });
+    connect(operation, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog,
+            [=](int) { refreshBinding(); });
+    connect(taskKind, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog,
+            [=](int) { refreshBinding(); });
+    connect(scrollAmount, QOverload<int>::of(&QSpinBox::valueChanged), &dialog,
+            [=](int) { refreshBinding(); });
+    connect(actionValue, &QLineEdit::textChanged, &dialog,
+            [=](const QString&) { refreshBinding(); });
+    refreshBinding();
+    // QDialog is a non-copyable QWidget. Capture the stack-owned dialog by
+    // reference (the connection context disconnects when it is destroyed).
+    connect(bind, &QPushButton::clicked, &dialog, [=, this, &dialog] {
+        const int index = results->currentRow();
+        if (index < 0 || static_cast<std::size_t>(index) >= lastResults->elements.size() ||
+            isRunning() || selectedActionRows().size() != 1) return;
+        if (!*lastTarget) return; // A completed search fixes the window identity.
+        const auto currentRow = static_cast<std::size_t>(selectedActionRows().front());
+        auto selectedWindow = (*lastTarget)->window;
+        // The browser title may have changed when its tab was selected.
+        // Preserve its latest visible title, not the old tab's window title.
+        for (const auto& live : clicknova::platform::listWindows()) {
+            if (live.handle == selectedWindow.handle && live.processId == selectedWindow.processId) {
+                selectedWindow = live;
+                break;
+            }
+        }
+        const auto* click = std::get_if<Click>(&actions_[currentRow]);
+        if (!std::holds_alternative<ElementTask>(actions_[currentRow]) &&
+            (!click || click->button != Button::Left || click->count != 1)) return;
+        const auto& item = lastResults->elements[static_cast<std::size_t>(index)];
+        const auto kind = static_cast<ElementCommand>(taskKind->currentIndex());
+        using clicknova::accessibility::Operation;
+        Operation op = Operation::Invoke;
+        if (kind == ElementCommand::Activate)
+            op = static_cast<Operation>(operation->currentData().toInt());
+        if (kind == ElementCommand::SetText)
+            op = item.provider >= clicknova::accessibility::Provider::Visual ?
+                Operation::Invoke : Operation::SetValue;
+        if (kind == ElementCommand::Scroll) op = Operation::Scroll;
+        const std::string parameter = (kind == ElementCommand::Activate &&
+            (op == Operation::SetValue || op == Operation::SetRangeValue)) ?
+            actionValue->text().toUtf8().toStdString() : std::string{};
+        if ((item.name.empty() && item.automationId.empty()) ||
+            (kind != ElementCommand::WaitVisible && kind != ElementCommand::AssertVisible &&
+             !clicknova::accessibility::supportsProvider(op, item.role, item.provider))) return;
+        ElementTask command;
+        command.command = kind;
+        if (kind == ElementCommand::SetText) command.text = actionValue->text().toStdU16String();
+        command.axis = static_cast<Axis>(scrollAxis->currentIndex());
+        command.delta = scrollAmount->value();
+        command.timeoutMs = timeout->value();
+        command.pollMs = polling->value();
+        command.doubleIntervalMs = doubleInterval->value();
+        std::wstring portableSelector = item.automationId;
+        if (item.provider == clicknova::accessibility::Provider::Visual) {
+            // A scenario must remain usable after moving the portable folder.
+            // Capture the user-selected template into data/templates by its
+            // SHA-256 and store only a relative, validated asset token.
+            std::wstring chosenPath;
+            int confidence = 0, radiusPercent = 0;
+            if (!clicknova::accessibility::visual::parseSelector(item.provider,
+                    item.automationId, chosenPath, confidence, radiusPercent)) return;
+            QFile templateFile(QString::fromStdWString(chosenPath));
+            if (!templateFile.open(QIODevice::ReadOnly) || templateFile.size() < 64 ||
+                templateFile.size() > 8 * 1024 * 1024) {
+                QMessageBox::warning(&dialog, QStringLiteral("ClickNova"),
+                    QStringLiteral("Образец изображения недоступен или слишком велик."));
+                return;
+            }
+            const QByteArray bytes = templateFile.readAll();
+            if (bytes.size() != templateFile.size()) return;
+            const QString extension = QFileInfo(templateFile.fileName()).suffix().toLower();
+            if (!QStringList{QStringLiteral("png"), QStringLiteral("jpg"),
+                    QStringLiteral("jpeg"), QStringLiteral("bmp")}.contains(extension)) return;
+            const QString sha = QString::fromLatin1(
+                QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+            const QString directory = clicknova::portable::filePath(QStringLiteral("templates"));
+            if (QFileInfo(directory).isSymLink() || !QDir().mkpath(directory)) {
+                QMessageBox::warning(&dialog, QStringLiteral("ClickNova"),
+                    QStringLiteral("Не удалось создать безопасную папку образцов."));
+                return;
+            }
+            const QString assetName = sha + QLatin1Char('.') + extension;
+            const QString storedPath = QDir(directory).filePath(assetName);
+            if (QFileInfo(storedPath).isSymLink()) return;
+            if (!QFileInfo::exists(storedPath) && !QFile::copy(templateFile.fileName(), storedPath)) {
+                QMessageBox::warning(&dialog, QStringLiteral("ClickNova"),
+                    QStringLiteral("Не удалось скопировать образец в переносимую папку."));
+                return;
+            }
+            QFile saved(storedPath);
+            if (!saved.open(QIODevice::ReadOnly) ||
+                QCryptographicHash::hash(saved.readAll(), QCryptographicHash::Sha256).toHex() != sha.toLatin1()) {
+                QMessageBox::warning(&dialog, QStringLiteral("ClickNova"),
+                    QStringLiteral("Сохранённый образец повреждён или изменён. Привязка отменена."));
+                return;
+            }
+            portableSelector = clicknova::accessibility::visual::makeSelector(item.provider,
+                (QStringLiteral("asset:") + assetName).toStdWString(), confidence, radiusPercent);
+            if (portableSelector.empty()) return;
+        }
+        checkpointActions();
+        auto& binding = stepWindows_[currentRow];
+        binding.title = QString::fromStdWString(selectedWindow.title).toUtf8().toStdString();
+        binding.process = QString::fromStdWString(selectedWindow.process).toUtf8().toStdString();
+        binding.enforce = true;
+        binding.activate = true; // Explicit binding opts into focusing its selected window.
+        binding.elementName = QString::fromStdWString(item.name).toUtf8().toStdString();
+        binding.elementAutomationId = QString::fromStdWString(portableSelector).toUtf8().toStdString();
+        // Chromium frequently exposes Tailwind/CSS utility class lists as
+        // UIA ClassName. They change with loading/hover/theme and are not a
+        // persistent selector. Prefer exact Name + Role (+ AutomationId).
+        const bool browserPage = (*lastTarget)->browser && !(*lastTarget)->tab.empty() &&
+            item.provider == clicknova::accessibility::Provider::Uia;
+        const bool cssClass = item.className.size() > 100 ||
+            item.className.find(L' ') != std::wstring::npos ||
+            item.className.find(L':') != std::wstring::npos;
+        binding.elementClass = browserPage && cssClass ? std::string{} :
+            QString::fromStdWString(item.className).toUtf8().toStdString();
+        binding.elementRole = static_cast<int>(item.role);
+        binding.elementProvider = static_cast<int>(item.provider);
+        binding.elementBrowser = (*lastTarget)->browser && item.provider == clicknova::accessibility::Provider::Uia;
+        binding.elementTab = binding.elementBrowser ?
+            QString::fromStdWString((*lastTarget)->tab).toUtf8().toStdString() : std::string{};
+        binding.elementOperation = static_cast<int>(op);
+        binding.elementValue = parameter;
+        actions_[currentRow] = command;
+        refreshTable(static_cast<int>(currentRow));
+        scheduleAutosave();
+        reportStatus(trText("Accessibility action bound to step: ", "Действие элемента привязано к шагу: ") +
+            QString::fromStdWString(item.automationId.empty() ? item.name : item.automationId));
+        dialog.accept();
+    });
+
+    connect(find, &QPushButton::clicked, &dialog, [=, &dialog, ru = russian_] {
+        const int selected = scope->currentData().toInt();
+        if (selected < 0 || selected >= static_cast<int>(choices->size())) {
+            state->setText(ru ? QString::fromUtf8("Выберите приложение или вкладку.") :
+                QStringLiteral("Choose an application or tab."));
+            return;
+        }
+        const UiSearchTarget selectedTarget = (*choices)[static_cast<std::size_t>(selected)];
+        if (selectedTarget.devToolsOnly) return; // No native window identity: never guess.
+        clicknova::accessibility::Query parameters;
+        parameters.text = query->text().toStdWString();
+        parameters.role = static_cast<clicknova::accessibility::Role>(role->currentData().toInt());
+        parameters.browserOnly = selectedTarget.browser;
+        // Large webpages routinely have far more than 80 accessible elements.
+        // The backend bounds results and rejects invalid/oversized requests.
+        parameters.limit = 400;
+        parameters.browserTab = selectedTarget.tab;
+        parameters.includeAnonymous = showTechnical->isChecked();
+        parameters.visualTemplate = useImage->isChecked() ? templateFile->text().toStdWString() : L"";
+        parameters.visualOcr = useOcr->isChecked();
+        parameters.imageConfidence = imageScore->value();
+        parameters.ocrConfidence = ocrScore->value();
+        parameters.visualRadius = searchRadius->value();
+        if (useImage->isChecked() && parameters.visualTemplate.empty()) {
+            state->setText(ru ? QString::fromUtf8("Сначала выберите образец изображения.") :
+                QStringLiteral("Choose an image template first."));
+            return;
+        }
+        if (!clicknova::accessibility::validQuery(parameters) ||
+            (!parameters.visualTemplate.empty() &&
+             !clicknova::accessibility::visual::validTemplatePath(parameters.visualTemplate))) {
+            state->setText(ru ? QString::fromUtf8("Слишком длинный запрос.") :
+                                 QStringLiteral("Invalid search query."));
+            return;
+        }
+        find->setEnabled(false);
+        refreshSources->setEnabled(false);
+        scope->setEnabled(false);
+        sourceTree->setEnabled(false);
+        *lastTarget = std::nullopt;
+        *lastResults = {};
+        bind->setEnabled(false);
+        results->setRowCount(0);
+        const bool visualScan = !parameters.visualTemplate.empty() || parameters.visualOcr;
+        state->setText(ru ? QString::fromUtf8("Поиск элементов…") : QStringLiteral("Searching elements…"));
+        // Temporarily put the game in front and make the selector transparent
+        // so the desktop screenshot cannot include ClickNova's dialog.
+        // A failed focus request must NEVER capture some unrelated window.
+        if (visualScan) {
+            dialog.setWindowOpacity(0.0);
+            if (!clicknova::platform::activateWindow(selectedTarget.window)) {
+                dialog.setWindowOpacity(1.0);
+                state->setText(ru ? QString::fromUtf8("Не удалось активировать окно игры.") :
+                    QStringLiteral("Could not focus the selected game window."));
+                find->setEnabled(true);
+                scope->setEnabled(true);
+                sourceTree->setEnabled(true);
+                refreshSources->setEnabled(true);
+                return;
+            }
+        }
+        auto outcome = std::make_shared<clicknova::accessibility::Result>();
+        auto* thread = QThread::create([outcome, selectedTarget, parameters] {
+            if (!selectedTarget.tab.empty() &&
+                !clicknova::accessibility::selectBrowserTab(selectedTarget.window, selectedTarget.tab)) {
+                outcome->error = "The browser did not allow selecting this tab via UI Automation.";
+                return;
+            }
+            *outcome = clicknova::accessibility::search(selectedTarget.window, parameters);
+        });
+        connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+        connect(thread, &QThread::finished, &dialog, [=, &dialog] {
+            if (visualScan) {
+                dialog.setWindowOpacity(1.0);
+                dialog.raise();
+                dialog.activateWindow();
+            }
+            find->setEnabled(true);
+            scope->setEnabled(true);
+            sourceTree->setEnabled(true);
+            if (!*tabLoading) refreshSources->setEnabled(true);
+            if (!outcome->error.empty()) {
+                const QString error = QString::fromStdString(outcome->error);
+                state->setText(ru ?
+                    (error.contains(QStringLiteral("tab"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("Браузер не позволил выбрать эту вкладку через UIA. Откройте её вручную и повторите поиск.") :
+                     error.contains(QStringLiteral("browser"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("Выберите окно поддерживаемого браузера.") :
+                     error.contains(QStringLiteral("unavailable"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("UI Automation недоступна для выбранного окна.") :
+                     error.contains(QStringLiteral("template"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("Ошибка образца изображения: ") + error :
+                     error.contains(QStringLiteral("Tesseract"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("Ошибка распознавания OCR: ") + error :
+                     error.contains(QStringLiteral("OpenCV"), Qt::CaseInsensitive) ?
+                        QString::fromUtf8("Ошибка OpenCV: ") + error :
+                        QString::fromUtf8("Не удалось получить элементы: ") + error) : error);
+                return;
+            }
+            *lastResults = *outcome;
+            *lastTarget = selectedTarget;
+            results->setRowCount(static_cast<int>(outcome->elements.size()));
+            for (std::size_t i = 0; i < outcome->elements.size(); ++i) {
+                const auto& item = outcome->elements[i];
+                const QString name = QString::fromStdWString(item.name);
+                const QString automationId = QString::fromStdWString(item.automationId);
+                const QString className = QString::fromStdWString(item.className);
+                const int index = static_cast<int>(item.role);
+                // Role::Any means an unclassified actual type, NOT the user's
+                // "All" search filter. Ask UIA for its real localized type.
+                const QString typeName = index > 0 && index < 13 ?
+                    QString::fromUtf8(ru ? russian[index] : english[index]) :
+                    (!item.localizedRole.empty() ? QString::fromStdWString(item.localizedRole) :
+                        (ru ? QString::fromUtf8("Не указан") : QStringLiteral("Unspecified")));
+                const QString providerLabel = QString::fromLatin1(clicknova::accessibility::providerName(item.provider));
+                const std::array<QString, 5> columns = {
+                    name.isEmpty() ? (ru ? QString::fromUtf8("(без имени)") : QStringLiteral("(unnamed)")) : name,
+                    automationId.isEmpty() ? QString::fromUtf8("—") : automationId,
+                    typeName + QStringLiteral(" · ") + providerLabel,
+                    className.isEmpty() ? QString::fromUtf8("—") : className,
+                    item.enabled ? (ru ? QString::fromUtf8("Да") : QStringLiteral("Yes")) :
+                                   (ru ? QString::fromUtf8("Нет") : QStringLiteral("No"))};
+                const QString explanation = ru ?
+                    QString::fromUtf8("Имя: %1\nAutomationId: %2\nТип: %3\nКласс: %4\nВключён: %5\nПустые значения не предоставлены приложением.") :
+                    QStringLiteral("Name: %1\nAutomationId: %2\nType: %3\nClass: %4\nEnabled: %5\nEmpty values are not provided by the application.");
+                const QString detail = explanation.arg(columns[0], columns[1], columns[2], columns[3], columns[4]);
+                for (int c = 0; c < 5; ++c) {
+                    auto* cell = new QTableWidgetItem(columns[c]);
+                    if (c == 0) {
+                        using clicknova::accessibility::Role;
+                        const clicknova::gui::Icon kind = item.role == Role::Button ||
+                            item.role == Role::MenuItem ? clicknova::gui::Icon::Click :
+                            item.role == Role::Edit ? clicknova::gui::Icon::Edit :
+                            item.role == Role::Text ? clicknova::gui::Icon::Text :
+                            item.role == Role::CheckBox || item.role == Role::RadioButton ?
+                                clicknova::gui::Icon::Check : clicknova::gui::Icon::Target;
+                        cell->setIcon(clicknova::gui::icon(kind));
+                    }
+                    cell->setToolTip(detail);
+                    if ((c == 0 && name.isEmpty()) || (c == 1 && automationId.isEmpty()) ||
+                        (c == 3 && className.isEmpty()))
+                        cell->setForeground(QColor(QStringLiteral("#98a9bd")));
+                    results->setItem(static_cast<int>(i), c, cell);
+                }
+            }
+            state->setText(ru ? QString::fromUtf8("Показано: %1%2. Безымянные технические контейнеры %3.")
+                    .arg(static_cast<qulonglong>(outcome->elements.size()))
+                    .arg(outcome->truncated ? QString::fromUtf8(" (лимит %1)").arg(static_cast<qulonglong>(parameters.limit)) : QString())
+                    .arg(parameters.includeAnonymous ? QString::fromUtf8("включены") : QString::fromUtf8("скрыты")) :
+                QStringLiteral("Shown: %1%2. Unnamed technical containers are %3.")
+                    .arg(static_cast<qulonglong>(outcome->elements.size()))
+                    .arg(outcome->truncated ? QStringLiteral(" (limit %1)").arg(static_cast<qulonglong>(parameters.limit)) : QString())
+                    .arg(parameters.includeAnonymous ? QStringLiteral("included") : QStringLiteral("hidden")));
+        });
+        if (visualScan) QTimer::singleShot(350, &dialog, [thread] { thread->start(); });
+        else thread->start();
+    });
+    dialog.exec();
+}
+
+void InputLabWidget::clearStepUiElement() {
+    if (isRunning() || selectedActionRows().size() != 1) return;
+    const auto row = static_cast<std::size_t>(selectedActionRows().front());
+    auto& binding = stepWindows_[row];
+    if (binding.elementName.empty() && binding.elementAutomationId.empty()) return;
+    checkpointActions();
+    binding.elementName.clear();
+    binding.elementAutomationId.clear();
+    binding.elementClass.clear();
+    binding.elementRole = 0;
+    binding.elementProvider = 0;
+    binding.elementBrowser = false;
+    binding.elementTab.clear();
+    binding.elementOperation = 0;
+    binding.elementValue.clear();
+    if (std::holds_alternative<ElementTask>(actions_[row]))
+        actions_[row] = clicknova::input::Wait{0};
+    refreshTable(static_cast<int>(row));
+    scheduleAutosave();
 }
 
 void InputLabWidget::clearStepWindow() {
@@ -1591,7 +3677,13 @@ void InputLabWidget::clearStepWindow() {
     const auto row = static_cast<std::size_t>(selectedActionRows().front());
     if (stepWindows_[row].title.empty()) return;
     checkpointActions();
+    const auto groupId = stepWindows_[row].manualGroupId;
+    const auto groupTitle = stepWindows_[row].manualGroupTitle;
     stepWindows_[row] = {};
+    stepWindows_[row].manualGroupId = groupId;
+    stepWindows_[row].manualGroupTitle = groupTitle;
+    if (std::holds_alternative<ElementTask>(actions_[row]))
+        actions_[row] = clicknova::input::Wait{0};
     refreshTable(static_cast<int>(row));
 }
 
@@ -1620,6 +3712,17 @@ void InputLabWidget::makeWindowBindingsInformational(bool selectedOnly) {
         binding.enforce = false;
         binding.activate = false;
         binding.waitMs = 0;
+        binding.elementName.clear();
+        binding.elementAutomationId.clear();
+        binding.elementClass.clear();
+        binding.elementRole = 0;
+    binding.elementProvider = 0;
+        binding.elementBrowser = false;
+        binding.elementTab.clear();
+        binding.elementOperation = 0;
+        binding.elementValue.clear();
+        if (std::holds_alternative<ElementTask>(actions_[static_cast<std::size_t>(row)]))
+            actions_[static_cast<std::size_t>(row)] = clicknova::input::Wait{0};
     }
     const auto selection = selectedActionRows();
     refreshTable(selection.empty() ? -1 : selection.front());
@@ -1635,15 +3738,58 @@ void InputLabWidget::editStepWindow() {
     if (binding.title.empty()) return;
     binding.enforce = stepEnforce_->isChecked();
     binding.activate = binding.enforce && stepActivate_->isChecked();
+    if (binding.enforce && !binding.activate &&
+        (!binding.elementAutomationId.empty() || !binding.elementName.empty()) &&
+        !clicknova::input::backgroundElementAction(binding)) {
+        reportStatus(trText("This element needs an active foreground window.",
+            "Для этого элемента требуется активное окно."));
+        refreshStepWindowEditor(static_cast<int>(row));
+        return;
+    }
     binding.waitMs = binding.enforce ? ms : 0;
+    if (!binding.enforce) {
+        binding.elementName.clear();
+        binding.elementAutomationId.clear();
+        binding.elementClass.clear();
+        binding.elementRole = 0;
+    binding.elementProvider = 0;
+        binding.elementBrowser = false;
+        binding.elementTab.clear();
+        binding.elementOperation = 0;
+        binding.elementValue.clear();
+    }
     if (stepWindows_[row] == binding) return;
     checkpointActions();
     stepWindows_[row] = std::move(binding);
+    if (!stepWindows_[row].enforce && std::holds_alternative<ElementTask>(actions_[row]))
+        actions_[row] = clicknova::input::Wait{0};
+    refreshTable(static_cast<int>(row));
     refreshStepWindowEditor(static_cast<int>(row));
     scheduleAutosave();
 }
 
 bool InputLabWidget::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == stepResizeGrip_ && event) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() == Qt::LeftButton) {
+                resizingSteps_ = true;
+                gripStartY_ = mouse->globalPosition().toPoint().y();
+                gripStartHeight_ = table_->height();
+                return true;
+            }
+        }
+        if (event->type() == QEvent::MouseMove && resizingSteps_) {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (!(mouse->buttons() & Qt::LeftButton)) { resizingSteps_ = false; return true; }
+            resizeStepList(gripStartHeight_ + mouse->globalPosition().toPoint().y() - gripStartY_ - table_->height());
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease && resizingSteps_) {
+            resizingSteps_ = false;
+            return true;
+        }
+    }
     if (table_ && event && event->type() == QEvent::ContextMenu) {
         const auto* context = static_cast<QContextMenuEvent*>(event);
         auto* header = table_->horizontalHeader();
@@ -1703,10 +3849,61 @@ void InputLabWidget::showActionMenu(int row, const QPoint& globalPos) {
     };
     const int selectionCount = static_cast<int>(selectedActionRows().size());
     const bool multiple = hasRow && selectionCount > 1;
+    if (hasRow && row < static_cast<int>(groupEndByStart_.size()) && groupEndByStart_[row] > row + 1) {
+        auto* selectGroup = item("Select entire consecutive group", "Выделить всю группу подряд",
+            clicknova::gui::Icon::SelectAll, "stepSelectConsecutiveGroup");
+        connect(selectGroup, &QAction::triggered, this, [this, row] {
+            std::vector<int> rows;
+            for (int child = row; child < groupEndByStart_[row]; ++child) rows.push_back(child);
+            // Clear transient filters and expand before selecting all real rows.
+            stepSearch_->clear();
+            stepFilter_->setCurrentIndex(0);
+            collapsedStepGroups_.remove(row);
+            applyStepVisibility();
+            refreshSelectedRows(rows);
+        });
+        menu->addSeparator();
+    }
+    if (hasRow) {
+        const int namedStart = row < static_cast<int>(manualStartByRow_.size()) ?
+            manualStartByRow_[row] : -1;
+        if (namedStart >= 0) {
+            auto* selectNamed = item("Select entire named group", "Выделить всю именованную группу",
+                clicknova::gui::Icon::SelectAll, "stepSelectManualGroup");
+            connect(selectNamed, &QAction::triggered, this, [this, namedStart] {
+                stepSearch_->clear(); stepFilter_->setCurrentIndex(0);
+                collapsedManualGroups_.remove(QString::fromStdString(stepWindows_[namedStart].manualGroupId));
+                std::vector<int> rows;
+                for (int child = namedStart; child < manualEndByStart_[namedStart]; ++child) {
+                    const int autoParent = groupStartByRow_[child];
+                    if (autoParent >= 0) collapsedStepGroups_.remove(autoParent);
+                    rows.push_back(child);
+                }
+                applyStepVisibility();
+                refreshSelectedRows(rows);
+            });
+        }
+        int groupFirst = -1, groupEnd = -1;
+        if (selectedManualGroup(groupFirst, groupEnd)) {
+            auto* rename = item("Rename group", "Переименовать группу",
+                clicknova::gui::Icon::Edit, "stepRenameManualGroup");
+            connect(rename, &QAction::triggered, this, [this] { renameManualGroup(); });
+            auto* ungroup = item("Ungroup", "Разгруппировать",
+                clicknova::gui::Icon::Close, "stepUngroupManualGroup");
+            connect(ungroup, &QAction::triggered, this, [this] { ungroupManualSteps(); });
+        }
+        auto* create = item("Group consecutive selected steps", "Сгруппировать выделенные шаги",
+            clicknova::gui::Icon::Folder, "stepCreateManualGroup");
+        const auto selected = selectedActionRows();
+        create->setEnabled(!selected.empty() &&
+            selected.back() - selected.front() + 1 == static_cast<int>(selected.size()));
+        connect(create, &QAction::triggered, this, [this] { createManualGroup(); });
+        menu->addSeparator();
+    }
     // Each operation is present only once: labels change with selection size.
     // Select All is useful only when at least one row is not selected.
     if (!actions_.empty() && selectionCount < static_cast<int>(actions_.size())) {
-        auto* selectAll = item("Select all", "Выделить всё", clicknova::gui::Icon::Copy,
+        auto* selectAll = item("Select all", "Выделить всё", clicknova::gui::Icon::SelectAll,
                                hasRow ? "multiSelectAll" : "listSelectAll",
                                QKeySequence(QKeySequence::SelectAll));
         connect(selectAll, &QAction::triggered, this, [this] { table_->selectAll(); });
@@ -1789,11 +3986,11 @@ void InputLabWidget::showActionMenu(int row, const QPoint& globalPos) {
                           "stepDown", QKeySequence(Qt::CTRL | Qt::Key_Down));
         down->setEnabled(row + 1 < static_cast<int>(actions_.size()));
         connect(down, &QAction::triggered, this, [this, row] { moveActionRow(row, row + 1); });
-        auto* first = item("Move to beginning", "В самое начало", clicknova::gui::Icon::Up,
+        auto* first = item("Move to beginning", "В самое начало", clicknova::gui::Icon::MoveTop,
                            "stepFirst");
         first->setEnabled(row > 0);
         connect(first, &QAction::triggered, this, [this, row] { moveActionRow(row, 0); });
-        auto* last = item("Move to end", "В самый конец", clicknova::gui::Icon::Down,
+        auto* last = item("Move to end", "В самый конец", clicknova::gui::Icon::MoveBottom,
                           "stepLast");
         last->setEnabled(row + 1 < static_cast<int>(actions_.size()));
         connect(last, &QAction::triggered, this, [this, row] {
@@ -1850,14 +4047,14 @@ void InputLabWidget::showActionMenu(int row, const QPoint& globalPos) {
         auto* copy = item("Copy", "Скопировать", clicknova::gui::Icon::Copy,
                           "stepCopy", QKeySequence(QKeySequence::Copy));
         connect(copy, &QAction::triggered, this, [this, row] { if (selectedActionRows().size() > 1) copySelectedRows(); else copyRow(row); });
-        auto* pasteBefore = item("Paste before", "Вставить перед", clicknova::gui::Icon::Copy,
+        auto* pasteBefore = item("Paste before", "Вставить перед", clicknova::gui::Icon::Paste,
                                  "stepPasteBefore", QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
         pasteBefore->setEnabled(actions_.size() < 512 && canPasteAction());
         connect(pasteBefore, &QAction::triggered, this, [this, row] { pasteActionAt(row); });
     }
     if (multiple) {
         auto* before = item("Paste before selection", "Вставить перед выделенными",
-            clicknova::gui::Icon::Copy, "stepPasteBefore", QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
+            clicknova::gui::Icon::Paste, "stepPasteBefore", QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
         before->setEnabled(actions_.size() < 512 && canPasteAction());
         const auto rows = selectedActionRows();
         const int first = *std::min_element(rows.begin(), rows.end());
@@ -1865,18 +4062,18 @@ void InputLabWidget::showActionMenu(int row, const QPoint& globalPos) {
     }
     auto* paste = item(!hasRow ? "Paste at end" : multiple ? "Paste after selection" : "Paste after",
                        !hasRow ? "Вставить в конец" : multiple ? "Вставить после выделенных" : "Вставить после",
-                       clicknova::gui::Icon::Copy, "stepPaste", QKeySequence(QKeySequence::Paste));
+                       clicknova::gui::Icon::Paste, "stepPaste", QKeySequence(QKeySequence::Paste));
     paste->setEnabled(actions_.size() < 512 && canPasteAction());
     const auto rows = selectedActionRows();
     const int at = !hasRow ? static_cast<int>(actions_.size()) :
         multiple ? *std::max_element(rows.begin(), rows.end()) + 1 : row + 1;
     connect(paste, &QAction::triggered, this, [this, at] { pasteActionAt(at); });
     menu->addSeparator();
-    auto* undo = item("Undo", "Отменить", clicknova::gui::Icon::Up,
+    auto* undo = item("Undo", "Отменить", clicknova::gui::Icon::Undo,
                       "listUndo", QKeySequence(QKeySequence::Undo));
     undo->setEnabled(actionHistory_.canUndo());
     connect(undo, &QAction::triggered, this, [this] { undoActionEdit(); });
-    auto* redo = item("Redo", "Повторить", clicknova::gui::Icon::Down,
+    auto* redo = item("Redo", "Повторить", clicknova::gui::Icon::Redo,
                       "listRedo", QKeySequence(Qt::CTRL | Qt::Key_Y));
     redo->setEnabled(actionHistory_.canRedo());
     connect(redo, &QAction::triggered, this, [this] { redoActionEdit(); });
@@ -1893,6 +4090,12 @@ void InputLabWidget::showActionMenu(int row, const QPoint& globalPos) {
 void InputLabWidget::reportStatus(const QString& message) {
     if (status_) status_->setText(message);
     if (statusSink_) statusSink_(message);
+}
+
+void InputLabWidget::reportActionChange(const QString& english, const QString& russian, int count) {
+    // Summaries only: neither typed text nor PowerShell step contents enter the
+    // shared activity log. The current step count makes undo/redo analysis easier.
+    reportStatus((russian_ ? russian : english).arg(count).arg(static_cast<qulonglong>(actions_.size())));
 }
 
 void InputLabWidget::refreshRecoveryAvailability() {
@@ -1915,6 +4118,20 @@ void InputLabWidget::updateButtons() {
     for (auto* button : {quickClick_, quickKey_, quickText_, quickWait_, quickWaitUntil_, quickCode_})
         button->setEnabled(idle && actions_.size() < 512);
     selectAll_->setEnabled(idle && !actions_.empty());
+    const int selectedRows = static_cast<int>(selectedActionRows().size());
+    const auto chosen = selectedActionRows();
+    const bool contiguous = !chosen.empty() && chosen.back() - chosen.front() + 1 == static_cast<int>(chosen.size());
+    createGroup_->setEnabled(idle && contiguous);
+    int groupFirst = -1, groupEnd = -1;
+    const bool hasGroup = selectedManualGroup(groupFirst, groupEnd);
+    renameGroup_->setEnabled(idle && hasGroup);
+    ungroupSteps_->setEnabled(idle && hasGroup);
+    duplicateStep_->setEnabled(idle && selectedRows > 0 && actions_.size() + selectedRows <= 512);
+    deleteStep_->setEnabled(idle && selectedRows > 0);
+    moveStepUp_->setEnabled(idle && selectedRows > 0);
+    moveStepDown_->setEnabled(idle && selectedRows > 0);
+    undoStep_->setEnabled(idle && actionHistory_.canUndo());
+    redoStep_->setEnabled(idle && actionHistory_.canRedo());
     table_->setDragEnabled(idle);
     table_->setAcceptDrops(idle);
     const int selectedCount = static_cast<int>(selectedActionRows().size());
@@ -2094,7 +4311,9 @@ void InputLabWidget::reviewCapturedRecording(std::vector<clicknova::recording::S
         checkpointActions();
         actions_ = std::move(updated);
         stepWindows_ = std::move(updatedWindows);
-        refreshTable(0);
+        // Importing actions is not a user row selection. Leave the table
+        // unselected until the user explicitly chooses a step to edit.
+        refreshTable(-1);
         reportStatus(trText("Imported recorded actions: ", "Записанные действия добавлены: ") +
                          QString::number(review.actions().size()));
         updateButtons();
@@ -2117,12 +4336,15 @@ void InputLabWidget::replaceActions(const clicknova::input::Plan& plan) {
         trText("Choose the required window before running", "Выберите необходимое окно перед запуском") :
         trText("Any foreground application", "Любое активное приложение"));
     actionHistory_.clear();
+    collapsedManualGroups_.clear();
+    collapsedStepGroups_.clear();
     actions_ = plan.actions;
     stepWindows_ = plan.stepWindows;
     normalizeStepWindows();
     repetitions_->setValue(plan.repetitions);
     passDelay_->setText(QString::number(plan.passDelayMs));
-    refreshTable(actions_.empty() ? -1 : 0);
+    // Loading a plan is not a user selection; never highlight row zero implicitly.
+    refreshTable(-1);
     reportStatus(trText("Imported actions. Autosave is enabled.",
                             "Действия перенесены. Автосохранение включено."));
 }
@@ -2205,12 +4427,40 @@ void InputLabWidget::beginPlayback() {
         reportStatus(trText("Cannot run: ", "Нельзя запустить: ") + QString::fromStdString(error));
         return;
     }
-    if (std::any_of(actions_.begin(), actions_.end(), [](const Action& a) {
-            return std::holds_alternative<RunScript>(a);
-        }) && QMessageBox::question(this, QStringLiteral("ClickNova"),
-            trText("This scenario contains LOCAL PowerShell code with your Windows user permissions. Run it now? Only run scripts you trust.",
-                   "Сценарий содержит ЛОКАЛЬНЫЙ код PowerShell с правами вашей учётной записи Windows. Выполнить? Запускайте только доверенный код."),
+    // A read-only preflight warns about accidental mass clicks, extremely long
+    // runs and local code. It never silently changes any user actions.
+    const auto safety = clicknova::input::preflight(plan);
+    if (safety.confirmationRecommended) {
+        QStringList warnings;
+        for (const auto& issue : safety.issues) {
+            QString text;
+            switch (issue.risk) {
+            case clicknova::input::PreflightRisk::UnboundForegroundInput:
+                text = trText("Input is not restricted to a target window.",
+                    "Ввод не ограничен выбранным окном."); break;
+            case clicknova::input::PreflightRisk::LocalScript:
+                text = trText("Local PowerShell code will run with your user permissions. Only run code you trust.",
+                    "Локальный PowerShell-код будет выполнен с правами вашей учётной записи. Запускайте только доверенный код."); break;
+            case clicknova::input::PreflightRisk::ManyClicks:
+                text = trText("High click count (%1 across all passes).",
+                    "Много кликов (%1 за все проходы).")
+                        .arg(QString::number(safety.estimatedClickCount)); break;
+            case clicknova::input::PreflightRisk::LongMinimumDuration:
+                text = trText("The scenario has at least %1 minutes of configured waits/delays.",
+                    "В сценарии минимум %1 минут ожиданий и задержек.")
+                        .arg(safety.minimumDurationMs / 60000); break;
+            case clicknova::input::PreflightRisk::ManualHeldInput:
+                text = trText("A key or mouse button is held between steps; a crash could leave it pressed.",
+                    "Клавиша или кнопка удерживается между шагами; аварийное завершение может оставить её нажатой."); break;
+            }
+            warnings.push_back(trText("Step %1: %2", "Шаг %1: %2")
+                .arg(static_cast<qulonglong>(issue.stepIndex + 1)).arg(text));
+        }
+        const QString prompt = trText("Check this scenario before running:\n\n%1\n\nContinue?",
+            "Проверьте сценарий перед запуском:\n\n%1\n\nПродолжить?").arg(warnings.join(QStringLiteral("\n")));
+        if (QMessageBox::warning(this, QStringLiteral("ClickNova"), prompt,
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+    }
     if (!targetWindow_ && requireWindowBinding_) {
         reportStatus(trText("This scenario requires a target window. Select it again before playback.",
                                 "Для этого сценария нужно окно. Выберите его заново перед запуском."));
@@ -2228,15 +4478,59 @@ void InputLabWidget::beginPlayback() {
                                 "Сначала выберите окно для шагов с координатами внутри окна."));
         return;
     }
-#ifndef _WIN32
-    reportStatus(trText("Input playback is currently available only on Windows.", "Воспроизведение ввода пока доступно только на Windows."));
+#if !defined(_WIN32) && !defined(CLICKNOVA_WITH_X11)
+    reportStatus(trText("Input playback requires Windows or Linux X11 with XTEST.",
+        "Для ввода нужна Windows либо Linux X11 с XTEST."));
     return;
+#else
+#ifdef CLICKNOVA_WITH_X11
+    if (!x11Stop_) x11Stop_ = std::make_unique<X11EmergencyStop>();
+    if (!x11Stop_->start([this] {
+            QMetaObject::invokeMethod(this, [this] { stopPlayback(); }, Qt::QueuedConnection);
+        })) {
+        reportStatus(trText("Cannot reserve global F12 on X11. Check the X11 session and shortcuts.",
+            "Не удалось зарезервировать F12 в X11. Проверьте сеанс и занятые сочетания."));
+        return;
+    }
+    { // Do not start unsupported UIA, PowerShell, or browser-element actions on X11.
+        std::size_t row = 0;
+        for (const auto& action : actions_) {
+            if (std::holds_alternative<RunScript>(action) || std::holds_alternative<ElementTask>(action) ||
+                (row < stepWindows_.size() &&
+                 (!stepWindows_[row].elementName.empty() ||
+                  !stepWindows_[row].elementAutomationId.empty() ||
+                  !stepWindows_[row].elementClass.empty() ||
+                  !stepWindows_[row].elementTab.empty() ||
+                  !stepWindows_[row].elementValue.empty() ||
+                  stepWindows_[row].elementBrowser || stepWindows_[row].elementProvider != 0 ||
+                  stepWindows_[row].elementRole != 0 || stepWindows_[row].elementOperation != 0))) {
+                x11Stop_->stop();
+                reportStatus(trText("Linux X11 does not support this scripted/accessibility action. Step %1.",
+                    "Шаг %1: сценарий/действие с элементом ещё не поддерживается в X11.")
+                    .arg(static_cast<qulonglong>(row + 1)));
+                return;
+            }
+            ++row;
+        }
+    }
 #else
     if (!stopHotkeyController_ || !stopHotkeyController_(true)) {
         reportStatus(trText("Cannot reserve the Stop shortcut. Choose a free Stop key in Settings.",
             "Не удалось зарегистрировать клавишу остановки. Выберите свободную клавишу в настройках."));
         return;
     }
+#endif
+#ifdef CLICKNOVA_WITH_X11
+    { // XTEST must be available before starting the three-second countdown.
+        X11InputBackend probe(x11Stop_->triggered(), targetWindow_);
+        if (!probe.ready()) {
+            x11Stop_->stop();
+            reportStatus(trText("XTEST input injection is unavailable. Install libXtst and use an X11 session.",
+                "XTEST недоступен. Установите libXtst и используйте сеанс X11."));
+            return;
+        }
+    }
+#endif
     if (autosaveTimer_->isActive()) writeAutosave();
     stopHotkeyActive_ = true;
     ++playbackGeneration_;
@@ -2249,7 +4543,12 @@ void InputLabWidget::beginPlayback() {
     upcomingPass_ = 1;
     nextStepTimer_->start();
     refreshNextStepTime();
-    const QString stopKey = stopHotkeyLabel_ ? stopHotkeyLabel_() : QStringLiteral("Stop");
+    const QString stopKey =
+#ifdef CLICKNOVA_WITH_X11
+        QStringLiteral("F12");
+#else
+        stopHotkeyLabel_ ? stopHotkeyLabel_() : QStringLiteral("Stop");
+#endif
     reportStatus(trText("Starting in 3 seconds. Switch to the target app. Press %1 to stop.",
                             "Старт через 3 секунды. Переключитесь в нужное приложение. Для остановки нажмите %1.").arg(stopKey));
     updateButtons();
@@ -2289,17 +4588,29 @@ void InputLabWidget::startPlayback() {
     const bool keepWindowsAwake = keepAwake_->isChecked();
     const auto generation = playbackGeneration_;
     worker_ = std::jthread([this, plan, transientTarget, keepWindowsAwake, generation](std::stop_token token) {
+#if defined(_WIN32) || defined(CLICKNOVA_WITH_X11)
 #ifdef _WIN32
         ScriptBackend backend(transientTarget);
         clicknova::platform::WindowsAwakeGuard awake(keepWindowsAwake);
+#else
+        (void)keepWindowsAwake;
+        X11InputBackend backend(x11Stop_->triggered(), transientTarget);
+#endif
         SteadyWaiter waiter;
-        const Result result = play(plan, backend, waiter, token,
-            [this, generation](const clicknova::input::PlaybackProgress& event) {
-                QMetaObject::invokeMethod(this, [this, generation, event] {
-                    if (generation == playbackGeneration_ && running_)
-                        onPlaybackProgress(event);
-                }, Qt::QueuedConnection);
-            });
+#ifdef _WIN32
+        const bool inputAvailable = true;
+#else
+        const bool inputAvailable = backend.ready();
+#endif
+        const Result result = inputAvailable
+            ? play(plan, backend, waiter, token,
+                [this, generation](const clicknova::input::PlaybackProgress& event) {
+                    QMetaObject::invokeMethod(this, [this, generation, event] {
+                        if (generation == playbackGeneration_ && running_)
+                            onPlaybackProgress(event);
+                    }, Qt::QueuedConnection);
+                })
+            : Result{Status::DispatchFailed, "X11 XTEST is unavailable"};
 #else
         const Result result{};
 #endif
@@ -2313,6 +4624,9 @@ void InputLabWidget::stopPlayback() {
         ++playbackGeneration_; // invalidate the old three-second singleShot
         clearNextStepTime();
         if (stopHotkeyActive_ && stopHotkeyController_) stopHotkeyController_(false);
+#ifdef CLICKNOVA_WITH_X11
+        if (x11Stop_) x11Stop_->stop();
+#endif
         stopHotkeyActive_ = false;
         window()->showNormal();
         reportStatus(trText("Cancelled before starting.", "Отменено до запуска."));
@@ -2333,6 +4647,9 @@ void InputLabWidget::finishPlayback(const Result& result) {
     window()->showNormal();
     window()->activateWindow();
     if (stopHotkeyActive_ && stopHotkeyController_) stopHotkeyController_(false);
+#ifdef CLICKNOVA_WITH_X11
+    if (x11Stop_) x11Stop_->stop();
+#endif
     stopHotkeyActive_ = false;
     QString outcome;
     switch (result.status) {
@@ -2355,6 +4672,10 @@ void InputLabWidget::finishPlayback(const Result& result) {
         result.message.find("PowerShell") != std::string::npos) {
         outcome = trText("PowerShell step failed", "Ошибка выполнения шага PowerShell");
     }
+    if (result.status == Status::DispatchFailed && result.failedStepIndex) {
+        outcome += trText(" · step %1, pass %2", " · шаг %1, проход %2")
+            .arg(static_cast<qulonglong>(*result.failedStepIndex + 1)).arg(result.failedPassNumber);
+    }
     reportStatus(QStringLiteral("%1 · %2: %3 · %4: %5")
         .arg(outcome, trText("Actions", "Действий"))
         .arg(result.actionsCompleted)
@@ -2365,8 +4686,7 @@ void InputLabWidget::finishPlayback(const Result& result) {
 
 namespace {
 QString autosavePath() {
-    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
-        QStringLiteral("/clicknova-steps-autosave.json");
+    return clicknova::portable::filePath(QStringLiteral("clicknova-steps-autosave.json"));
 }
 }
 
@@ -2426,13 +4746,16 @@ void InputLabWidget::restoreAutosave() {
     if (repetitions < 1) return;
     const auto delay = draft.value(QStringLiteral("passDelayInput")).toString();
     restoringDraft_ = true;
+    collapsedManualGroups_.clear();
+    collapsedStepGroups_.clear();
     actions_ = std::move(restored);
     stepWindows_ = std::move(restoredWindows);
     requireWindowBinding_ = draft.value(QStringLiteral("requireTargetWindow")).toBool();
     targetWindow_.reset(); // Never reuse stale HWND from a previous run.
     repetitions_->setValue(repetitions);
     passDelay_->setText(delay);
-    refreshTable(actions_.empty() ? -1 : 0);
+    // Opening an entire plan must not silently highlight its first action.
+    refreshTable(-1);
     actionHistory_.clear();
     restoringDraft_ = false;
     autosaveTimer_->stop();

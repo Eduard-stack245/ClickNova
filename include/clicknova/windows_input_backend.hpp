@@ -15,6 +15,7 @@ public:
     void setTarget(std::optional<clicknova::platform::WindowTarget> target) {
         target_ = std::move(target);
     }
+    const std::optional<clicknova::platform::WindowTarget>& selectedWindow() const { return target_; }
     bool dispatch(const Event& event) override;
     bool boundToWindow() const override { return target_.has_value(); }
     bool releaseOnCleanup(const Event& event) override;

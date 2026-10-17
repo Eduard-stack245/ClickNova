@@ -113,6 +113,14 @@ std::optional<WindowTarget> windowUnderCursor() {
     return identify(GetAncestor(hovered, GA_ROOT));
 }
 
+TargetCheck checkAccessibleTarget(const WindowTarget& window) {
+    const HWND hwnd = toHandle(window.handle);
+    if (!isSameWindow(window)) return TargetCheck::Missing;
+    if (!IsWindowVisible(hwnd)) return TargetCheck::Hidden;
+    if (IsIconic(hwnd)) return TargetCheck::Minimized;
+    return TargetCheck::Ready;
+}
+
 TargetCheck checkTarget(const WindowTarget& window) {
     HWND hwnd = toHandle(window.handle);
     return evaluateWindowTarget(TargetSnapshot{
@@ -161,7 +169,7 @@ TargetCheck resolveClientPoint(const WindowTarget& window, int clientX, int clie
 }
 
 } // namespace clicknova::platform
-#else
+#elif !defined(CLICKNOVA_WITH_X11)
 namespace clicknova::platform {
 std::vector<WindowTarget> listWindows() { return {}; }
 std::optional<WindowTarget> foregroundWindow() { return std::nullopt; }
@@ -169,6 +177,7 @@ std::optional<WindowTarget> findWindow(const std::wstring&, const std::wstring&)
 bool activateWindow(const WindowTarget&) { return false; }
 std::optional<WindowTarget> windowUnderCursor() { return std::nullopt; }
 TargetCheck checkTarget(const WindowTarget&) { return TargetCheck::Unsupported; }
+TargetCheck checkAccessibleTarget(const WindowTarget&) { return TargetCheck::Unsupported; }
 TargetCheck checkScreenPoint(const WindowTarget&, int, int) { return TargetCheck::Unsupported; }
 TargetCheck checkCapturePoint(const WindowTarget&, int, int) { return TargetCheck::Unsupported; }
 TargetCheck resolveClientPoint(const WindowTarget&, int, int, int&, int&) { return TargetCheck::Unsupported; }

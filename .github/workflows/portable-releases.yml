@@ -1,0 +1,150 @@
+name: ClickNova portable releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release tag matches the source version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -ne 'v0.6.0') { throw 'Release packaging scripts target v0.6.0 only; bump version first' }
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Qt 6.12
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          arch: 'win64_msvc2022_64'
+          cache: true
+      - name: Configure Windows GUI
+        shell: pwsh
+        run: |
+          cmake -S . -B build-release -G "Visual Studio 17 2022" -A x64 -T v143 -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" -DCLICKNOVA_BUILD_GUI=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+      - name: Compile
+        shell: pwsh
+        run: |
+          cmake --build build-release --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
+      - name: Deploy Qt without redistributing private MSVC DLLs
+        shell: pwsh
+        run: |
+          & (Join-Path $env:QT_ROOT_DIR 'bin/windeployqt.exe') --release --no-compiler-runtime 'build-release/Release/ClickNova.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'Qt deployment failed' }
+      - name: Windows unit and GUI smoke tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build-release -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Refusing to publish a release with failing tests' }
+          Set-Content -LiteralPath 'build-release/.clicknova-tests-passed' -Value 'CTest Release passed' -Encoding Ascii
+      - name: Create Windows portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & ./scripts/package-portable-windows.ps1 -BuildDirectory 'build-release' -OutputZip 'dist/ClickNova-0.6.0-Windows-x64-portable.zip'
+          if (-not (Test-Path 'dist/ClickNova-0.6.0-Windows-x64-portable.zip')) { throw 'ZIP not created' }
+          $sha = (Get-FileHash -LiteralPath 'dist/ClickNova-0.6.0-Windows-x64-portable.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'dist/ClickNova-0.6.0-Windows-x64-portable.sha256'), "$sha  ClickNova-0.6.0-Windows-x64-portable.zip`n")
+      - name: Test portable ZIP independently of source tree
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'ClickNova portable тест'
+          Expand-Archive -LiteralPath 'dist/ClickNova-0.6.0-Windows-x64-portable.zip' -DestinationPath $target
+          $exe = Join-Path $target 'ClickNova/ClickNova.exe'
+          if (-not (Test-Path $exe)) { throw 'Packaged executable missing' }
+          & $exe --smoke-test-ui
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged GUI smoke test failed' }
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: clicknova-portable-windows-x64
+          path: |
+            dist/ClickNova-0.6.0-Windows-x64-portable.zip
+            dist/ClickNova-0.6.0-Windows-x64-portable.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release tag matches the source version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "$GITHUB_REF_NAME" = v0.6.0
+      - name: Install Linux build and X11 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libgl1-mesa-dev libx11-dev libxtst-dev libxext-dev libxcb-cursor0 libxcb-xinerama0 libxcb-xinput0 libxcb-keysyms1 libxkbcommon-x11-0 libfontconfig1 libfuse2t64 xvfb xauth
+      - name: Install Qt 6.12
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          arch: 'gcc_64'
+          cache: true
+      - name: Configure Linux GUI
+        run: cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DCLICKNOVA_BUILD_GUI=ON
+      - name: Compile
+        run: cmake --build build-release --parallel 2
+      - name: Linux unit and GUI smoke tests
+        run: xvfb-run -a ctest --test-dir build-release --output-on-failure
+      - name: Download official AppImage packaging tools
+        run: |
+          mkdir -p tools dist
+          curl -fL --retry 3 -o tools/linuxdeploy-x86_64.AppImage 'https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage'
+          curl -fL --retry 3 -o tools/linuxdeploy-plugin-qt-x86_64.AppImage 'https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage'
+          chmod +x tools/*.AppImage
+      - name: Build self-contained Linux AppImage
+        env:
+          CLICKNOVA_LINUXDEPLOY: ${{ github.workspace }}/tools/linuxdeploy-x86_64.AppImage
+          CLICKNOVA_LINUXDEPLOY_QT: ${{ github.workspace }}/tools/linuxdeploy-plugin-qt-x86_64.AppImage
+        run: bash scripts/package-appimage-linux.sh build-release/ClickNova dist 0.6.0
+      - name: Test AppImage in X11 and verify checksum
+        run: |
+          test -s dist/ClickNova-0.6.0-Linux-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a dist/ClickNova-0.6.0-Linux-x86_64.AppImage --smoke-test-ui
+          python3 scripts/package-appimage-bundle-linux.py dist/ClickNova-0.6.0-Linux-x86_64.AppImage dist/ClickNova-0.6.0-Linux-x86_64-portable.zip
+          (cd dist && sha256sum ClickNova-0.6.0-Linux-x86_64.AppImage ClickNova-0.6.0-Linux-x86_64-portable.zip > ClickNova-0.6.0-Linux-x86_64.sha256)
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: clicknova-portable-linux-x86-64
+          path: |
+            dist/ClickNova-0.6.0-Linux-x86_64.AppImage
+            dist/ClickNova-0.6.0-Linux-x86_64-portable.zip
+            dist/ClickNova-0.6.0-Linux-x86_64.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-x64, linux-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: clicknova-portable-*
+          merge-multiple: true
+          path: dist
+      - name: Publish only after BOTH operating systems pass
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: true

@@ -1,0 +1,11 @@
+{
+  "manifest_version": 2,
+  "name": "ClickNova Tabs Bridge Firefox",
+  "version": "0.6.0",
+  "description": "With your consent, send tab names, URLs and favicons to ClickNova on your computer. No page contents or cookies.",
+  "permissions": ["tabs", "storage", "alarms", "http://127.0.0.1:48231/*"],
+  "background": {"scripts": ["background.js"], "persistent": true},
+  "browser_action": {"default_title": "ClickNova Tabs", "default_popup": "options.html"},
+  "options_ui": {"page": "options.html", "open_in_tab": false},
+  "browser_specific_settings": {"gecko": {"id": "tabs-bridge@clicknova.local", "strict_min_version": "109.0"}}
+}

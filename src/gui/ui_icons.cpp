@@ -56,6 +56,17 @@ QIcon icon(Icon kind, const QColor& color) {
     case Icon::Wait:
         circle(12,12,9); line(12,6,12,12); line(12,12,16,14);
         break;
+    case Icon::ClockUntil:
+        // Absolute clock time: small target mark distinguishes it from duration Wait.
+        circle(11,12,8); line(11,7,11,12); line(11,12,15,12);
+        painter.setBrush(color); circle(20,19,2.5);
+        break;
+    case Icon::Code:
+        // Source code glyph, never the same letter-T icon used for typing text.
+        path({{9,7},{4,12},{9,17}});
+        path({{15,7},{20,12},{15,17}});
+        line(13,5,11,19);
+        break;
     case Icon::More:
         for (int i=0; i<3; ++i) { painter.setBrush(color); circle(5+7*i,12,1.2); }
         break;
@@ -123,8 +134,55 @@ QIcon icon(Icon kind, const QColor& color) {
     case Icon::Mouse:
         rect(6,2,12,20,6); line(12,2,12,11); line(6,11,18,11); break;
     case Icon::Undo:
-        path({{10,5},{4,11},{10,16}}); line(4,11,15,11);
-        painter.drawArc(QRectF(10,8,11,12),-80*16,175*16);
+        // Left-curved history arrow: never reuse the Move Up pictogram.
+        path({{10,4},{4,9},{10,14}});
+        line(4,9,14,9);
+        painter.drawArc(QRectF(8,7,13,13), 225*16, 225*16);
+        break;
+    case Icon::Redo:
+        // Right-curved history arrow, deliberately distinct from Move Down.
+        path({{14,4},{20,9},{14,14}});
+        line(20,9,10,9);
+        painter.drawArc(QRectF(3,7,13,13), 90*16, 225*16);
+        break;
+    case Icon::MoveTop:
+        line(4,4,20,4);
+        line(12,20,12,8);
+        path({{6,14},{12,8},{18,14}});
+        break;
+    case Icon::MoveBottom:
+        line(4,20,20,20);
+        line(12,4,12,16);
+        path({{6,10},{12,16},{18,10}});
+        break;
+    case Icon::SelectAll:
+        // Dashed selection border and check mark.
+        painter.setPen(QPen(color, 1.7, Qt::DashLine, Qt::RoundCap));
+        rect(3,3,18,18,2);
+        painter.setPen(QPen(color, 1.9, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        path({{7,12},{10.5,15.5},{17,8}});
+        break;
+    case Icon::Paste:
+        rect(5,5,14,17,2);
+        rect(9,2,6,6,1);
+        line(8,12,16,12); line(8,16,14,16);
+        break;
+    case Icon::Profile:
+        // Account/profile glyph: clearly identifies the scenario drawer.
+        circle(12,8,4.0);
+        painter.drawArc(QRectF(3,13,18,11), 0, 180*16);
+        break;
+    case Icon::Brand:
+        // Scalable application mark; no external fonts or image files.
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#2774d9")));
+        rect(1,1,22,22,5);
+        painter.setPen(QPen(QColor(QStringLiteral("#ffffff")), 2.0,
+                             Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawArc(QRectF(5,5,14,14), 60*16, 240*16);
+        painter.setBrush(QColor(QStringLiteral("#ffffff")));
+        path({{13.5,8},{19.5,12},{13.5,16}}, true);
         break;
     }
     painter.end();

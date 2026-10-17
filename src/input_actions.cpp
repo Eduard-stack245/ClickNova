@@ -2,6 +2,8 @@
 #include "clicknova/input_actions.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <chrono>
 #include <ctime>
 #include <condition_variable>
@@ -100,6 +102,16 @@ std::int64_t millisecondsUntil(const WaitUntil& target,
     return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
 }
 
+bool backgroundElementAction(const StepWindow& step) noexcept {
+    return step.enforce && !step.title.empty() && !step.activate &&
+        (!step.elementAutomationId.empty() || !step.elementName.empty()) &&
+        step.elementProvider >= 0 && step.elementProvider <= 2 &&
+        step.elementOperation != 8 && // Focus changes foreground keyboard focus.
+        (step.elementOperation != 10 || step.elementProvider == 0) && // Pointer wheel is foreground-only.
+        !step.elementBrowser && // Browser-tab actions may change the visible page.
+        step.elementTab.empty();     // Tab selection changes active browser tab.
+}
+
 std::string validate(const Plan& plan) {
     if (plan.actions.empty()) return "Add at least one input action.";
     if (plan.actions.size() > kMaxActions) return "Too many input actions (maximum 512).";
@@ -110,7 +122,82 @@ std::string validate(const Plan& plan) {
 
     if (!plan.stepWindows.empty() && plan.stepWindows.size() != plan.actions.size())
         return "Window binding count does not match actions.";
-    for (const auto& binding : plan.stepWindows) {
+    for (std::size_t i = 0; i < plan.stepWindows.size(); ++i) {
+        const auto& binding = plan.stepWindows[i];
+        const bool hasSelector = !binding.elementName.empty() || !binding.elementAutomationId.empty();
+        const int op = binding.elementOperation;
+        const int role = binding.elementRole;
+        const int provider = binding.elementProvider;
+        const auto* elementTask = std::get_if<ElementTask>(&plan.actions[i]);
+        const bool observational = elementTask &&
+            (elementTask->command == ElementCommand::WaitVisible ||
+             elementTask->command == ElementCommand::AssertVisible);
+        const bool doublePointer = elementTask &&
+            elementTask->command == ElementCommand::DoubleActivate &&
+            op == 0 && role >= 0 && role <= 12;
+        const bool compatible = observational || doublePointer || (op == 0 && (role == 1 || role == 5 || role == 7 || role == 4)) ||
+            (op == 1 && (role == 2 || role == 4)) ||
+            ((op == 2 || op == 3) && role == 3) ||
+            (op == 4 && (role == 8 || role == 9 || role == 10)) ||
+            ((op == 5 || op == 6) && (role == 4 || role == 10)) ||
+            (op == 7 && (role == 11 || role == 12)) ||
+            ((op == 8 || op == 9 || op == 10) && role >= 0 && role <= 12);
+        const bool sourceCompatible = observational || provider == 0 ||
+            (provider == 1 && (op == 0 || op == 1 || op == 4 || op == 8 || op == 10)) ||
+            (provider == 2 && (op == 0 || op == 1 || op == 8 || op == 10)) ||
+            ((provider == 3 || provider == 4) && (op == 0 || op == 10) && role == 1);
+        const bool selectorCompatible = provider == 0 ||
+            (provider == 1 && binding.elementAutomationId.starts_with("msaa")) ||
+            (provider == 2 && binding.elementAutomationId.starts_with("jab")) ||
+            (provider == 3 && binding.elementAutomationId.starts_with("cv:") &&
+             binding.elementClass.starts_with("v1:")) ||
+            (provider == 4 && binding.elementAutomationId.starts_with("ocr:") &&
+             binding.elementClass.starts_with("v1:"));
+        const bool takesValue = (op == 1 || op == 7) &&
+            (!elementTask || elementTask->command == ElementCommand::Activate);
+        bool numericValueValid = true;
+        if (op == 7) {
+            const auto& v = binding.elementValue;
+            double number = 0;
+            const auto result = std::from_chars(v.data(), v.data() + v.size(), number,
+                std::chars_format::general);
+            numericValueValid = !v.empty() && result.ec == std::errc{} &&
+                result.ptr == v.data() + v.size() && std::isfinite(number);
+        }
+        if (binding.elementName.size() > 512 || binding.elementAutomationId.size() > 512 ||
+            binding.elementClass.size() > 512 || binding.elementValue.size() > 4096 ||
+            binding.elementTab.size() > 512 || binding.elementTab.find('\0') != std::string::npos ||
+            (!binding.elementTab.empty() && (!hasSelector || !binding.elementBrowser || provider != 0)) ||
+            (binding.elementBrowser && provider != 0) ||
+            provider < 0 || provider > 4 ||
+            binding.elementName.find('\0') != std::string::npos ||
+            binding.elementAutomationId.find('\0') != std::string::npos ||
+            binding.elementClass.find('\0') != std::string::npos ||
+            binding.elementValue.find('\0') != std::string::npos ||
+            (hasSelector && (binding.title.empty() || !binding.enforce || !compatible ||
+              !sourceCompatible || !selectorCompatible ||
+              (!elementTask && !std::holds_alternative<Click>(plan.actions[i])) ||
+              (!elementTask && std::get<Click>(plan.actions[i]).button != Button::Left) ||
+              (!elementTask && (op != 0 || provider == 3 || provider == 4) &&
+               std::get<Click>(plan.actions[i]).count != 1) ||
+              (elementTask && (
+                  (elementTask->command == ElementCommand::DoubleActivate && op != 0) ||
+                  (elementTask->command == ElementCommand::SetText &&
+                   (provider < 3 ? op != 1 : (op != 0 || !binding.activate))) ||
+                  (elementTask->command == ElementCommand::Scroll &&
+                   (op != 10 || (provider != 0 && !binding.activate))) ||
+                  (elementTask->command == ElementCommand::DoubleActivate && !binding.activate) ||
+                  ((elementTask->command == ElementCommand::WaitVisible ||
+                    elementTask->command == ElementCommand::AssertVisible) && op != 0) ||
+                  ((elementTask->command == ElementCommand::Activate ||
+                    elementTask->command == ElementCommand::DoubleActivate) &&
+                    (provider >= 3 && op != 0)))) ||
+              (!takesValue && !binding.elementValue.empty()) || !numericValueValid ||
+              (!binding.activate && !backgroundElementAction(binding)))) ||
+            (!hasSelector && (binding.elementRole != 0 || binding.elementProvider != 0 || !binding.elementClass.empty() ||
+                             binding.elementBrowser || !binding.elementTab.empty() ||
+                             op != 0 || !binding.elementValue.empty())))
+            return "Invalid accessibility action binding.";
         if (binding.title.size() > 1024 || binding.process.size() > 260 ||
             binding.waitMs < 0 || binding.title.find('\0') != std::string::npos ||
             binding.process.find('\0') != std::string::npos ||
@@ -131,6 +218,9 @@ std::string validate(const Plan& plan) {
             (required && (binding.title != heldWindow.title ||
                           binding.process != heldWindow.process))))
             return "Cannot switch target windows while a key or mouse button is held.";
+        if (!held.empty() &&
+            (!binding.elementName.empty() || !binding.elementAutomationId.empty()))
+            return "Cannot operate a UI Automation element while an input is held.";
         if (held.empty()) heldWindow = binding;
 
         const auto error = std::visit([&](const auto& a) -> std::string {
@@ -182,6 +272,23 @@ std::string validate(const Plan& plan) {
                     return "Pointer movement coordinates are out of range.";
                 if (a.durationMs < 0 || a.durationMs > kMaxDelayMs)
                     return "Invalid pointer movement duration.";
+            } else if constexpr (std::is_same_v<T, ElementTask>) {
+                if (a.command > ElementCommand::AssertVisible) return "Invalid element command.";
+                if (binding.title.empty() || !binding.enforce ||
+                    (binding.elementName.empty() && binding.elementAutomationId.empty()))
+                    return "Element task requires a saved, enforced selector and window.";
+                if (a.command == ElementCommand::SetText) {
+                    if (!validText(a.text)) return "Invalid element text.";
+                } else if (!a.text.empty()) return "Unexpected element text.";
+                if (a.command == ElementCommand::Scroll &&
+                    (a.axis > Axis::Horizontal || a.delta == 0 || a.delta < -1200 || a.delta > 1200))
+                    return "Invalid element scroll amount.";
+                if (a.doubleIntervalMs < 10 || a.doubleIntervalMs > 1000)
+                    return "Invalid double-activation interval.";
+                if (a.command == ElementCommand::WaitVisible &&
+                    (a.timeoutMs < 0 || a.timeoutMs > 600000 || a.pollMs < 20 || a.pollMs > 5000))
+                    return "Invalid element polling settings.";
+                if (!held.empty()) return "Release held input before an element task.";
             } else if constexpr (std::is_same_v<T, Wait>) {
                 if (a.durationMs < 0) return "Invalid wait duration.";
             } else if constexpr (std::is_same_v<T, WaitUntil>) {
@@ -194,6 +301,86 @@ std::string validate(const Plan& plan) {
     }
     if (!held.empty()) return "Every key/button down must have a matching up in the same pass.";
     return {};
+}
+
+namespace {
+std::uint64_t saturatedAdd(std::uint64_t a, std::uint64_t b) {
+    return a > std::numeric_limits<std::uint64_t>::max() - b
+        ? std::numeric_limits<std::uint64_t>::max() : a + b;
+}
+std::uint64_t saturatedMultiply(std::uint64_t a, std::uint64_t b) {
+    return b && a > std::numeric_limits<std::uint64_t>::max() / b
+        ? std::numeric_limits<std::uint64_t>::max() : a * b;
+}
+} // namespace
+
+PreflightReport preflight(const Plan& plan) {
+    PreflightReport report;
+    report.validationError = validate(plan);
+    if (!report.validationError.empty()) return report;
+    std::uint64_t perPassClicks = 0;
+    std::uint64_t perPassWaitMs = 0;
+    bool foundUnbound = false, foundScript = false, foundHold = false;
+    std::size_t firstClick = 0;
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
+        const auto& action = plan.actions[i];
+        const StepWindow binding = plan.stepWindows.empty() ? StepWindow{} : plan.stepWindows[i];
+        const bool guarded = plan.requireTargetWindow ||
+            (binding.enforce && !binding.title.empty());
+        const bool rawInput = std::holds_alternative<Click>(action) ||
+            std::holds_alternative<MovePointer>(action) ||
+            std::holds_alternative<Wheel>(action) ||
+            std::holds_alternative<KeyTap>(action) ||
+            std::holds_alternative<KeyDown>(action) ||
+            std::holds_alternative<KeyUp>(action) ||
+            std::holds_alternative<KeyHold>(action) ||
+            std::holds_alternative<ButtonDown>(action) ||
+            std::holds_alternative<ButtonUp>(action) ||
+            std::holds_alternative<MouseHold>(action) ||
+            std::holds_alternative<TypeText>(action);
+        if (rawInput && !guarded && !foundUnbound &&
+            binding.elementName.empty() && binding.elementAutomationId.empty()) {
+            report.issues.push_back({PreflightRisk::UnboundForegroundInput, i});
+            foundUnbound = true;
+        }
+        if (const auto* click = std::get_if<Click>(&action)) {
+            if (!perPassClicks) firstClick = i;
+            perPassClicks = saturatedAdd(perPassClicks, static_cast<std::uint64_t>(click->count));
+            perPassWaitMs = saturatedAdd(perPassWaitMs,
+                saturatedMultiply(static_cast<std::uint64_t>(click->count - 1),
+                                  static_cast<std::uint64_t>(click->intervalMs)));
+        } else if (const auto* wait = std::get_if<Wait>(&action)) {
+            perPassWaitMs = saturatedAdd(perPassWaitMs, static_cast<std::uint64_t>(wait->durationMs));
+        } else if (const auto* mouseHold = std::get_if<MouseHold>(&action)) {
+            perPassWaitMs = saturatedAdd(perPassWaitMs, static_cast<std::uint64_t>(mouseHold->durationMs));
+        } else if (const auto* keyHold = std::get_if<KeyHold>(&action)) {
+            perPassWaitMs = saturatedAdd(perPassWaitMs, static_cast<std::uint64_t>(keyHold->durationMs));
+        } else if (const auto* move = std::get_if<MovePointer>(&action)) {
+            perPassWaitMs = saturatedAdd(perPassWaitMs, static_cast<std::uint64_t>(move->durationMs));
+        }
+        if (std::holds_alternative<RunScript>(action) && !foundScript) {
+            report.issues.push_back({PreflightRisk::LocalScript, i});
+            foundScript = true;
+        }
+        if ((std::holds_alternative<KeyDown>(action) || std::holds_alternative<ButtonDown>(action)) && !foundHold) {
+            report.issues.push_back({PreflightRisk::ManualHeldInput, i});
+            foundHold = true;
+        }
+    }
+    report.estimatedClickCount = saturatedMultiply(perPassClicks, static_cast<std::uint64_t>(plan.repetitions));
+    const auto repeatedWait = saturatedMultiply(perPassWaitMs, static_cast<std::uint64_t>(plan.repetitions));
+    const auto betweenPasses = saturatedMultiply(static_cast<std::uint64_t>(plan.passDelayMs),
+        static_cast<std::uint64_t>(plan.repetitions - 1));
+    report.minimumDurationMs = static_cast<std::int64_t>(std::min<std::uint64_t>(
+        saturatedAdd(repeatedWait, betweenPasses), std::numeric_limits<std::int64_t>::max()));
+    // Confirmation thresholds protect accidental floods and 30+ minute jobs.
+    if (report.estimatedClickCount > 1000)
+        report.issues.push_back({PreflightRisk::ManyClicks, firstClick});
+    if (report.minimumDurationMs >= 30LL * 60 * 1000)
+        report.issues.push_back({PreflightRisk::LongMinimumDuration, 0});
+    report.confirmationRecommended = foundScript || foundHold ||
+        report.estimatedClickCount > 1000 || report.minimumDurationMs >= 30LL * 60 * 1000;
+    return report;
 }
 
 bool SteadyWaiter::wait(std::int64_t milliseconds, std::stop_token stop) {
@@ -222,7 +409,14 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
     Result result;
     result.message = validate(plan);
     if (!result.message.empty()) return result;
-    if (plan.requireTargetWindow && !backend.boundToWindow()) {
+    // A leading WaitVisible step with an explicit enforced window is allowed
+    // to acquire the scenario target later. Other unbound scenarios still fail.
+    const bool deferredTarget = !plan.stepWindows.empty() &&
+        plan.stepWindows[0].enforce && !plan.stepWindows[0].title.empty() &&
+        !plan.actions.empty() &&
+        (std::get_if<ElementTask>(&plan.actions[0]) &&
+         std::get<ElementTask>(plan.actions[0]).command == ElementCommand::WaitVisible);
+    if (plan.requireTargetWindow && !backend.boundToWindow() && !deferredTarget) {
         result.message = "The saved scenario requires selecting its window again.";
         return result;
     }
@@ -277,7 +471,13 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
             }
             const auto& action = plan.actions[actionIndex];
             const StepWindow binding = plan.stepWindows.empty() ? StepWindow{} : plan.stepWindows[actionIndex];
-            if (!backend.prepareStepWindow(binding, stop)) {
+            const auto* task = std::get_if<ElementTask>(&action);
+            const bool waitingForElement = task && task->command == ElementCommand::WaitVisible;
+            // Waiting for an element must also wait for the owning window to EXIST.
+            // Do not run the window's own waitMs before starting the element deadline.
+            if (!waitingForElement && !backend.prepareStepWindow(binding, stop)) {
+                result.failedStepIndex = actionIndex;
+                result.failedPassNumber = rep + 1;
                 result.status = stop.stop_requested() ? Status::Cancelled : Status::DispatchFailed;
                 result.message = stop.stop_requested() ? "Playback cancelled." :
                     "Required step window not found, not foreground, or activation denied.";
@@ -292,8 +492,13 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                     const auto heldButton = buttonHeld(a.button);
                     for (std::int64_t i = 0; i < a.count; ++i) {
                         if (i > 0 && !wait(a.intervalMs)) return false;
-                        if (stop.stop_requested() || !sendHeld(heldButton, true) ||
-                            !sendHeld(heldButton, false)) return false;
+                        if (stop.stop_requested()) return false;
+                        if (!binding.elementName.empty() || !binding.elementAutomationId.empty()) {
+                            if (!backend.invokeElement(binding, stop)) return false;
+                            ++result.eventsSent; // one logical UIA operation
+                        } else if (!sendHeld(heldButton, true) || !sendHeld(heldButton, false)) {
+                            return false;
+                        }
                     }
                     return true;
                 } else if constexpr (std::is_same_v<T, ButtonDown>) {
@@ -310,6 +515,46 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                     if (!sendHeld(which, true)) return false;
                     if (!wait(a.durationMs)) return false;
                     return sendHeld(which, false);
+                } else if constexpr (std::is_same_v<T, ElementTask>) {
+                    // Every attempt re-resolves the saved selector, never a stale HWND
+                    // or pixel. No coordinate fallback on unsupported providers.
+                    switch (a.command) {
+                    case ElementCommand::Activate:
+                        return backend.invokeElement(binding, stop);
+                    case ElementCommand::DoubleActivate:
+                        // Native Invoke twice is NOT a double-click. The backend
+                        // must explicitly provide a guarded foreground OS click.
+                        return backend.doubleClickElement(binding, a.doubleIntervalMs, stop);
+                    case ElementCommand::SetText: {
+                        // Transport through the existing provider's SetValue pattern.
+                        StepWindow operation = binding;
+                        operation.elementValue.clear();
+                        // Encoding happens in the native backend, not by lossy casts.
+                        return backend.setElementText(operation, a.text, stop);
+                    }
+                    case ElementCommand::Scroll:
+                        return backend.scrollElement(binding, a.axis, a.delta, stop);
+                    case ElementCommand::AssertVisible:
+                        return backend.elementPresent(binding, stop);
+                    case ElementCommand::WaitVisible: {
+                        // Monotonic deadline; cancellation can interrupt each poll.
+                        const auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(a.timeoutMs);
+                        do {
+                            if (stop.stop_requested()) { waitCancelled = true; return false; }
+                            StepWindow probe = binding;
+                            probe.waitMs = 0; // The outer monotonic deadline owns timing.
+                            if (backend.prepareStepWindow(probe, stop) &&
+                                backend.elementPresent(binding, stop)) return true;
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now >= deadline) break;
+                            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+                            if (!wait(std::min<std::int64_t>(a.pollMs, left))) return false;
+                        } while (true);
+                        return false;
+                    }
+                    }
+                    return false;
                 } else if constexpr (std::is_same_v<T, TypeText>) {
                     for (char16_t unit : a.text) {
                         if (stop.stop_requested()) { waitCancelled = true; return false; }
@@ -417,11 +662,25 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                 }
             }, action);
             if (!okay) {
+                result.failedStepIndex = actionIndex;
+                result.failedPassNumber = rep + 1;
                 result.status = (stop.stop_requested() || waitCancelled) ? Status::Cancelled : Status::DispatchFailed;
                 result.message = result.status == Status::Cancelled ? "Playback cancelled." :
-                    (std::holds_alternative<RunScript>(action) ?
-                         "Local PowerShell step failed or PowerShell was not available." : "Input dispatch failed.");
+                    ((!binding.elementName.empty() || !binding.elementAutomationId.empty()) ?
+                     "Element operation failed: target absent, ambiguous, inaccessible or unsupported by its provider." :
+                     (std::holds_alternative<RunScript>(action) ?
+                         "Local PowerShell step failed or PowerShell was not available." : "Input dispatch failed."));
                 return finalize();
+            }
+            if (const auto* completedTask = std::get_if<ElementTask>(&action)) {
+                switch (completedTask->command) {
+                case ElementCommand::DoubleActivate: result.eventsSent += 2; break;
+                case ElementCommand::Activate:
+                case ElementCommand::SetText:
+                case ElementCommand::Scroll: ++result.eventsSent; break;
+                case ElementCommand::WaitVisible:
+                case ElementCommand::AssertVisible: break;
+                }
             }
             ++result.actionsCompleted;
         }

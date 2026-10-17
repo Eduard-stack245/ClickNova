@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ClickNova Tabs Bridge</title>
+<style>
+body{font:14px system-ui,sans-serif;margin:18px;min-width:290px;max-width:420px;color:CanvasText;background:Canvas}
+label{display:block;margin:14px 0 5px}input,select,button{font:inherit;padding:8px;max-width:100%;box-sizing:border-box}
+input{width:100%;font-family:monospace}button{margin:12px 7px 6px 0}small{line-height:1.5;display:block}#status{min-height:22px}
+</style></head>
+<body>
+<h2>ClickNova Tabs Bridge</h2>
+<small>Only sends names, URLs and favicon addresses of ordinary, non-private website tabs to ClickNova on <code>127.0.0.1</code>. No passwords, cookies or page contents. Nothing is sent until you enter the pairing key.</small>
+<label for="key">Pairing key / Код сопряжения</label>
+<input id="key" spellcheck="false" autocomplete="off" maxlength="32" placeholder="Copy from ClickNova → Find element">
+<label for="browser">Browser / Браузер</label>
+<select id="browser"><option>Chromium</option><option>Chrome</option><option>Edge</option><option>Brave</option><option>Opera</option><option>Vivaldi</option><option>Firefox</option></select>
+<div><button id="save">Connect / Подключить</button><button id="clear">Disconnect / Отключить</button></div>
+<p id="status" role="status"></p>
+<small>The key stays in extension-local storage. ClickNova listens only while the search dialog is open. Closing ClickNova stops the connection. To stop sharing, press Disconnect.</small>
+<script src="options.js"></script>
+</body></html>

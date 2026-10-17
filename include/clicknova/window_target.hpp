@@ -40,7 +40,8 @@ struct TargetSnapshot {
 TargetCheck evaluateWindowTarget(const TargetSnapshot& snapshot);
 const char* targetCheckMessage(TargetCheck status);
 
-// On Linux these functions return no candidates / Unsupported, not fake success.
+// On Linux with X11 support these functions inspect real X11 windows; without
+// DISPLAY/X11 they return no candidates / Unsupported, not fake success.
 std::vector<WindowTarget> listWindows();
 std::optional<WindowTarget> foregroundWindow();
 // Find a fresh live HWND from a persisted title/executable name; no cached HWND.
@@ -51,6 +52,9 @@ bool activateWindow(const WindowTarget& target);
 // A ClickNova-owned, minimized, or untitled window is not a valid target.
 std::optional<WindowTarget> windowUnderCursor();
 TargetCheck checkTarget(const WindowTarget& window);
+// Native accessibility patterns can act on a non-foreground window. Require a
+// live, same-process, visible, non-minimized window, but never force focus.
+TargetCheck checkAccessibleTarget(const WindowTarget& window);
 TargetCheck checkScreenPoint(const WindowTarget& window, int screenX, int screenY);
 // Validates capture geometry, not the focus/occlusion requirements for playback.
 TargetCheck checkCapturePoint(const WindowTarget& window, int screenX, int screenY);

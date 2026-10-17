@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # Read-only Git check. Does not stage, commit, push, clean or delete files.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -22,6 +22,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Whitespace issues in staged changes.' }
 $tracked = @(& git ls-files)
 $badFiles = @($tracked | Where-Object {
     $_ -match '(^|/)(build|build-[^/]*|cmake-build-[^/]*|dist-windows|out)/' -or
+    $_ -match '^tools/(vcpkg|clicknova-visual-vcpkg[^/]*|clicknova-visual-installer[.]lock)(/|$)' -or
     $_ -match '\.(exe|dll|obj|pdb|lib|ilk)$'
 })
 if ($badFiles.Count -gt 0) {
@@ -52,9 +53,12 @@ if ($obsolete.Count -gt 0) {
 # Reject staged documentation, private data, binaries, and build output.
 $staged = @(& git diff --cached --name-only --diff-filter=ACMR)
 $sensitive = @($staged | Where-Object {
-    $_ -match '(?i)(^|/)(README|CHANGELOG|CONTRIBUTING|RELEASE_NOTES)\.md$' -or
-    $_ -match '(^|/)(docs|\.github|build(-[^/]*)?|cmake-build-[^/]*|dist(-[^/]*)?|\.clicknova|user-data|user-profiles|user-macros|scenarios|user-scenarios|profiles|backups)/' -or
-    $_ -match '(?i)\.(exe|dll|lib|obj|pdb|log|dmp|zip|json)$' -or
+    $_ -match '(?i)\.md$' -or
+    $_ -match '^tools/(vcpkg|clicknova-visual-vcpkg[^/]*|clicknova-visual-installer[.]lock)(/|$)' -or
+    ($_ -match '(^|/)(docs|\.github|build(-[^/]*)?|cmake-build-[^/]*|dist(-[^/]*)?|\.clicknova|user-data|user-profiles|user-macros|scenarios|user-scenarios|profiles|backups|backup-[^/]*|backup_[^/]*|data|ClickNova-data|tessdata|recording-recovery)/' -and
+     $_ -cne '.github/workflows/portable-releases.yml') -or
+    ($_ -match '(?i)\.(exe|dll|lib|obj|pdb|log|dmp|zip|json|tsv|traineddata|sqlite|sqlite3)$' -and
+     $_ -notmatch '^extensions/(chromium|firefox)/manifest[.]json$') -or
     $_ -match '(^|/)\.env(\.|$)' -or
     $_ -match 'autosave'
 })
@@ -65,8 +69,10 @@ if ($sensitive.Count -gt 0) {
 
 # Previously tracked documentation must also be removed from the index.
 $disallowedTracked = @($tracked | Where-Object {
-    $_ -match '(?i)(^|/)(README|CHANGELOG|CONTRIBUTING|RELEASE_NOTES)\.md$' -or
-    $_ -match '(^|/)(docs|\.github)/'
+    $_ -match '(?i)\.md$' -or
+    $_ -match '^tools/(vcpkg|clicknova-visual-vcpkg[^/]*|clicknova-visual-installer[.]lock)(/|$)' -or
+    ($_ -match '(^|/)(docs|\.github|data|ClickNova-data|tessdata|recording-recovery|backup-[^/]*|backup_[^/]*)/' -and
+     $_ -cne '.github/workflows/portable-releases.yml')
 })
 if ($disallowedTracked.Count -gt 0) {
     $disallowedTracked | ForEach-Object { Write-Host "Remove from Git index: $_" -ForegroundColor Yellow }
@@ -74,7 +80,7 @@ if ($disallowedTracked.Count -gt 0) {
 }
 
 # C++ source comments and build tooling are English; localized UI strings are allowed.
-$nonEnglishComments = @(Select-String -Path $sourceFiles.FullName -Pattern '^\s*(?://|/\*|\*|#)\s*.*[А-Яа-яЁё]')
+$nonEnglishComments = @(Select-String -Path $sourceFiles.FullName -Pattern '^\s*(?://|/\*|\*|#)\s*.*\p{IsCyrillic}')
 if ($nonEnglishComments.Count -gt 0) {
     throw 'Non-English source comments found. Keep comments in English and localized UI strings as-is.'
 }

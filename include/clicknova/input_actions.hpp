@@ -39,6 +39,20 @@ struct KeyHold { int virtualKey{0}; int durationMs{500}; };
 // UTF-16 for Windows KEYEVENTF_UNICODE; not physical scan codes.
 struct TypeText { std::u16string text; };
 struct Wait { std::int64_t durationMs{0}; };
+// A selector-bound operation. Selectors live in the corresponding StepWindow;
+// never persist HWND/PID or substitute stale screen coordinates.
+enum class ElementCommand : std::uint8_t {
+    Activate, DoubleActivate, SetText, Scroll, WaitVisible, AssertVisible
+};
+struct ElementTask {
+    ElementCommand command{ElementCommand::Activate};
+    std::u16string text;   // For SetText only (plain text; never passwords).
+    Axis axis{Axis::Vertical};
+    int delta{120};       // For Scroll only, in standard wheel units.
+    int timeoutMs{5000}; // For WaitVisible (0 = immediate check).
+    int pollMs{100};     // For WaitVisible (bounded polling, cancellable).
+    int doubleIntervalMs{100}; // Configurable delay between activations (10..1000).
+};
 // Pause until the next occurrence of a local Windows clock time (24-hour).
 // If today's time has passed, the next occurrence is tomorrow.
 // Unlike Wait, this stores a clock time, not an elapsed duration.
@@ -46,7 +60,7 @@ struct WaitUntil { int hour{12}; int minute{0}; int second{0}; };
 // Explicit local PowerShell code step. No script runs on load or recording.
 struct RunScript { std::u16string code; };
 using Action = std::variant<Click, ButtonDown, ButtonUp, MouseHold, Wheel,
-                            KeyTap, KeyDown, KeyUp, KeyHold, TypeText, Wait, MovePointer, RunScript, WaitUntil>;
+                            KeyTap, KeyDown, KeyUp, KeyHold, TypeText, Wait, MovePointer, RunScript, WaitUntil, ElementTask>;
 // Per-step persisted window identity: NEVER a HWND, PID, or a raw native handle.
 // Matching uses the selected window title and executable filename on Windows.
 // Empty title means this action uses the plan-wide/default foreground target.
@@ -56,11 +70,30 @@ using Action = std::variant<Click, ButtonDown, ButtonUp, MouseHold, Wheel,
 struct StepWindow {
     std::string title;          // UTF-8 title at selection or recording time
     std::string process;        // UTF-8 executable name, optional
-    bool activate{false};      // Explicit opt-in: request foreground focus
+    bool activate{false};      // False on a native-element step = request background provider action, never SendInput
     std::int64_t waitMs{0};    // 0 = fail immediately if the window is absent
     bool enforce{true};        // false = recorded metadata only; do not target
+    // Optional accessible element operation attached to a left-click step. Saved
+    // identifiers are selectors, never native COM pointers / HWNDs / PIDs.
+    std::string elementName;
+    std::string elementAutomationId;
+    std::string elementClass;
+    int elementProvider{0};    // accessibility::Provider: 0 UIA, 1 MSAA, 2 Java, 3 OpenCV, 4 OCR
+    int elementRole{0};        // accessibility::Role; 1=button, 4=link, 7=menu item
+    bool elementBrowser{false};
+    std::string elementTab; // Optional browser tab's accessible name; never a URL or HWND.
+    int elementOperation{0};    // 0=Invoke, 1=SetValue, 2/3=Check/Uncheck, etc.
+    std::string elementValue;  // UTF-8, used only for SetValue / SetRangeValue
+    // Presentation-only manual group. Travels with the action through edits, undo
+    // and scenario files. Never influences window matching or playback.
+    std::string manualGroupId; // UUID, empty when not grouped
+    std::string manualGroupTitle; // UTF-8, max 80 Unicode characters
+
     bool operator==(const StepWindow&) const = default;
 };
+// Only a native accessibility binding without tab switching/focus is eligible
+// for background execution. Image/OCR matching and raw input always need focus.
+bool backgroundElementAction(const StepWindow& step) noexcept;
 struct Plan {
     std::vector<Action> actions;
     int repetitions{1};
@@ -70,6 +103,24 @@ struct Plan {
     // Empty for legacy scenarios; otherwise exactly one per action.
     std::vector<StepWindow> stepWindows;
 };
+
+// Read-only safety preview. No injection, target activation or script execution.
+// The report is advisory: playback still validates the plan independently.
+enum class PreflightRisk : std::uint8_t {
+    UnboundForegroundInput, LocalScript, ManyClicks, LongMinimumDuration, ManualHeldInput
+};
+struct PreflightIssue {
+    PreflightRisk risk{PreflightRisk::UnboundForegroundInput};
+    std::size_t stepIndex{0}; // zero-based source action, never a visual tree row
+};
+struct PreflightReport {
+    std::string validationError;
+    std::vector<PreflightIssue> issues;
+    std::uint64_t estimatedClickCount{0};
+    std::int64_t minimumDurationMs{0}; // excludes window discovery and WaitUntil
+    bool confirmationRecommended{false};
+};
+PreflightReport preflight(const Plan& plan);
 
 // Milliseconds to the NEXT local occurrence of a wall-clock time. Returns -1
 // for invalid time or a local-clock conversion error. Exposed for deterministic tests.
@@ -115,6 +166,15 @@ public:
     virtual bool prepareStepWindow(const StepWindow& binding, std::stop_token) {
         return binding.title.empty();
     }
+    // Perform an exact, unique UIA operation. No fallback to coordinate input.
+    virtual bool invokeElement(const StepWindow&, std::stop_token) { return false; }
+    // Genuine foreground OS double-click, never two semantic Invoke operations.
+    virtual bool doubleClickElement(const StepWindow&, int, std::stop_token) { return false; }
+    // Read-only fresh resolution. Missing/ambiguous elements are false.
+    virtual bool elementPresent(const StepWindow&, std::stop_token) { return false; }
+    // Provider-specific ScrollPattern only, never fallback to desktop wheel.
+    virtual bool scrollElement(const StepWindow&, Axis, int, std::stop_token) { return false; }
+    virtual bool setElementText(const StepWindow&, const std::u16string&, std::stop_token) { return false; }
     // Optional executor; the default refuses local code for unsupported backends.
     virtual bool runScript(const std::u16string&, std::stop_token) { return false; }
 };
@@ -137,6 +197,9 @@ struct Result {
     std::uint64_t actionsCompleted{0};
     // Cleanup is best effort if injection fails or playback is cancelled.
     bool releaseFailed{false};
+    // Exact source action on a dispatch failure, independent of tree grouping.
+    std::optional<std::size_t> failedStepIndex;
+    int failedPassNumber{0};
 };
 
 // Sent from the playback thread. The UI must marshal notifications to its own

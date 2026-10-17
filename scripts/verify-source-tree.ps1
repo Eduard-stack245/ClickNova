@@ -5,6 +5,13 @@ Set-StrictMode -Version Latest
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $required = @(
     'CMakeLists.txt', 'LICENSE', '.gitignore', '.gitattributes', 'ClickNova.cmd',
+    'src/gui/browser_discovery.cpp', 'src/gui/browser_discovery.hpp',
+    'src/gui/browser_extension_bridge.cpp', 'src/gui/browser_extension_bridge.hpp',
+    'extensions/chromium/manifest.json', 'extensions/chromium/background.js',
+    'extensions/chromium/options.html', 'extensions/chromium/options.js',
+    'extensions/firefox/manifest.json', 'extensions/firefox/background.js',
+    'extensions/firefox/options.html', 'extensions/firefox/options.js',
+    'tests/browser_discovery_tests.cpp', 'tests/browser_extension_bridge_tests.cpp',
     'include/clicknova/action_list_edit.hpp', 'tests/action_list_edit_tests.cpp',
     'src/gui/action_table_widget.hpp',
     'include/clicknova/core.hpp', 'include/clicknova/input_actions.hpp', 'include/clicknova/windows_input_backend.hpp', 'include/clicknova/sequence.hpp',
@@ -13,6 +20,8 @@ $required = @(
     'include/clicknova/sequence_preview.hpp', 'include/clicknova/sequence_conversion.hpp', 'include/clicknova/version.hpp.in',
     'src/core.cpp', 'src/storage/input_plan_codec.cpp', 'src/storage/input_plan_codec.hpp', 'tests/input_plan_codec_tests.cpp', 'src/input_actions.cpp', 'src/platform/windows/windows_input_backend.cpp', 'src/window_guard.cpp', 'src/sequence.cpp', 'src/sequence_preview.cpp', 'src/sequence_conversion.cpp',
     'src/platform/window_target.cpp',
+    'src/platform/x11/window_target_x11.cpp', 'src/platform/x11/x11_input_backend.cpp',
+    'include/clicknova/x11_input_backend.hpp', 'tests/x11_input_tests.cpp',
     'src/gui/main.cpp', 'src/gui/app_style.cpp', 'src/gui/app_style.hpp', 'src/gui/ui_icons.cpp', 'src/gui/ui_icons.hpp',
     'src/gui/smoke_tests.cpp', 'src/gui/smoke_tests.hpp',
     'src/gui/wrap_layout.cpp', 'src/gui/wrap_layout.hpp',
@@ -35,7 +44,13 @@ $required = @(
     'include/clicknova/duration_expression.hpp', 'tests/duration_expression_tests.cpp',
     'scripts/build-windows.ps1', 'scripts/run-windows.ps1', 'scripts/check-commit.ps1',
     'scripts/check-source-license.cmake', 'scripts/check-repository.cmake', 'scripts/package-source.ps1',
-    'scripts/verify-source-tree.ps1'
+    'scripts/verify-source-tree.ps1',
+    'scripts/build-linux.sh', 'scripts/package-portable-linux.sh', 'scripts/package-appimage-linux.sh',
+    'scripts/package-appimage-bundle-linux.py',
+    '.github/workflows/portable-releases.yml', 'packaging/clicknova.desktop', 'packaging/clicknova.svg',
+    'tests/release_packaging_tests.py',
+    'scripts/uninstall-clicknova.sh', 'scripts/uninstall-clicknova.ps1',
+    'tests/uninstall_safety_tests.py', 'Enable-OpenCV-OCR.cmd'
 )
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf) })
 if ($missing.Count -gt 0) {

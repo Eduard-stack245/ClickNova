@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ClickNova
+Comment=Portable automation and step editor
+Exec=ClickNova
+Icon=clicknova
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=true

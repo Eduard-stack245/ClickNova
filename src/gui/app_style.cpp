@@ -19,6 +19,17 @@ void applyClickNovaStyle(QApplication& app) {
         QLabel#recorderCounter { color: #b7e6cd; font-weight: 600; }
         QLabel#workflowFeedback { background: #1c3047; border: 1px solid #365a86;
                                   color: #e0edff; border-radius: 9px; padding: 9px 12px; }
+        QLabel#inputLabQuickHeading, QLabel#inputLabStepsHeading {
+            color: #d4e4f8; font-size: 13px; font-weight: 650;
+            padding: 4px 0 1px 0;
+        }
+        QWidget#activityLogHeader { background: #202a36; border-top: 1px solid #46566c; }
+        QLabel#activityLogTitle { font-weight: 650; color: #e4edf9; }
+        QLabel#activityLogCount { background: #30445a; color: #dbeafc;
+                                  border-radius: 9px; padding: 2px 6px; font-weight: 600; }
+        QWidget#activityLogHeader QPushButton { padding: 6px 9px; border-radius: 7px; }
+        QPushButton#toggleActivityLog { padding: 5px; }
+        QLabel#profileHeaderTitle { color: #aebfd5; font-weight: 600; }
         QListWidget#navigation { background: #1b2029; border: 1px solid #313a48;
                                  border-radius: 13px; padding: 8px 5px; outline: none; }
         QListWidget#navigation::item { border-radius: 9px; padding: 12px 10px; margin: 2px 3px; }

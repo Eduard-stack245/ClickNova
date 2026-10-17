@@ -9,6 +9,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include "../gui/portable_storage.hpp"
 #include <algorithm>
 #include <utility>
 #include <QByteArray>
@@ -30,8 +31,7 @@ QString encodedName(const QString& name) {
 void fail(QString* error, const QString& message) { if (error) *error = message; }
 }
 ScenarioStore::ScenarioStore(QString root)
-    : root_(root.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
-              QStringLiteral("/scenarios") : std::move(root)) {}
+    : root_(root.isEmpty() ? clicknova::portable::filePath(QStringLiteral("scenarios")) : std::move(root)) {}
 
 bool ScenarioStore::validName(const QString& name) {
     static const QRegularExpression re(QStringLiteral("^[\\p{L}\\p{N}][\\p{L}\\p{N} _-]{0,39}$"));

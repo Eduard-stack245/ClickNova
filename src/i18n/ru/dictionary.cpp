@@ -6,6 +6,13 @@ namespace clicknova::i18n {
 const QHash<QString, QString>& russianDictionary() {
         static const QHash<QString, QString> dictionary = {
             {"Action", "Действие"},
+            {"Use the profile controls in the top bar from any workspace. Profiles store click settings, coordinates, shortcuts and language. Recorded step scenarios are saved separately. Select the target window again after restarting.",
+             "Профилями можно управлять из верхней панели в любом разделе. Они хранят параметры кликов, координаты, горячие клавиши и язык. Записанные сценарии шагов сохраняются отдельно. После перезапуска целевое окно нужно выбрать заново."},
+            {"Profiles store automation settings and shortcuts. Recorded step scenarios are saved separately.",
+             "Профили хранят настройки автоматизации и горячие клавиши. Сценарии записанных шагов сохраняются отдельно."},
+            {"Execution and recorder events will appear here.",
+             "Здесь отображаются события выполнения сценариев и записи действий."},
+            {"Cannot create activity log folder.", "Не удалось создать папку журнала."},
             {"Start after", "Запуск через"},
             {"Start method", "Способ запуска"},
             {"After a delay", "Через промежуток времени"},
@@ -224,7 +231,7 @@ const QHash<QString, QString>& russianDictionary() {
             {"Choose a target window before pressing Start.", "Перед запуском выберите целевое окно."},
             {"Configure window settings...", "Настроить окно..."},
             {"Auto Clicker", "Автокликер"}, {"Position", "Позиция"},
-            {"Windows", "Окна"}, {"Profiles", "Профили"},
+            {"Windows", "Окна"}, {"Steps", "Шаги"}, {"Profiles", "Профили"},
             {"Shortcuts", "Горячие клавиши"}, {"Settings", "Настройки"},
             {"Add action creates an empty step. Pick a point with one click or edit the selected step.",
              "Добавить действие — создать пустой шаг. Выберите точку кликом или измените параметры шага."},

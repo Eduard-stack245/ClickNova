@@ -5,7 +5,11 @@
 #include "clicknova/input_recording.hpp"
 #include "clicknova/action_list_edit.hpp"
 #include "clicknova/window_target.hpp"
+#ifdef CLICKNOVA_WITH_X11
+#include "clicknova/x11_input_backend.hpp"
+#endif
 #include <optional>
+#include <memory>
 #include <chrono>
 #include "../storage/scenario_store.hpp"
 #include <QWidget>
@@ -17,6 +21,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <QSet>
 
 class QComboBox;
 class QLineEdit;
@@ -30,6 +35,8 @@ class QTimeEdit;
 class QMenu;
 class QEvent;
 class QTableWidget;
+class QVBoxLayout;
+class QDialog;
 class ActionTableWidget;
 class InputRecorderDialog;
 
@@ -45,6 +52,11 @@ public:
     QPushButton* runControl() const { return run_; }
     QPushButton* stopControl() const { return stop_; }
     QPushButton* recoveryControl() const { return recoverRecording_; }
+    QComboBox* savedPlanPicker() const { return savedPlans_; }
+    QPushButton* savePlanControl() const { return savePlan_; }
+    QPushButton* loadPlanControl() const { return loadPlan_; }
+    QPushButton* deletePlanControl() const { return deletePlan_; }
+    void hideEmbeddedSavedLibrary();
     void setStatusSink(std::function<void(const QString&)> sink) { statusSink_ = std::move(sink); }
     void setCanBegin(std::function<bool()> guard) { canBegin_ = std::move(guard); }
     void replaceActions(const clicknova::input::Plan& plan);
@@ -89,6 +101,8 @@ private:
     bool canPasteAction() const;
     void updateSelected();
     void chooseStepWindow();
+    void searchStepUiElements();
+    void clearStepUiElement();
     void clearStepWindow();
     void makeWindowBindingsInformational(bool selectedOnly);
     void editStepWindow();
@@ -99,6 +113,15 @@ private:
     std::int64_t passMilliseconds() const;
     void selectAction(int index);
     void refreshTable(int selectRow);
+    void applyStepVisibility();
+    void toggleStepGroup(int row);
+    void createManualGroup();
+    void renameManualGroup();
+    void ungroupManualSteps();
+    bool selectedManualGroup(int& first, int& end) const;
+    void resizeStepList(int pixels);
+    void detachStepList();
+    int stepCategory(int row) const;
     void updateFields();
     clicknova::input::Action currentEditorAction() const;
     void loadEditor(const clicknova::input::Action& action);
@@ -106,6 +129,7 @@ private:
     QString actionDetails(const clicknova::input::Action& action) const;
     void updateButtons();
     void reportStatus(const QString& message);
+    void reportActionChange(const QString& english, const QString& russian, int count);
     void refreshRecoveryAvailability();
     void refreshSavedPlans(const QString& selected = {});
     void savePlan();
@@ -157,17 +181,54 @@ private:
     bool hasRecovery_{false};
     clicknova::storage::ScenarioStore scenarioStore_;
     std::jthread worker_;
+#ifdef CLICKNOVA_WITH_X11
+    std::unique_ptr<clicknova::input::X11EmergencyStop> x11Stop_;
+#endif
     ActionTableWidget* table_{nullptr};
+    QWidget* stepsPanel_{nullptr};
+    QVBoxLayout* stepsRootLayout_{nullptr};
+    QLineEdit* stepSearch_{nullptr};
+    QComboBox* stepFilter_{nullptr};
+    QLabel* stepCount_{nullptr};
+    QWidget* stepResizeGrip_{nullptr};
+    QPushButton* expandGroups_{nullptr};
+    QPushButton* collapseGroups_{nullptr};
+    QPushButton* enlargeSteps_{nullptr};
+    QPushButton* shrinkSteps_{nullptr};
+    QPushButton* detachSteps_{nullptr};
+    QPushButton* createGroup_{nullptr};
+    QPushButton* renameGroup_{nullptr};
+    QPushButton* ungroupSteps_{nullptr};
+    QPushButton* duplicateStep_{nullptr};
+    QPushButton* deleteStep_{nullptr};
+    QPushButton* moveStepUp_{nullptr};
+    QPushButton* moveStepDown_{nullptr};
+    QPushButton* undoStep_{nullptr};
+    QPushButton* redoStep_{nullptr};
+    QPointer<QDialog> detachedSteps_;
+    QSet<int> collapsedStepGroups_;
+    QSet<QString> collapsedManualGroups_;
+    std::vector<int> manualEndByStart_;
+    std::vector<int> manualStartByRow_;
+    std::vector<int> groupEndByStart_;
+    std::vector<int> groupStartByRow_;
+    bool resizingSteps_{false};
+    int gripStartY_{0};
+    int gripStartHeight_{0};
+    int attachedHeight_{330};
     // Only the currently open menu has the discoverable object name. Closing
     // a menu does not always delete it before the next GUI event is processed.
     QPointer<QMenu> activeActionMenu_;
     QPushButton* chooseWindow_{nullptr};
     QPushButton* clearWindow_{nullptr};
     QPushButton* chooseStepWindow_{nullptr};
+    QPushButton* searchStepUi_{nullptr};
+    QPushButton* clearStepUi_{nullptr};
     QPushButton* clearStepWindow_{nullptr};
     QLabel* stepWindowStatus_{nullptr};
     QCheckBox* stepEnforce_{nullptr};
     QCheckBox* stepActivate_{nullptr};
+    QLabel* stepWindowTimeoutLabel_{nullptr};
     QLineEdit* stepWindowWait_{nullptr};
     QLabel* windowStatus_{nullptr};
     QComboBox* type_{nullptr};
@@ -222,6 +283,8 @@ private:
     QLabel* repetitionsLabel_{nullptr};
     QLabel* passDelayLabel_{nullptr};
     QLabel* help_{nullptr};
+    QLabel* quickHeading_{nullptr};
+    QLabel* stepsHeading_{nullptr};
     QLabel* status_{nullptr};
     QGroupBox* editorGroup_{nullptr};
     QGroupBox* savedGroup_{nullptr};

@@ -9,6 +9,7 @@
 #include <QJsonParseError>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include "portable_storage.hpp"
 #include <QUuid>
 #include <limits>
 
@@ -62,8 +63,7 @@ bool decode(const QJsonValue& value, recording::Sample& s) {
 void report(QString* error, const QString& message) { if (error) *error = message; }
 }
 QString directory() {
-    return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) +
-           QStringLiteral("/recording-recovery");
+    return clicknova::portable::filePath(QStringLiteral("recording-recovery"));
 }
 QString newPath(const QString& baseDirectory) {
     const QString name = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzz"));

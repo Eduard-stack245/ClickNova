@@ -1,6 +1,11 @@
 # Track ClickNova source, build scripts, tests, and required license files only.
 # Exclude generated output, documentation, and private user data.
 
+# vcpkg developer dependency checkout; never publish the downloaded toolchain.
+/tools/vcpkg/
+/tools/clicknova-visual-vcpkg*/
+/tools/clicknova-visual-installer.lock
+
 # CMake / IDE build directories (all variants used by ClickNova)
 /build/
 /build-*/
@@ -88,6 +93,14 @@ ui_*.h
 Thumbs.db
 Desktop.ini
 
+# Local update packages
+/patch/
+/BASELINE.sha256
+/MANIFEST.sha256
+/apply-update.cmd
+/apply-update.ps1
+/README.txt
+
 # Local user profiles and private configuration
 /.clicknova/
 /user-data/
@@ -108,7 +121,11 @@ __pycache__/
 /CONTRIBUTING.md
 /RELEASE_NOTES.md
 /docs/
-/.github/
+# Keep ONLY the audited, buildable portable release workflow in version control.
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/portable-releases.yml
 
 # Personal scenarios, build output, and logs are never tracked.
 
@@ -142,3 +159,20 @@ autosave*.json
 # Private input recording recovery files (never commit typed content)
 *.cnrecord.json
 /recording-recovery/
+
+# ClickNova portable user data and installed OCR language models
+data/
+
+# Strict pre-commit hygiene: local backups and application-generated assets.
+# Source updates create backup-... folders at the project root; NEVER commit them.
+/backup-*/
+/backup_*/
+/ClickNova-data/
+/tessdata/
+/recording-recovery/
+*.traineddata
+*.sqlite
+*.sqlite3
+
+# Project audit notes and release documentation stay out of the minimal source repo.
+/*.md
