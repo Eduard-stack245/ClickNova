@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "input_capture_dialog.hpp"
 #include "ui_icons.hpp"
 
@@ -48,7 +48,9 @@ public:
                                    : QStringLiteral("Close without changing the selected button or key."));
         clicknova::gui::setButtonIcon(cancel, clicknova::gui::Icon::Close);
         connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
-        layout->addWidget(cancel);
+        cancel->setMinimumWidth(118);
+        cancel->setMaximumWidth(180);
+        layout->addWidget(cancel, 0, Qt::AlignRight);
         QTimer::singleShot(0, target_, [this] { target_->setFocus(Qt::OtherFocusReason); });
     }
     std::optional<clicknova::input::Button> button() const { return button_; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 """Wrap a tested AppImage in a removable, ownership-tracked portable ZIP.
 
 Only known build artifacts are copied. Never scan a developer's home directory.

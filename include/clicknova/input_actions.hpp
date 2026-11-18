@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include <cstddef>
@@ -88,6 +88,8 @@ struct StepWindow {
     // and scenario files. Never influences window matching or playback.
     std::string manualGroupId; // UUID, empty when not grouped
     std::string manualGroupTitle; // UTF-8, max 80 Unicode characters
+    std::string displayName; // Optional UTF-8 user label for this single step, max 80 characters
+    std::string screenshotId; // SHA-256 lowercase hex PNG in the private local image store; never a path
 
     bool operator==(const StepWindow&) const = default;
 };
@@ -206,16 +208,31 @@ struct Result {
 // thread and use startedAt (steady clock) instead of starting a new timer
 // when Qt eventually processes the notification.
 struct PlaybackProgress {
-    enum class Kind { ActionStarted, WaitingForNextStep, WaitingForPass };
+    // ActionCompleted and ActionFailed carry the real elapsedMs of the
+    // original source step, including target preparation. No typed content.
+    enum class Kind { ActionStarted, WaitingForNextStep, WaitingForPass,
+                      ActionCompleted, ActionFailed };
     Kind kind{Kind::ActionStarted};
     std::size_t stepIndex{0};   // zero-based index of the upcoming/current action
     int passNumber{1};          // one-based pass number
     std::int64_t waitMs{0};
     std::chrono::steady_clock::time_point startedAt{};
+    std::int64_t elapsedMs{0};
 };
 using ProgressCallback = std::function<void(const PlaybackProgress&)>;
 
+// An explicit, volatile continuation point. This is never loaded from disk.
+// Both indices address the ORIGINAL plan, not a sliced copy or a row in the UI.
+struct PlaybackCursor {
+    std::size_t stepIndex{0}; // zero-based, original plan
+    int passNumber{1};        // one-based
+};
+// Resuming at a held-input boundary is unsafe even though the complete
+// scenario is valid. A failed operation may have had partial external effects.
+std::string validatePlaybackCursor(const Plan& plan, PlaybackCursor cursor);
+
 Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
-            std::stop_token stop = {}, ProgressCallback onProgress = {});
+            std::stop_token stop = {}, ProgressCallback onProgress = {},
+            PlaybackCursor cursor = {});
 
 } // namespace clicknova::input

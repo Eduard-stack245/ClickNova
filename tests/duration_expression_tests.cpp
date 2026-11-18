@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/duration_expression.hpp"
 #ifdef NDEBUG
 #undef NDEBUG

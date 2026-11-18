@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "input_plan_codec.hpp"
 #include <QJsonArray>
 #include <QJsonObject>
@@ -219,6 +219,10 @@ QJsonObject encodeBoundInputAction(const input::Action& action, const input::Ste
         if (!binding.elementValue.empty())
             record[QStringLiteral("uiaValue")] = QString::fromStdString(binding.elementValue);
     }
+    if (!binding.displayName.empty())
+        record[QStringLiteral("displayName")] = QString::fromStdString(binding.displayName);
+    if (!binding.screenshotId.empty())
+        record[QStringLiteral("screenshotId")] = QString::fromStdString(binding.screenshotId);
     if (!binding.manualGroupId.empty()) {
         record[QStringLiteral("manualGroupId")] = QString::fromStdString(binding.manualGroupId);
         record[QStringLiteral("manualGroupTitle")] = QString::fromStdString(binding.manualGroupTitle);
@@ -227,6 +231,24 @@ QJsonObject encodeBoundInputAction(const input::Action& action, const input::Ste
 }
 std::optional<input::StepWindow> decodeStepWindow(const QJsonObject& record) {
     input::StepWindow binding;
+    const auto screenshotId = record.value(QStringLiteral("screenshotId"));
+    if (!screenshotId.isUndefined()) {
+        if (!screenshotId.isString()) return std::nullopt;
+        const QString id = screenshotId.toString();
+        static const QRegularExpression sha256(QStringLiteral("^[0-9a-f]{64}$"));
+        if (!sha256.match(id).hasMatch()) return std::nullopt;
+        binding.screenshotId = id.toStdString();
+    }
+    const auto displayName = record.value(QStringLiteral("displayName"));
+    if (!displayName.isUndefined()) {
+        if (!displayName.isString()) return std::nullopt;
+        const QString name = displayName.toString();
+        if (name.trimmed().isEmpty() || name.size() > 80 || name.contains(QChar(0)) ||
+            std::any_of(name.begin(), name.end(), [](const QChar ch) {
+                return ch.category() == QChar::Other_Control;
+            })) return std::nullopt;
+        binding.displayName = name.toStdString();
+    }
     const auto groupId = record.value(QStringLiteral("manualGroupId"));
     const auto groupTitle = record.value(QStringLiteral("manualGroupTitle"));
     if (!groupId.isUndefined() || !groupTitle.isUndefined()) {

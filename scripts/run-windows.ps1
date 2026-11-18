@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # One-click developer launcher: rebuild only when a source file changed.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest

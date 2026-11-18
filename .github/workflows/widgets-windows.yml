@@ -1,0 +1,39 @@
+name: Qt Widgets Windows validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify single Qt Widgets interface
+        shell: pwsh
+        run: python tests/validate_widgets_only.py
+      - name: Install Qt 6.12 MSVC kit
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.12.0'
+          arch: 'win64_msvc2022_64'
+      - name: Configure Qt Widgets application
+        shell: pwsh
+        run: cmake -S . -B build-ci -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" -DCLICKNOVA_BUILD_GUI=ON -DBUILD_TESTING=ON
+      - name: Build
+        shell: pwsh
+        run: cmake --build build-ci --config ${{ matrix.configuration }} --parallel
+      - name: Deploy Qt Widgets runtime
+        shell: pwsh
+        run: |
+          $configuration = '${{ matrix.configuration }}'
+          $mode = if ($configuration -eq 'Debug') { '--debug' } else { '--release' }
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" $mode "build-ci/$configuration/ClickNova.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build-ci -C ${{ matrix.configuration }} --output-on-failure

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_recording.hpp"
 #include <QDialog>
@@ -29,7 +29,25 @@ public:
     void finishForReview() { stop(false); }
     void bringToFront();
     bool recordingStarted() const noexcept { return started_; }
+    bool isPaused() const noexcept { return paused_; }
     QString checkpointFile() const { return checkpointFile_; }
+    QString statusText() const;
+    // Typed Qt Quick adapter. The dialog still owns all capture hooks and
+    // recovery checkpoints; no native input samples are exposed to QML.
+    bool canStartFromQml() const noexcept;
+    bool canPauseFromQml() const noexcept;
+    bool canReviewFromQml() const noexcept;
+    bool canDiscardFromQml() const noexcept;
+    bool requestStartFromQml();
+    bool requestPausedFromQml(bool paused);
+    bool requestFinishFromQml();
+    bool requestDiscardFromQml();
+    bool captureOptionFromQml(int option) const;
+    bool setCaptureOptionFromQml(int option, bool enabled);
+    int recordedEventCount() const noexcept;
+    std::uint64_t recordedElapsedMs() const noexcept;
+    QString progressTextFromQml() const;
+    QString windowTextFromQml() const;
 private:
     class NativeHooks;
     void start();

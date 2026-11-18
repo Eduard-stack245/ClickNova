@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # Build a single-file AppImage after CMake/CTest succeeded on a Linux X11 builder.
 # Requires separately installed linuxdeploy and linuxdeploy-plugin-qt tools.
 # This script never installs a compiler or modifies system packages.

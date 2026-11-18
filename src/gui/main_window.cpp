@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // Qt desktop UI. Windows uses SendInput; Linux X11 uses guarded XTEST playback.
 #include <QApplication>
 #include <QAbstractSpinBox>
@@ -28,6 +28,9 @@
 #include <QPoint>
 #include <QListWidget>
 #include <QStackedWidget>
+#include <QSplitter>
+#include <QListView>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QKeySequenceEdit>
@@ -64,6 +67,7 @@
 #include <QWidget>
 #include <functional>
 #include <iterator>
+#include <initializer_list>
 #include <algorithm>
 #include <chrono>
 #include <limits>
@@ -88,6 +92,7 @@
 #include "clicknova/sequence_conversion.hpp"
 #include "clicknova/sequence_to_input.hpp"
 #include "clicknova/quick_motion.hpp"
+#include "quick_clicker_service.hpp"
 #include "clicknova/version.hpp"
 #include "clicknova/window_target.hpp"
 #include "clicknova/windows_awake.hpp"
@@ -115,6 +120,7 @@ using clicknova::windows::validateShortcuts;
 
 bool isSmokeMode() {
     return qApp->arguments().contains(QStringLiteral("--smoke-test-scenarios")) ||
+           qApp->arguments().contains(QStringLiteral("--qml-smoke")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-ui")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-language")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-sequence")) ||
@@ -125,6 +131,8 @@ bool isSmokeMode() {
            qApp->arguments().contains(QStringLiteral("--smoke-test-input-lab")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-unified")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-unified-search")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-scenario-check")) ||
+           qApp->arguments().contains(QStringLiteral("--smoke-test-execution-report")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-wheel-routing")) ||
            qApp->arguments().contains(QStringLiteral("--smoke-test-quick-motion"));
 }
@@ -142,8 +150,9 @@ public:
         setMinimumSize(760, 540);
         auto* root = new QWidget(this);
         auto* layout = new QVBoxLayout(root);
-        layout->setContentsMargins(16, 14, 16, 14);
-        layout->setSpacing(12);
+        // Smaller gutters leave more room for action details and avoid horizontal clipping.
+        layout->setContentsMargins(12, 10, 12, 10);
+        layout->setSpacing(10);
         // Application icon and name already appear in the native title bar.
         // Avoid a second giant logo/title inside the workspace.
         setWindowIcon(clicknova::gui::icon(clicknova::gui::Icon::Brand));
@@ -155,11 +164,35 @@ public:
         workflowFeedback_->hide();
         layout->addWidget(workflowFeedback_);
 
-        auto* body = new QHBoxLayout;
-        body->setSpacing(16);
-        navigation_ = new QListWidget(root);
+        // Splitter allows the user to drag the left sidebar edge, while the
+        // compact mode retains all three navigation destinations as icons.
+        navigationSplitter_ = new QSplitter(Qt::Horizontal, root);
+        navigationSplitter_->setObjectName(QStringLiteral("mainWorkspaceSplitter"));
+        navigationSplitter_->setHandleWidth(7);
+        navigationSplitter_->setChildrenCollapsible(false);
+        navigationPanel_ = new QWidget(navigationSplitter_);
+        navigationPanel_->setObjectName(QStringLiteral("navigationPanel"));
+        auto* navigationLayout = new QVBoxLayout(navigationPanel_);
+        navigationLayout->setContentsMargins(9, 9, 9, 9);
+        navigationLayout->setSpacing(7);
+        auto* navigationHeader = new QHBoxLayout;
+        navigationHeader->setContentsMargins(3, 0, 0, 0);
+        navigationHeader->setSpacing(2);
+        auto* navigationHeading = new QLabel(navigationPanel_);
+        navigationHeading->setObjectName(QStringLiteral("navigationHeading"));
+        navigationHeading->setText(QStringLiteral("WORKSPACES"));
+        navigationHeader->addWidget(navigationHeading, 1);
+        navigationToggle_ = new QToolButton(navigationPanel_);
+        navigationToggle_->setObjectName(QStringLiteral("navigationCollapse"));
+        navigationToggle_->setFixedSize(34, 34);
+        navigationHeader->addWidget(navigationToggle_, 0, Qt::AlignRight);
+        navigationLayout->addLayout(navigationHeader);
+        navigation_ = new QListWidget(navigationPanel_);
         navigation_->setObjectName(QStringLiteral("navigation"));
-        navigation_->setFixedWidth(208);
+        navigation_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        navigation_->setFrameShape(QFrame::NoFrame);
+        navigation_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        navigation_->setUniformItemSizes(true);
         navigation_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         navigation_->setTextElideMode(Qt::ElideRight);
         navigation_->setSpacing(6);
@@ -172,10 +205,46 @@ public:
         for (int index = 0; index < navigation_->count(); ++index)
             navigation_->item(index)->setIcon(clicknova::gui::icon(sections[index]));
         navigation_->setIconSize(QSize(21, 21));
-        body->addWidget(navigation_);
-        pages_ = new QStackedWidget(root);
-        body->addWidget(pages_, 1);
-        layout->addLayout(body, 1);
+        // Navigation is a three-item choice, not a full-height document list.
+        // The blank remainder stays visually quiet instead of looking clickable.
+        navigation_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        navigation_->setMinimumHeight(190);
+        navigation_->setMaximumHeight(224);
+        navigationLayout->addWidget(navigation_);
+        navigationLayout->addStretch(1);
+        navigationSplitter_->addWidget(navigationPanel_);
+        pages_ = new QStackedWidget(navigationSplitter_);
+        navigationSplitter_->addWidget(pages_);
+        navigationSplitter_->setStretchFactor(0, 0);
+        navigationSplitter_->setStretchFactor(1, 1);
+        layout->addWidget(navigationSplitter_, 1);
+        navigationExpandedWidth_ = std::clamp(
+            initialPreferences.value(QStringLiteral("ui/navigationWidth"), 190).toInt(), 164, 350);
+        navigationCollapsed_ = !isSmokeMode() &&
+            initialPreferences.value(QStringLiteral("ui/navigationCollapsed"), false).toBool();
+        updateNavigationAppearance();
+        navigationSplitter_->setSizes({navigationCollapsed_ ? 72 : navigationExpandedWidth_, 950});
+        connect(navigationToggle_, &QToolButton::clicked, this, [this] {
+            setNavigationCollapsed(!navigationCollapsed_);
+        });
+        connect(navigationSplitter_, &QSplitter::splitterMoved, this, [this](int, int) {
+            if (navigationCollapsed_ || !navigationPanel_) return;
+            const int pixels = navigationPanel_->width();
+            if (pixels < 164) return;
+            navigationExpandedWidth_ = std::clamp(pixels, 164, 350);
+            if (!isSmokeMode()) {
+                QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+                settings.setValue(QStringLiteral("ui/navigationWidth"), navigationExpandedWidth_);
+            }
+        });
+        // Apply the precise stored width once the real window layout exists.
+        QTimer::singleShot(0, this, [this] {
+            if (!navigationSplitter_) return;
+            const int left = navigationCollapsed_ ? 72 : navigationExpandedWidth_;
+            const int right = std::max(1, navigationSplitter_->width() -
+                navigationSplitter_->handleWidth() - left);
+            navigationSplitter_->setSizes({left, right});
+        });
 
         auto createPage = [this](const QString& title, const QString& description) {
             auto* scroll = new QScrollArea;
@@ -306,6 +375,7 @@ public:
         quickHoldDuration_->setToolTip(QStringLiteral("How long each mouse button stays pressed. Zero is a normal click. Supports Left, Right, Middle, X1 and X2."));
         form->addRow(QStringLiteral("Hold each click"), quickHoldDuration_);
         infinite_ = new QCheckBox(QStringLiteral("Unlimited clicks"));
+        infinite_->setObjectName(QStringLiteral("quickUnlimited"));
         infinite_->setMinimumHeight(44);
         infinite_->setChecked(false);
         form->addRow(QStringLiteral("Mode"), infinite_);
@@ -370,6 +440,17 @@ public:
         customizeClicks_->setMinimumHeight(42);
         customizeClicks_->setToolTip(QStringLiteral("Turn a fixed-position, finite click run into editable actions with independent intervals."));
         form->addRow(customizeClicks_);
+        // These are short choices/numbers, not paragraphs. Keep their comfortable
+        // input height, but do not stretch them to the whole desktop width.
+        for (auto* choice : {button_, quickAction_, startMode_})
+            choice->setMaximumWidth(340);
+        for (auto* value : {interval_, quickHoldDuration_, count_, startDelayValue_})
+            value->setMaximumWidth(210);
+        startDelayUnit_->setMaximumWidth(160);
+        startAtTime_->setMaximumWidth(200);
+        delayRow->setMaximumWidth(390);
+        chooseButton->setMaximumWidth(290);
+        customizeClicks_->setMaximumWidth(350);
         auto* quickTip = new QLabel(QStringLiteral(
             "Choose an action. For moving or dragging, capture the destination first. Stop releases any held button."));
         quickTip->setObjectName(QStringLiteral("subheading"));
@@ -412,8 +493,11 @@ public:
         x_->setRange(-32768, 32767);
         y_->setRange(-32768, 32767);
 #endif
+        x_->setMaximumWidth(200);
+        y_->setMaximumWidth(200);
         coordinatesLayout->addWidget(x_);
         coordinatesLayout->addWidget(y_);
+        coordinatesLayout->addStretch(1);
         positionForm->addRow(QStringLiteral("Coordinates"), coordinates);
 
         capture_ = new QPushButton(QStringLiteral("Capture cursor after 3 seconds"));
@@ -421,6 +505,7 @@ public:
 #ifndef _WIN32
         capture_->setEnabled(false);
 #endif
+        capture_->setMaximumWidth(320);
         positionForm->addRow(QStringLiteral("Pick coordinates"), capture_);
         positionCaptureSeconds_ = new QSpinBox;
         positionCaptureSeconds_->setObjectName(QStringLiteral("positionCaptureSeconds"));
@@ -428,6 +513,7 @@ public:
         positionCaptureSeconds_->setValue(5);
         positionCaptureSeconds_->setSuffix(QStringLiteral(" s"));
         positionCaptureSeconds_->setMinimumHeight(44);
+        positionCaptureSeconds_->setMaximumWidth(170);
         positionForm->addRow(QStringLiteral("Capture delay"), positionCaptureSeconds_);
         connect(positionMode_, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [this](int) { updatePositionInputs(); });
@@ -456,13 +542,17 @@ public:
         quickMoveY_->setMinimumHeight(44);
         quickMoveX_->setPrefix(QStringLiteral("X: "));
         quickMoveY_->setPrefix(QStringLiteral("Y: "));
+        quickMoveX_->setMaximumWidth(200);
+        quickMoveY_->setMaximumWidth(200);
         endpointRow->addWidget(quickMoveX_);
         endpointRow->addWidget(quickMoveY_);
+        endpointRow->addStretch(1);
         moveForm->addRow(QStringLiteral("Destination coordinates"), endpoint);
         quickCaptureDestination_ = new QPushButton(QStringLiteral("Capture destination by timer"));
         quickCaptureDestination_->setObjectName(QStringLiteral("quickCaptureDestination"));
         quickCaptureDestination_->setProperty("actionRole", QStringLiteral("primary"));
         quickCaptureDestination_->setMinimumHeight(44);
+        quickCaptureDestination_->setMaximumWidth(320);
         moveForm->addRow(quickCaptureDestination_);
         quickMoveDuration_ = new QSpinBox;
         quickMoveDuration_->setObjectName(QStringLiteral("quickMoveDuration"));
@@ -470,6 +560,7 @@ public:
         quickMoveDuration_->setValue(600);
         quickMoveDuration_->setSuffix(QStringLiteral(" ms"));
         quickMoveDuration_->setMinimumHeight(44);
+        quickMoveDuration_->setMaximumWidth(210);
         moveForm->addRow(QStringLiteral("Movement duration"), quickMoveDuration_);
         auto* moveNote = new QLabel(QStringLiteral(
             "Start: current cursor or a fixed point in Click Position. "
@@ -694,6 +785,7 @@ public:
         languageSelector_ = new QComboBox;
         languageSelector_->setObjectName(QStringLiteral("uiLanguage"));
         languageSelector_->setMinimumHeight(44);
+        languageSelector_->setMaximumWidth(240);
         languageSelector_->addItem(QStringLiteral("English"), QStringLiteral("en"));
         languageSelector_->addItem(QString::fromUtf8("Русский"), QStringLiteral("ru"));
         languageForm->addRow(QStringLiteral("Language"), languageSelector_);
@@ -951,6 +1043,8 @@ public:
             auto* loadButton = new QPushButton(QStringLiteral("Load"));
             auto* deleteButton = new QPushButton(QStringLiteral("Delete"));
             deleteButton->setProperty("actionRole", QStringLiteral("danger"));
+            deleteButton->setObjectName(autoClicker ? QStringLiteral("autoScenarioDelete")
+                                                    : QStringLiteral("sequenceScenarioDelete"));
             saveButton->setObjectName(autoClicker ? QStringLiteral("autoScenarioSave")
                                                  : QStringLiteral("sequenceScenarioSave"));
             loadButton->setObjectName(autoClicker ? QStringLiteral("autoScenarioLoad")
@@ -1034,6 +1128,7 @@ public:
         start_->setObjectName(QStringLiteral("primaryButton"));
         start_->setProperty("actionRole", QStringLiteral("primary"));
         stop_ = new QPushButton(QStringLiteral("Stop"));
+        stop_->setObjectName(QStringLiteral("quickStopControl"));
         stop_->setProperty("actionRole", QStringLiteral("danger"));
         stop_->setEnabled(false);
         start_->setMinimumHeight(52);
@@ -1042,6 +1137,7 @@ public:
         buttons->addWidget(stop_);
         layout->addLayout(buttons);
         status_ = new QLabel(QStringLiteral("Ready"));
+        status_->setObjectName(QStringLiteral("quickStatus"));
         status_->setWordWrap(true);
         status_->setMinimumHeight(28);
         layout->addWidget(status_);
@@ -1051,6 +1147,10 @@ public:
         if (workflowFeedback_) workflowFeedback_->hide();
         setCentralWidget(root);
         setupRunToolbarAndLog();
+        // The actual connected Start/Stop buttons now belong to the top toolbar.
+        // Do not leave an empty command row below the page content.
+        layout->removeItem(buttons);
+        delete buttons;
         setupLibraryToolbar(autoLibrary);
         // Remove the old layout items before reparenting the connected
         // widgets. Otherwise WrapLayout can still position the moved buttons.
@@ -1058,6 +1158,29 @@ public:
         for (auto* action : {saveProfile_, loadProfile_, deleteProfile_})
             profileActions->removeWidget(action);
         setupProfileHeader(scenarioToolbar_, profileGroup);
+        // Optimize control density without removing any control or reconnecting its handler.
+        QTimer::singleShot(0, this, [this] {
+            for (auto* field : findChildren<QSpinBox*>()) {
+                const QString key = field->objectName();
+                if (key.contains(QStringLiteral("Coordinate"), Qt::CaseInsensitive) ||
+                    key.contains(QStringLiteral("Duration"), Qt::CaseInsensitive) ||
+                    key.contains(QStringLiteral("Interval"), Qt::CaseInsensitive) ||
+                    key.contains(QStringLiteral("Delay"), Qt::CaseInsensitive) ||
+                    key.contains(QStringLiteral("Count"), Qt::CaseInsensitive)) {
+                    field->setMaximumWidth(185);
+                }
+            }
+            for (auto* button : findChildren<QPushButton*>()) {
+                if (button->parentWidget() == nullptr) continue;
+                const QString caption = button->text().simplified();
+                if (caption.size() > 24 || caption.isEmpty()) continue;
+                if (button->objectName() == QStringLiteral("scenarioToolbarToggle")) continue;
+                const int content = button->fontMetrics().horizontalAdvance(caption) +
+                    (button->icon().isNull() ? 28 : 56);
+                button->setMaximumWidth(qBound(86, content, 246));
+                button->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+            }
+        });
         refreshWindowList();
         if (!isSmokeMode()) {
             restoreLastSettings();
@@ -1090,6 +1213,26 @@ public:
         setButtonIcon(loadSequenceScenario_, Icon::Folder);
         setButtonIcon(deleteSequenceScenario_, Icon::Delete);
 
+        // One native quick-click engine shared with the QML bridge. Both native
+        // controls and global hotkeys call the same service, never a proxy button.
+        quickClickerService_ = std::make_unique<clicknova::gui::QuickClickerService>(
+            clicknova::gui::makeDefaultQuickClickerDevice(), this);
+        quickClickerService_->setObjectName(QStringLiteral("quickClickerService"));
+#ifdef _WIN32
+        quickClickerService_->setSafetyHooks(
+            [this] { return hotkeys_ && hotkeys_->setRunning(true); },
+            [this] { if (hotkeys_) hotkeys_->setRunning(false); },
+            [this] {
+                return !capturePending_ && !sequenceTimedCapture_ &&
+                       !captureWindowPending_ && !captureStepWindowPending_ &&
+                       !sequenceHoverPicking_ &&
+                       (!inputLab_ || !inputLab_->isRunning());
+            });
+#endif
+        connect(quickClickerService_.get(), &clicknova::gui::QuickClickerService::stateChanged,
+            this, [this] { refreshQuickServiceUi(); });
+        connect(quickClickerService_.get(), &clicknova::gui::QuickClickerService::statusChanged,
+            this, [this] { setStatus(quickClickerService_->status()); });
         connect(start_, &QPushButton::clicked, this, [this] { start(); });
         // Saving immediately also persists the timer across normal restarts.
         connect(startDelayValue_, qOverload<int>(&QSpinBox::valueChanged),
@@ -1192,6 +1335,127 @@ public:
 #endif
 #endif
     }
+    // Bridge API: no clicks on hidden Qt Widgets. Config is read from the
+    // original profile/scenario fields until those stores are service-backed.
+    clicknova::gui::QuickClickerService* quickService() const noexcept {
+        return quickClickerService_.get();
+    }
+    bool requestQuickStart(const QVariantMap* qmlOptions = nullptr) {
+        if (property("clicknova.uiaScanning").toBool() ||
+            property("clicknova.visualScanning").toBool()) {
+            setStatus(QStringLiteral("UIA inspection is active. Cancel inspection before starting."));
+            return false;
+        }
+#ifdef _WIN32
+        if (!quickClickerService_ || active_ || capturePending_ ||
+            (inputLab_ && inputLab_->isRunning()) ||
+            (quickSequence_ && quickSequence_->isChecked())) {
+            setStatus(QStringLiteral("Quick clicker unavailable while another workflow is active."));
+            return false;
+        }
+        const bool bound = qmlOptions ? qmlOptions->value(QStringLiteral("targetWindow")).toBool()
+                                      : targetMode_->currentIndex() == 1;
+        if (bound && !selectedTarget_) {
+            setStatus(QStringLiteral("Select a target window before starting."));
+            return false;
+        }
+        QVariantMap options;
+        if (qmlOptions) {
+            // QML has already validated this typed draft. Do not reread any
+            // hidden Widgets fields, including the native countdown settings.
+            options = *qmlOptions;
+        } else {
+            const auto delay = clicknova::timing::startDelayMs(
+                static_cast<std::uint64_t>(startDelayValue_->value()),
+                startDelayUnit_->currentIndex());
+            if (!delay) { setStatus(QStringLiteral("Invalid quick start delay.")); return false; }
+            const QTime clock = startAtTime_->time();
+            options = {
+                {QStringLiteral("action"), quickAction_->currentIndex()},
+                {QStringLiteral("button"), button_->currentIndex()},
+                {QStringLiteral("intervalMs"), interval_->value()},
+                {QStringLiteral("holdMs"), quickHoldDuration_->value()},
+                {QStringLiteral("count"), quickAction_->currentIndex() == 3 ? 1 : count_->value()},
+                {QStringLiteral("unlimited"), quickAction_->currentIndex() != 3 && infinite_->isChecked()},
+                {QStringLiteral("fixedPosition"), positionMode_->currentIndex() == 1},
+                {QStringLiteral("x"), x_->value()},
+                {QStringLiteral("y"), y_->value()},
+                {QStringLiteral("targetWindow"), bound},
+                {QStringLiteral("destinationConfigured"), destinationConfigured_},
+                {QStringLiteral("destinationX"), quickMoveX_->value()},
+                {QStringLiteral("destinationY"), quickMoveY_->value()},
+                {QStringLiteral("movementMs"), quickMoveDuration_->value()},
+                {QStringLiteral("delayMs"), static_cast<qlonglong>(*delay)},
+                {QStringLiteral("useClockStart"), startMode_->currentIndex() == 1},
+                {QStringLiteral("clockHour"), clock.hour()},
+                {QStringLiteral("clockMinute"), clock.minute()},
+                {QStringLiteral("clockSecond"), clock.second()},
+                {QStringLiteral("keepAwake"), keepAwakeQuick_->isChecked()}
+            };
+        }
+        // Transient HWNDs are verified afresh, never restored from a profile.
+        const auto target = bound ? selectedTarget_ : std::optional<clicknova::platform::WindowTarget>{};
+        if (!quickClickerService_->setSelectedWindow(target) ||
+            !quickClickerService_->configure(options) || !quickClickerService_->start()) {
+            setStatus(quickClickerService_->status());
+            return false;
+        }
+        if (!isSmokeMode()) saveLastSettings();
+        return true;
+#else
+        // X11 native Quick remains available through the legacy workspace;
+        // this service explicitly refuses unsupported OS injection.
+        return quickClickerService_ && quickClickerService_->start();
+#endif
+    }
+    bool requestQuickStartFromQml(const QVariantMap& options) {
+        return requestQuickStart(&options);
+    }
+    bool quickDestinationReady() const noexcept { return destinationConfigured_; }
+    bool markQuickDestination() {
+        if (active_ || capturePending_ ||
+            (inputLab_ && inputLab_->isRunning()) ||
+            (quickClickerService_ && (quickClickerService_->active() ||
+                                     quickClickerService_->needsCleanup()))) return false;
+        destinationConfigured_ = true;
+        updateQuickOptions();
+        return true;
+    }
+    bool requestQuickStop() {
+        if (!quickClickerService_ ||
+            (!quickClickerService_->active() && !quickClickerService_->needsCleanup())) return false;
+        quickClickerService_->stop();
+        return !quickClickerService_->active() && !quickClickerService_->needsCleanup();
+    }
+    void refreshQuickServiceUi() {
+#ifdef _WIN32
+        if (!quickClickerService_) return;
+        const bool running = quickClickerService_->active();
+        const bool cleanupRequired = quickClickerService_->needsCleanup();
+        // Keep all native editing/storage operations locked during recovery.
+        active_ = running || cleanupRequired;
+        if (sequenceEditor_) sequenceEditor_->setLocked(running);
+        setShortcutEditorsEnabled(!running && !cleanupRequired);
+        if (start_) start_->setEnabled(!running && !cleanupRequired);
+        if (stop_) stop_->setEnabled(running || cleanupRequired);
+        for (QWidget* field : std::initializer_list<QWidget*>{button_, quickAction_, interval_,
+                              quickHoldDuration_, count_, infinite_, startDelayValue_,
+                              startDelayUnit_, startMode_, startAtTime_,
+                              positionMode_, quickMoveX_, quickMoveY_,
+                              quickMoveDuration_, quickCaptureDestination_}) {
+            if (field) field->setEnabled(!running && !cleanupRequired);
+        }
+        if (profiles_) profiles_->setEnabled(!running && !cleanupRequired);
+        if (saveProfile_) saveProfile_->setEnabled(!running && !cleanupRequired);
+        updateProfileActions();
+        updateScenarioButtons();
+        updateTargetInputs();
+        updatePositionInputs();
+        updateQuickOptions();
+        if (start_) start_->setEnabled(!running && !cleanupRequired);
+        if (stop_) stop_->setEnabled(running || cleanupRequired);
+#endif
+    }
     ~MainWindow() override {
         captureCountdownTimer_.stop();
         hideCaptureCountdown();
@@ -1207,12 +1471,69 @@ public:
 #endif
     }
 private:
-    void resizeEvent(QResizeEvent* event) override {
-        QMainWindow::resizeEvent(event);
-        if (!navigation_) return;
-        // Give the content priority at smaller desktop/window sizes.
-        const int navWidth = width() < 980 ? 144 : width() < 1240 ? 176 : 208;
-        if (navigation_->width() != navWidth) navigation_->setFixedWidth(navWidth);
+    void updateNavigationAppearance() {
+        if (!navigation_ || !navigationPanel_ || !navigationToggle_) return;
+        // IconMode centers the icons in a genuine narrow sidebar; ListMode
+        // restores the full labels, with the selected destination unchanged.
+        navigation_->setViewMode(navigationCollapsed_ ? QListView::IconMode : QListView::ListMode);
+        navigation_->setProperty("compact", navigationCollapsed_);
+        navigation_->setSpacing(navigationCollapsed_ ? 2 : 3);
+        navigation_->setMovement(QListView::Static);
+        navigation_->setFlow(QListView::TopToBottom);
+        navigation_->setWrapping(false);
+        navigation_->setResizeMode(QListView::Adjust);
+        navigation_->setGridSize(navigationCollapsed_ ? QSize(48, 52) : QSize());
+        navigation_->setIconSize(navigationCollapsed_ ? QSize(23, 23) : QSize(20, 20));
+        navigationPanel_->setMinimumWidth(navigationCollapsed_ ? 72 : 164);
+        navigationPanel_->setMaximumWidth(navigationCollapsed_ ? 72 : 350);
+        static const QStringList sectionNames = {
+            QStringLiteral("Auto Clicker"), QStringLiteral("Sequence"),
+            QStringLiteral("Settings")};
+        for (int i = 0; i < navigation_->count() && i < sectionNames.size(); ++i) {
+            navigation_->item(i)->setText(navigationCollapsed_ ? QString() : uiText(sectionNames[i]));
+            navigation_->item(i)->setToolTip(uiText(sectionNames[i]));
+            // A textless icon rail still needs meaningful screen-reader names.
+            navigation_->item(i)->setData(Qt::AccessibleTextRole, uiText(sectionNames[i]));
+            navigation_->item(i)->setTextAlignment(
+                navigationCollapsed_ ? Qt::Alignment(Qt::AlignCenter) :
+                Qt::Alignment(Qt::AlignVCenter | Qt::AlignLeft));
+        }
+        const QString title = navigationCollapsed_
+            ? (language_ == QStringLiteral("ru") ? QString::fromUtf8("Развернуть панель") :
+               QStringLiteral("Expand sidebar"))
+            : (language_ == QStringLiteral("ru") ? QString::fromUtf8("Свернуть панель") :
+               QStringLiteral("Collapse sidebar"));
+        navigationToggle_->setToolTip(title);
+        navigationToggle_->setAccessibleName(title);
+        navigationToggle_->setText(QString());
+        if (auto* heading = navigationPanel_->findChild<QLabel*>(
+                QStringLiteral("navigationHeading"))) {
+            heading->setText(language_ == QStringLiteral("ru") ?
+                QString::fromUtf8("РАЗДЕЛЫ") : QStringLiteral("WORKSPACES"));
+            heading->setVisible(!navigationCollapsed_);
+        }
+        navigationToggle_->setArrowType(navigationCollapsed_ ? Qt::RightArrow : Qt::LeftArrow);
+        navigationToggle_->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        // Re-evaluate the dynamic compact property when changing modes.
+        navigation_->style()->unpolish(navigation_);
+        navigation_->style()->polish(navigation_);
+    }
+
+    void setNavigationCollapsed(bool collapsed) {
+        if (!navigationSplitter_ || !navigationPanel_ || navigationCollapsed_ == collapsed) return;
+        if (!navigationCollapsed_ && navigationPanel_->width() >= 144)
+            navigationExpandedWidth_ = std::clamp(navigationPanel_->width(), 164, 350);
+        navigationCollapsed_ = collapsed;
+        updateNavigationAppearance();
+        const int sidebarWidth = collapsed ? 72 : navigationExpandedWidth_;
+        const int contentWidth = std::max(1, navigationSplitter_->width() -
+            navigationSplitter_->handleWidth() - sidebarWidth);
+        navigationSplitter_->setSizes({sidebarWidth, contentWidth});
+        if (!isSmokeMode()) {
+            QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            settings.setValue(QStringLiteral("ui/navigationCollapsed"), navigationCollapsed_);
+            settings.setValue(QStringLiteral("ui/navigationWidth"), navigationExpandedWidth_);
+        }
     }
 
     bool eventFilter(QObject* watched, QEvent* event) override {
@@ -1578,7 +1899,10 @@ private:
         stepStartAction_ = toolbar->addWidget(inputLab_->runControl());
         stepStopAction_ = toolbar->addWidget(inputLab_->stopControl());
         for (auto* button : {start_, stop_, inputLab_->runControl(), inputLab_->stopControl()}) {
-            button->setMinimumWidth(155);
+            // Preserve the complete Start/Stop captions without producing four
+            // giant buttons when the user expands the main window.
+            button->setMinimumWidth(132);
+            button->setMaximumWidth(320);
             button->setMinimumHeight(42);
         }
         // A single account-style icon opens both the scenario library and
@@ -1740,10 +2064,8 @@ private:
             for (int i = 0; i < source.size() && i < combo->count(); ++i)
                 combo->setItemText(i, uiText(source[i]));
         }
-        for (int i = 0; i < navigation_->count(); ++i) {
-            static const QStringList names = {"Auto Clicker", "Sequence", "Settings"};
-            if (i < names.size()) navigation_->item(i)->setText(uiText(names[i]));
-        }
+        // Retain icon-only mode when changing the language.
+        updateNavigationAppearance();
         if (clickConfigTabs_) {
             clickConfigTabs_->setTabText(0, uiText(QStringLiteral("Click Position")));
             clickConfigTabs_->setTabText(1, uiText(QStringLiteral("Target Window")));
@@ -1942,6 +2264,11 @@ private:
 #endif
     }
     void start() {
+        if (property("clicknova.uiaScanning").toBool() ||
+            property("clicknova.visualScanning").toBool()) {
+            setStatus(QStringLiteral("UIA inspection is active. Cancel inspection before starting."));
+            return;
+        }
         if (inputLab_ && inputLab_->isRunning()) {
             setStatus(QStringLiteral("Stop the sequence editor before starting another workflow."));
             return;
@@ -1950,6 +2277,14 @@ private:
             if (inputLab_) inputLab_->requestRun();
             return;
         }
+#ifdef _WIN32
+        // Quick runs through the headless service. Leave the old sequence
+        // compatibility branch intact for legacy sequence conversion only.
+        if (!legacyRunRequested_ && (!quickSequence_ || !quickSequence_->isChecked())) {
+            requestQuickStart();
+            return;
+        }
+#endif
 #ifndef _WIN32
 #ifdef CLICKNOVA_WITH_X11
         // Reuse the tested sequence engine and its mandatory global F12 stop.
@@ -2030,6 +2365,36 @@ private:
         if (!requestedDelay || *requestedDelay < 0) {
             setStatus(QStringLiteral("Invalid start delay."));
             return;
+        }
+        // Unlike an informational countdown, this confirmation explicitly
+        // tells the user not to touch input devices during the live test.
+        if (!isSmokeMode()) {
+            const bool ru = language_ == QStringLiteral("ru");
+            const QString title = ru ? QStringLiteral("Подтвердите запуск теста")
+                                     : QStringLiteral("Confirm test start");
+            const QString notice = ru
+                ? QStringLiteral("Сейчас начнётся тест ClickNova. Программа будет управлять "
+                    "мышью и клавиатурой.\n\nДо начала выполнения можно перейти в "
+                    "нужное приложение. После начала теста не пользуйтесь мышью, "
+                    "клавиатурой и не переключайте окна: действия могут попасть не туда.\n\nДля остановки "
+                    "используйте настроенную горячую клавишу Stop.")
+                : QStringLiteral("A ClickNova test is about to start. The app will "
+                    "control your mouse and keyboard.\n\nYou may switch to the target app "
+                    "before playback begins. Once the test is running, do not touch the mouse or keyboard "
+                    "or change the focused window. Unexpected input "
+                    "can send actions to the wrong place.\n\nUse the configured Stop "
+                    "hotkey to stop the test.");
+            QMessageBox dialog(QMessageBox::Warning, title, notice,
+                               QMessageBox::NoButton, this);
+            QPushButton* confirm = dialog.addButton(
+                ru ? QStringLiteral("Начать тест") : QStringLiteral("Start test"),
+                QMessageBox::AcceptRole);
+            QPushButton* cancel = dialog.addButton(
+                ru ? QStringLiteral("Отмена") : QStringLiteral("Cancel"),
+                QMessageBox::RejectRole);
+            dialog.setDefaultButton(cancel);
+            dialog.exec();
+            if (dialog.clickedButton() != confirm) return;
         }
         // Reserve Stop only for the running session. Idle shortcuts do not
         // steal keys from games, editors or other applications.
@@ -2328,6 +2693,13 @@ private:
         } else clickTimer_.start(interval_->value());
     }
     void stop() {
+#ifdef _WIN32
+        if (quickClickerService_ &&
+            (quickClickerService_->active() || quickClickerService_->needsCleanup())) {
+            quickClickerService_->stop();
+            return;
+        }
+#endif
         awakeQuickGuard_.setEnabled(false);
         if (inputLab_ && inputLab_->isRunning()) inputLab_->cancel();
         clickTimer_.stop();
@@ -2632,6 +3004,7 @@ private:
     void restoreAfterPointSelection() {
         if (hiddenForCapture_) {
             hiddenForCapture_ = false;
+            if (qmlPointCaptureActive_) return; // Headless legacy window: QML restores itself.
             if (wasMaximizedBeforeCapture_) showMaximized();
             else showNormal();
         }
@@ -2754,6 +3127,7 @@ private:
         restoreAfterPointSelection();
         if (hotkeys_) hotkeys_->setPicking(false);
         positionMode_->setEnabled(true);
+        qmlPointCaptureActive_ = false;
         start_->setEnabled(true);
         profiles_->setEnabled(true);
         saveProfile_->setEnabled(true);
@@ -3179,6 +3553,190 @@ private:
         saveLastSettings();
         return true;
     }
+    // Qt Quick library operations: the same QSettings and ScenarioStore as the
+    // classic editor. No prompts, paths or unverified data supplied by QML.
+public:
+    bool qmlLibraryExists(const QString& library, const QString& name) const {
+        if (!clicknova::storage::ScenarioStore::validName(name)) return false;
+        if (library == QStringLiteral("profile")) {
+            QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            settings.beginGroup(QStringLiteral("profiles"));
+            return settings.childGroups().contains(name);
+        }
+        if (library != QStringLiteral("auto") && library != QStringLiteral("sequence")) return false;
+        const ScenarioKind kind = library == QStringLiteral("auto")
+            ? ScenarioKind::AutoClicker : ScenarioKind::Sequence;
+        return scenarioStore_.names(kind).contains(name);
+    }
+
+    bool qmlSaveLibrary(const QString& library, const QString& name, bool overwrite) {
+        if (active_ || capturePending_ || !clicknova::storage::ScenarioStore::validName(name) ||
+            (inputLab_ && inputLab_->isRunning()) ||
+            (sequenceEditor_ && sequenceEditor_->hasUnsavedActionChanges())) return false;
+        if (qmlLibraryExists(library, name) && !overwrite) return false;
+        if (library == QStringLiteral("profile")) {
+            QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            settings.beginGroup(QStringLiteral("profiles"));
+            settings.beginGroup(name);
+            saveFields(settings, *this);
+            settings.endGroup();
+            settings.endGroup();
+            settings.sync();
+            if (settings.status() != QSettings::NoError) return false;
+            refreshProfiles(name);
+            setStatus(QStringLiteral("Saved profile: %1").arg(name));
+            return true;
+        }
+        if (library != QStringLiteral("auto") && library != QStringLiteral("sequence")) return false;
+        const ScenarioKind kind = library == QStringLiteral("auto")
+            ? ScenarioKind::AutoClicker : ScenarioKind::Sequence;
+        QString error;
+        if (!scenarioStore_.save(kind, name, scenarioValues(kind), &error)) return false;
+        refreshScenarios(kind, name);
+        setStatus(QStringLiteral("Scenario saved: %1").arg(name));
+        return true;
+    }
+
+    bool qmlLoadLibrary(const QString& library, const QString& name) {
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            (sequenceEditor_ && sequenceEditor_->hasUnsavedActionChanges()) ||
+            !qmlLibraryExists(library, name)) return false;
+        if (library == QStringLiteral("profile")) {
+            const int index = profiles_ ? profiles_->findText(name, Qt::MatchExactly) : -1;
+            if (index < 0) return false;
+            const int previous = profiles_->currentIndex();
+            profiles_->setCurrentIndex(index);
+            // The existing loader validates hotkeys before changing settings.
+            // Distinguish successful load from early rejection without assuming
+            // that a dialog return value reflects the model state.
+            lastStatusEnglish_ = QStringLiteral("QML profile load pending");
+            loadNamedProfile();
+            const bool success = lastStatusEnglish_ == QStringLiteral("Loaded profile: %1").arg(name);
+            if (!success) profiles_->setCurrentIndex(previous);
+            return success;
+        }
+        if (library != QStringLiteral("auto") && library != QStringLiteral("sequence")) return false;
+        const ScenarioKind kind = library == QStringLiteral("auto")
+            ? ScenarioKind::AutoClicker : ScenarioKind::Sequence;
+        QString error;
+        const auto values = scenarioStore_.load(kind, name, &error);
+        if (!values || !applyScenario(kind, *values, &error)) return false;
+        refreshScenarios(kind, name);
+        setStatus(QStringLiteral("Scenario loaded: %1").arg(name));
+        return true;
+    }
+
+    bool qmlDeleteLibrary(const QString& library, const QString& name) {
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            !qmlLibraryExists(library, name)) return false;
+        if (library == QStringLiteral("profile")) {
+            QSettings settings(QStringLiteral("ClickNova"), QStringLiteral("ClickNova"));
+            settings.remove(QStringLiteral("profiles/") + name);
+            settings.sync();
+            if (settings.status() != QSettings::NoError) return false;
+            refreshProfiles();
+            setStatus(QStringLiteral("Deleted profile: %1").arg(name));
+            return true;
+        }
+        if (library != QStringLiteral("auto") && library != QStringLiteral("sequence")) return false;
+        const ScenarioKind kind = library == QStringLiteral("auto")
+            ? ScenarioKind::AutoClicker : ScenarioKind::Sequence;
+        if (!scenarioStore_.remove(kind, name)) return false;
+        refreshScenarios(kind);
+        setStatus(QStringLiteral("Scenario deleted: %1").arg(name));
+        return true;
+    }
+private:
+
+    // Qt Quick target selection: authoritative native window table and
+    // mandatory foreground checks remain unchanged.
+public:
+    bool qmlSelectQuickTarget(const clicknova::platform::WindowTarget& target) {
+#ifdef _WIN32
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            !target.handle || !target.processId || target.title.empty() ||
+            target.process.empty() || !targetMode_ || !targetWindows_)
+            return false;
+        refreshWindowList();
+        for (int i = 0; i < static_cast<int>(availableWindows_.size()); ++i) {
+            const auto& candidate = availableWindows_[static_cast<std::size_t>(i)];
+            if (candidate.handle != target.handle || candidate.processId != target.processId ||
+                candidate.title != target.title || candidate.process != target.process ||
+                clicknova::platform::checkAccessibleTarget(candidate) != clicknova::platform::TargetCheck::Ready)
+                continue;
+            if (targetMode_->currentIndex() != 1) targetMode_->setCurrentIndex(1);
+            targetWindows_->setCurrentIndex(i);
+            // The existing QComboBox handler updates selectedTarget_ and
+            // invalidates captured move destinations if the HWND changed.
+            if (!selectedTarget_ || selectedTarget_->handle != candidate.handle ||
+                selectedTarget_->processId != candidate.processId) return false;
+            setStatus(QStringLiteral("Window selected. Focus it before starting clicks."));
+            return true;
+        }
+#else
+        (void)target;
+#endif
+        return false;
+    }
+    // Qt Quick capture facade. All coordinates are still acquired using
+    // the native cursor picker and validated against the selected target.
+public:
+    bool qmlBeginPointCapture(bool destination) {
+#ifdef _WIN32
+        if (active_ || capturePending_ || (inputLab_ && inputLab_->isRunning()) ||
+            !positionMode_ || !quickCaptureDestination_ ||
+            (destination && !quickCaptureDestination_->isEnabled())) return false;
+        if (!destination && positionMode_->currentIndex() != 1)
+            positionMode_->setCurrentIndex(1);
+        endpointCapture_ = destination;
+        qmlPointCaptureActive_ = true;
+        captureCursor();
+        if (capturePending_) return true;
+        qmlPointCaptureActive_ = false;
+        endpointCapture_ = false;
+#else
+        (void)destination;
+#endif
+        return false;
+    }
+    bool qmlCancelPointCapture() {
+#ifdef _WIN32
+        if (!qmlPointCaptureActive_ || !capturePending_) return false;
+        captureCountdownTimer_.stop();
+        hideCaptureCountdown();
+        capturePending_ = false;
+        endpointCapture_ = false;
+        ++captureToken_;
+        // Clear the hidden native window state without showing it.
+        restoreAfterPointSelection();
+        qmlPointCaptureActive_ = false;
+        if (hotkeys_) hotkeys_->setPicking(false);
+        positionMode_->setEnabled(true);
+        start_->setEnabled(true);
+        profiles_->setEnabled(true);
+        saveProfile_->setEnabled(true);
+        setShortcutEditorsEnabled(true);
+        updatePositionInputs();
+        updateProfileActions();
+        updateTargetInputs();
+        setStatus(QStringLiteral("Coordinate capture cancelled."));
+        return true;
+#else
+        return false;
+#endif
+    }
+    QVariantMap qmlPointCaptureState() const {
+#ifdef _WIN32
+        constexpr bool supported = true;
+#else
+        constexpr bool supported = false;
+#endif
+        return {{QStringLiteral("supported"), supported},
+                {QStringLiteral("active"), qmlPointCaptureActive_ && capturePending_},
+                {QStringLiteral("remaining"), qmlPointCaptureActive_ ? captureRemaining_ : 0},
+                {QStringLiteral("destination"), qmlPointCaptureActive_ && endpointCapture_}};
+    }
+private:
     void saveScenario(ScenarioKind kind) {
         if (active_ || capturePending_) return;
         if (kind == ScenarioKind::Sequence && sequenceEditor_->hasUnsavedActionChanges()) {
@@ -3463,8 +4021,7 @@ private:
             if (!valid) {
                 settings.endGroup();
                 settings.endGroup();
-                QMessageBox::warning(this, uiText(QStringLiteral("Profiles")),
-                    uiText(QStringLiteral("Profile shortcut unavailable. No settings were changed.")));
+                setStatus(QStringLiteral("Profile shortcut unavailable. No settings were changed."));
                 return;
             }
             const QSignalBlocker a(enableStartShortcut_);
@@ -3522,6 +4079,11 @@ private:
     QString savedWindowTitle_;
     QComboBox* languageSelector_{nullptr};
     QListWidget* navigation_{nullptr};
+    QSplitter* navigationSplitter_{nullptr};
+    QWidget* navigationPanel_{nullptr};
+    QToolButton* navigationToggle_{nullptr};
+    int navigationExpandedWidth_{176};
+    bool navigationCollapsed_{false};
     InputLabWidget* inputLab_{nullptr};
     bool legacyRunRequested_{false};
     QStackedWidget* pages_{nullptr};
@@ -3546,6 +4108,7 @@ private:
     QPushButton* quickCaptureDestination_{nullptr};
     bool destinationConfigured_{false};
     bool endpointCapture_{false};
+    bool qmlPointCaptureActive_{false};
     QSpinBox* interval_{nullptr};
     QSpinBox* quickHoldDuration_{nullptr};
     QSpinBox* count_{nullptr};
@@ -3665,11 +4228,76 @@ private:
     MousePointPicker mousePicker_;
     std::unique_ptr<Hotkeys> hotkeys_;
 #endif
+    // Destroy service before native hotkeys; its destructor may release Stop.
+    std::unique_ptr<clicknova::gui::QuickClickerService> quickClickerService_;
 };
 
 } // namespace
 
+// Typed functions for the Qt Quick bridge. A MainWindow pointer is only
+// accepted when it is the actual model-owned native compatibility window.
+bool clicknovaQmlLibraryExists(QMainWindow* window, const QString& kind, const QString& name) {
+    const auto* model = dynamic_cast<const MainWindow*>(window);
+    return model && model->qmlLibraryExists(kind, name);
+}
+bool clicknovaQmlSaveLibrary(QMainWindow* window, const QString& kind, const QString& name, bool overwrite) {
+    auto* model = dynamic_cast<MainWindow*>(window);
+    return model && model->qmlSaveLibrary(kind, name, overwrite);
+}
+bool clicknovaQmlLoadLibrary(QMainWindow* window, const QString& kind, const QString& name) {
+    auto* model = dynamic_cast<MainWindow*>(window);
+    return model && model->qmlLoadLibrary(kind, name);
+}
+bool clicknovaQmlDeleteLibrary(QMainWindow* window, const QString& kind, const QString& name) {
+    auto* model = dynamic_cast<MainWindow*>(window);
+    return model && model->qmlDeleteLibrary(kind, name);
+}
+
+bool clicknovaQmlSelectQuickTarget(QMainWindow* window,
+                                    const clicknova::platform::WindowTarget& target) {
+    auto* model = dynamic_cast<MainWindow*>(window);
+    return model && model->qmlSelectQuickTarget(target);
+}
+
+bool clicknovaQmlBeginPointCapture(QMainWindow* window, bool destination) {
+    auto* native = dynamic_cast<MainWindow*>(window);
+    return native && native->qmlBeginPointCapture(destination);
+}
+bool clicknovaQmlCancelPointCapture(QMainWindow* window) {
+    auto* native = dynamic_cast<MainWindow*>(window);
+    return native && native->qmlCancelPointCapture();
+}
+QVariantMap clicknovaQmlPointCaptureState(QMainWindow* window) {
+    auto* native = dynamic_cast<MainWindow*>(window);
+    return native ? native->qmlPointCaptureState()
+                  : QVariantMap{{QStringLiteral("active"), false}};
+}
+
 QMainWindow* createClickNovaMainWindow() { return new MainWindow(); }
+clicknova::gui::QuickClickerService* clicknovaQuickClicker(QMainWindow* window) {
+    auto* main = dynamic_cast<MainWindow*>(window);
+    return main ? main->quickService() : nullptr;
+}
+bool clicknovaStartQuick(QMainWindow* window) {
+    auto* main = dynamic_cast<MainWindow*>(window);
+    return main && main->requestQuickStart();
+}
+bool clicknovaStopQuick(QMainWindow* window) {
+    auto* main = dynamic_cast<MainWindow*>(window);
+    return main && main->requestQuickStop();
+}
+bool clicknovaStartQuickWithOptions(QMainWindow* window, const QVariantMap& options) {
+    auto* main = dynamic_cast<MainWindow*>(window);
+    return main && main->requestQuickStartFromQml(options);
+}
+bool clicknovaQuickDestinationReady(const QMainWindow* window) {
+    auto* main = dynamic_cast<const MainWindow*>(window);
+    return main && main->quickDestinationReady();
+}
+bool clicknovaQuickMarkDestination(QMainWindow* window) {
+    auto* main = dynamic_cast<MainWindow*>(window);
+    return main && main->markQuickDestination();
+}
 bool clicknovaShortcutSmoke() {
 #ifdef _WIN32
     {

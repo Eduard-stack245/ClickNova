@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "window_chooser.hpp"
 #include "ui_icons.hpp"
 #include "ui_translation.hpp"
@@ -28,6 +28,8 @@ std::optional<clicknova::platform::WindowTarget> chooseTargetWindow(
     auto* search = new QLineEdit(&dialog);
     search->setObjectName(QStringLiteral("windowSearch"));
     search->setPlaceholderText(tr(QStringLiteral("Search by window name or PID...")));
+    search->setClearButtonEnabled(true);
+    search->setMinimumHeight(42);
     column->addWidget(search);
     auto* list = new QListWidget(&dialog);
     list->setObjectName(QStringLiteral("windowSearchResults"));
@@ -52,6 +54,10 @@ std::optional<clicknova::platform::WindowTarget> chooseTargetWindow(
     clicknova::gui::setButtonIcon(refresh, clicknova::gui::Icon::Refresh);
     clicknova::gui::setButtonIcon(cancel, clicknova::gui::Icon::Close);
     clicknova::gui::setButtonIcon(confirm, clicknova::gui::Icon::Window, QColor(QStringLiteral("#ffffff")));
+    for (auto* command : {refresh, cancel, confirm}) {
+        command->setMinimumHeight(40);
+        command->setMaximumWidth(235);
+    }
     row->addWidget(refresh);
     row->addStretch();
     row->addWidget(cancel);

@@ -1,5 +1,5 @@
 @echo off
-REM SPDX-License-Identifier: Apache-2.0
+REM SPDX-License-Identifier: MIT
 setlocal
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0uninstall-clicknova.ps1"
 if errorlevel 1 (

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # Package application source only; never include documentation, settings, or generated output.
 param([string]$OutputPath = '')
 $ErrorActionPreference = 'Stop'
@@ -50,6 +50,7 @@ try {
     # The release recipe and AppImage desktop assets are required to create
     # ready-to-run downloads from the source ZIP via GitHub Actions.
     foreach ($item in @('.github/workflows/portable-releases.yml',
+                        '.github/workflows/widgets-windows.yml',
                         'packaging/clicknova.desktop', 'packaging/clicknova.svg')) {
         $from = Join-Path $root $item
         if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { throw "Missing portable release asset: $item" }
@@ -79,6 +80,7 @@ try {
                              'src/platform/x11/x11_input_backend.cpp', 'include/clicknova/x11_input_backend.hpp',
                              'tests/x11_input_tests.cpp',
                              '.github/workflows/portable-releases.yml',
+                             '.github/workflows/widgets-windows.yml',
                              'packaging/clicknova.desktop', 'packaging/clicknova.svg',
                              'scripts/package-appimage-linux.sh',
                              'scripts/package-appimage-bundle-linux.py',
@@ -87,7 +89,7 @@ try {
         }
         $invalid = @($entries | Where-Object {
             ($_ -match '(^|/)(\.git|\.github|build[^/]*|dist[^/]*|scenarios|user-data|profiles|autosave[^/]*)/' -and
-             $_ -ne '.github/workflows/portable-releases.yml') -or
+             $_ -notin @('.github/workflows/portable-releases.yml', '.github/workflows/widgets-windows.yml')) -or
             $_ -match '(?i)(^|/)(README|CHANGELOG|CONTRIBUTING|RELEASE_NOTES)\.md$' -or
             ($_ -match '(?i)\.(json|log|exe|dll|obj|pdb|zip|bak|tmp)$' -and
              $_ -notmatch '^extensions/(chromium|firefox)/manifest[.]json$')

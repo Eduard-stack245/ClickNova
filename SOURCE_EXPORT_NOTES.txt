@@ -1,0 +1,9 @@
+﻿ClickNova source export for native C++/Qt/QML integration
+Created: 
+2026-11-18 00:50:01 +01:00
+Exported files: 
+320
+Omitted deliberately: .git, build*, dist*, user data, old patch trees,
+secrets and common binary/credential extensions.
+Review the archive for any project-specific confidential data before sharing.
+Original project was NOT modified.

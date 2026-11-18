@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/start_delay.hpp"
 #include <cstdint>
 #include <iostream>

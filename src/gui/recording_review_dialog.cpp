@@ -1,6 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "recording_review_dialog.hpp"
 #include "ui_icons.hpp"
+#include "wrap_layout.hpp"
 #include "clicknova/recording_review.hpp"
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -65,7 +66,7 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     table_->setColumnWidth(2, 215);
     table_->setMinimumHeight(180);
     layout->addWidget(table_, 1);
-    auto* tools = new QHBoxLayout;
+    auto* tools = new WrapLayout(nullptr, 7);
     edit_ = new QPushButton(text("Edit selected", "Изменить выбранное"));
     edit_->setObjectName(QStringLiteral("reviewEdit"));
     edit_->setProperty("actionRole", QStringLiteral("primary"));
@@ -83,7 +84,11 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     clicknova::gui::setButtonIcon(remove_, clicknova::gui::Icon::Delete, QColor(QStringLiteral("#ffcbd2")));
     clicknova::gui::setButtonIcon(up_, clicknova::gui::Icon::Up);
     clicknova::gui::setButtonIcon(down_, clicknova::gui::Icon::Down);
-    for (auto* button : {edit_, remove_, up_, down_}) tools->addWidget(button);
+    for (auto* button : {edit_, remove_, up_, down_}) {
+        button->setMaximumWidth(195);
+        button->setMinimumHeight(38);
+        tools->addWidget(button);
+    }
     layout->addLayout(tools);
     feedback_ = new QLabel;
     feedback_->setObjectName(QStringLiteral("reviewFeedback"));
@@ -96,7 +101,7 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     save_->setToolTip(text("Unchecked: no separate named scenario is created. The current editor still autosaves its draft locally.",
                                "Если выключено, именованный сценарий не создаётся. Черновик текущего редактора всё равно автосохраняется локально."));
     layout->addWidget(save_);
-    auto* buttons = new QHBoxLayout;
+    auto* buttons = new WrapLayout(nullptr, 8);
     replace_ = new QPushButton(text("Replace current actions", "Заменить текущие действия"));
     replace_->setObjectName(QStringLiteral("reviewReplace"));
     replace_->setProperty("actionRole", QStringLiteral("primary"));
@@ -116,7 +121,8 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     clicknova::gui::setButtonIcon(append_, clicknova::gui::Icon::List, QColor(QStringLiteral("#d8fff1")));
     clicknova::gui::setButtonIcon(cancel, clicknova::gui::Icon::Close);
     for (auto* button : {replace_, append_, cancel}) {
-        button->setMinimumHeight(36);
+        button->setMinimumHeight(38);
+        button->setMaximumWidth(275);
         buttons->addWidget(button);
     }
     layout->addLayout(buttons);

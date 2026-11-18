@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // Read-only X11 window discovery/geometry, plus explicit EWMH activation.
 // Does NOT synthesize input. Wayland/native portals require separate backends.
 #include "clicknova/window_target.hpp"

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "scenario_store.hpp"
 #include <QDir>
 #include <QFile>

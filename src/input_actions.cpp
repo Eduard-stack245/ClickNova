@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/input_actions.hpp"
 
 #include <algorithm>
@@ -303,6 +303,34 @@ std::string validate(const Plan& plan) {
     return {};
 }
 
+std::string validatePlaybackCursor(const Plan& plan, PlaybackCursor cursor) {
+    const auto error = validate(plan);
+    if (!error.empty()) return error;
+    if (cursor.passNumber < 1 || cursor.passNumber > plan.repetitions ||
+        cursor.stepIndex >= plan.actions.size())
+        return "Invalid original step or pass for continuation.";
+    // No mid-sequence entry while any key/button is held. A subsequent
+    // release would be sent without the matching press in this playback.
+    std::set<Held> held;
+    for (std::size_t i = 0; i < cursor.stepIndex; ++i) {
+        std::visit([&](const auto& a) {
+            using T = std::decay_t<decltype(a)>;
+            if constexpr (std::is_same_v<T, KeyDown>) {
+                held.insert(keyHeld(a.virtualKey));
+            } else if constexpr (std::is_same_v<T, KeyUp>) {
+                held.erase(keyHeld(a.virtualKey));
+            } else if constexpr (std::is_same_v<T, ButtonDown>) {
+                held.insert(buttonHeld(a.button));
+            } else if constexpr (std::is_same_v<T, ButtonUp>) {
+                held.erase(buttonHeld(a.button));
+            }
+        }, plan.actions[i]);
+    }
+    if (!held.empty())
+        return "Cannot continue inside an unfinished held key/button sequence.";
+    return {};
+}
+
 namespace {
 std::uint64_t saturatedAdd(std::uint64_t a, std::uint64_t b) {
     return a > std::numeric_limits<std::uint64_t>::max() - b
@@ -405,17 +433,17 @@ bool SteadyWaiter::wait(std::int64_t milliseconds, std::stop_token stop) {
 }
 
 Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
-            std::stop_token stop, ProgressCallback onProgress) {
+            std::stop_token stop, ProgressCallback onProgress, PlaybackCursor cursor) {
     Result result;
-    result.message = validate(plan);
+    result.message = validatePlaybackCursor(plan, cursor);
     if (!result.message.empty()) return result;
     // A leading WaitVisible step with an explicit enforced window is allowed
     // to acquire the scenario target later. Other unbound scenarios still fail.
     const bool deferredTarget = !plan.stepWindows.empty() &&
-        plan.stepWindows[0].enforce && !plan.stepWindows[0].title.empty() &&
-        !plan.actions.empty() &&
-        (std::get_if<ElementTask>(&plan.actions[0]) &&
-         std::get<ElementTask>(plan.actions[0]).command == ElementCommand::WaitVisible);
+        plan.stepWindows[cursor.stepIndex].enforce &&
+        !plan.stepWindows[cursor.stepIndex].title.empty() &&
+        (std::get_if<ElementTask>(&plan.actions[cursor.stepIndex]) &&
+         std::get<ElementTask>(plan.actions[cursor.stepIndex]).command == ElementCommand::WaitVisible);
     if (plan.requireTargetWindow && !backend.boundToWindow() && !deferredTarget) {
         result.message = "The saved scenario requires selecting its window again.";
         return result;
@@ -453,8 +481,9 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
         return result;
     };
     result.status = Status::Completed;
-    for (int rep = 0; rep < plan.repetitions; ++rep) {
-        if (rep > 0) {
+    for (int rep = cursor.passNumber - 1; rep < plan.repetitions; ++rep) {
+        // The first resumed pass has already started: never repeat its delay.
+        if (rep > cursor.passNumber - 1) {
             if (onProgress) onProgress(PlaybackProgress{
                 PlaybackProgress::Kind::WaitingForPass, 0, rep + 1,
                 plan.passDelayMs, std::chrono::steady_clock::now()});
@@ -464,11 +493,26 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                 return finalize();
             }
         }
-        for (std::size_t actionIndex = 0; actionIndex < plan.actions.size(); ++actionIndex) {
+        for (std::size_t actionIndex =
+                 rep == cursor.passNumber - 1 ? cursor.stepIndex : 0;
+             actionIndex < plan.actions.size(); ++actionIndex) {
             if (stop.stop_requested()) {
                 result.status = Status::Cancelled;
                 return finalize();
             }
+            const auto actionStartedAt = std::chrono::steady_clock::now();
+            if (onProgress) onProgress(PlaybackProgress{
+                PlaybackProgress::Kind::ActionStarted, actionIndex, rep + 1,
+                0, actionStartedAt});
+            const auto elapsedMs = [&] {
+                return std::max<std::int64_t>(0,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - actionStartedAt).count());
+            };
+            const auto notifyOutcome = [&](PlaybackProgress::Kind kind) {
+                if (onProgress) onProgress(PlaybackProgress{
+                    kind, actionIndex, rep + 1, 0, actionStartedAt, elapsedMs()});
+            };
             const auto& action = plan.actions[actionIndex];
             const StepWindow binding = plan.stepWindows.empty() ? StepWindow{} : plan.stepWindows[actionIndex];
             const auto* task = std::get_if<ElementTask>(&action);
@@ -481,11 +525,9 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                 result.status = stop.stop_requested() ? Status::Cancelled : Status::DispatchFailed;
                 result.message = stop.stop_requested() ? "Playback cancelled." :
                     "Required step window not found, not foreground, or activation denied.";
+                notifyOutcome(PlaybackProgress::Kind::ActionFailed);
                 return finalize();
             }
-            if (onProgress) onProgress(PlaybackProgress{
-                PlaybackProgress::Kind::ActionStarted, actionIndex, rep + 1,
-                0, std::chrono::steady_clock::now()});
             bool okay = std::visit([&](const auto& a) {
                 using T = std::decay_t<decltype(a)>;
                 if constexpr (std::is_same_v<T, Click>) {
@@ -670,8 +712,10 @@ Result play(const Plan& plan, IBackend& backend, IWaiter& waiter,
                      "Element operation failed: target absent, ambiguous, inaccessible or unsupported by its provider." :
                      (std::holds_alternative<RunScript>(action) ?
                          "Local PowerShell step failed or PowerShell was not available." : "Input dispatch failed."));
+                notifyOutcome(PlaybackProgress::Kind::ActionFailed);
                 return finalize();
             }
+            notifyOutcome(PlaybackProgress::Kind::ActionCompleted);
             if (const auto* completedTask = std::get_if<ElementTask>(&action)) {
                 switch (completedTask->command) {
                 case ElementCommand::DoubleActivate: result.eventsSent += 2; break;

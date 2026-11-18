@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "optional_components.hpp"
 #include "portable_storage.hpp"
 #include <QApplication>

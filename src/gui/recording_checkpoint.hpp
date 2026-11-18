@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_recording.hpp"
 #include <QString>
 #include <QDateTime>
 #include <cstdint>
 #include <vector>
+#include <optional>
 
 namespace clicknova::gui::recording_checkpoint {
 struct Snapshot {
@@ -22,6 +23,9 @@ bool save(const QString& path, const QDateTime& created,
           const std::vector<recording::Sample>& samples,
           std::uint64_t durationMs, QString* error = nullptr);
 bool load(const QString& path, Snapshot& snapshot, QString* error = nullptr);
+// Restrict QML and tests to known checkpoint basenames within the recovery root.
+bool loadNamed(const QString& fileName, Snapshot& snapshot,
+               const QString& baseDirectory = {}, QString* error = nullptr);
 std::vector<Snapshot> list(const QString& baseDirectory = {});
 bool remove(const QString& path);
 }

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.20)
 project(ClickNova VERSION 0.6.0 LANGUAGES CXX)
 
@@ -14,7 +14,7 @@ if(MSVC)
   add_compile_options(/utf-8)
 endif()
 
-add_library(clicknova_core STATIC src/core.cpp src/window_guard.cpp src/sequence.cpp src/sequence_preview.cpp src/sequence_conversion.cpp src/sequence_to_input.cpp src/input_actions.cpp src/quick_motion.cpp src/input_recording.cpp src/recording_review.cpp)
+add_library(clicknova_core STATIC src/core.cpp src/window_guard.cpp src/sequence.cpp src/sequence_preview.cpp src/sequence_conversion.cpp src/sequence_to_input.cpp src/input_actions.cpp src/step_timing.cpp src/quick_motion.cpp src/quick_clicker_policy.cpp src/input_recording.cpp src/recording_review.cpp)
 target_include_directories(clicknova_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(clicknova_core PUBLIC cxx_std_20)
 if(MSVC)
@@ -88,6 +88,8 @@ if(WIN32)
   endif()
 endif()
 
+option(CLICKNOVA_BUILD_GUI "Build classic Qt 6 Widgets desktop application" OFF)
+
 include(CTest)
 if(BUILD_TESTING)
   if(UNIX)
@@ -103,6 +105,35 @@ if(BUILD_TESTING)
       endif()
     endif()
   endif()
+  # Pure QML/JS navigation and destructive-action contracts also run on
+  # Windows when Python is installed, without launching native input hooks.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  # Qt-free test of one-checkpoint, all-or-nothing native QML inspector edits.
+  # Runs in both GUI and headless builds; no OS input is ever injected.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME widgets_only_application_contract
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_widgets_only.py)
+  endif()
+  add_executable(clicknova_native_edit_transaction_tests
+    tests/native_edit_transaction_tests.cpp
+    src/gui/qml/action_workspace.cpp
+    src/gui/qml/action_edit_service.cpp
+    src/gui/qml/action_batch_service.cpp)
+  target_include_directories(clicknova_native_edit_transaction_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(clicknova_native_edit_transaction_tests PRIVATE clicknova_core)
+  add_test(NAME native_edit_transaction_tests COMMAND clicknova_native_edit_transaction_tests)
+  # The whole-document revision includes every input action variant and all
+  # persisted window/element bindings. It performs no OS input or Qt calls.
+  add_executable(clicknova_action_revision_tests tests/action_revision_tests.cpp)
+  target_include_directories(clicknova_action_revision_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(clicknova_action_revision_tests PRIVATE clicknova_core)
+  add_test(NAME action_revision_tests COMMAND clicknova_action_revision_tests)
+  # Stale row/window confirmations use the same Qt-free revision policy;
+  # neither test can access Win32 hooks, mouse input or Qt Widgets.
+  add_executable(clicknova_action_revision_guard_tests tests/action_revision_guard_tests.cpp)
+  target_include_directories(clicknova_action_revision_guard_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(clicknova_action_revision_guard_tests PRIVATE clicknova_core)
+  add_test(NAME action_revision_guard_tests COMMAND clicknova_action_revision_guard_tests)
   add_executable(clicknova_core_tests tests/core_tests.cpp)
   target_link_libraries(clicknova_core_tests PRIVATE clicknova_core)
   add_test(NAME core_tests COMMAND clicknova_core_tests)
@@ -188,9 +219,190 @@ if(BUILD_TESTING)
   target_link_libraries(clicknova_action_list_edit_tests PRIVATE clicknova_core)
   add_test(NAME action_list_edit_tests COMMAND clicknova_action_list_edit_tests)
   add_test(NAME input_actions_tests COMMAND clicknova_input_actions_tests)
+  add_executable(clicknova_playback_resume_tests tests/playback_resume_tests.cpp)
+  target_link_libraries(clicknova_playback_resume_tests PRIVATE clicknova_core)
+  add_test(NAME playback_resume_tests COMMAND clicknova_playback_resume_tests)
+  add_executable(clicknova_execution_report_tests tests/execution_report_tests.cpp)
+  target_link_libraries(clicknova_execution_report_tests PRIVATE clicknova_core)
+  add_test(NAME execution_report_tests COMMAND clicknova_execution_report_tests)
+add_executable(clicknova_step_timing_tests tests/step_timing_tests.cpp)
+target_link_libraries(clicknova_step_timing_tests PRIVATE clicknova_core)
+add_test(NAME step_timing_tests COMMAND clicknova_step_timing_tests)
   add_executable(clicknova_quick_motion_tests tests/quick_motion_tests.cpp)
   target_link_libraries(clicknova_quick_motion_tests PRIVATE clicknova_core)
   add_test(NAME quick_motion_tests COMMAND clicknova_quick_motion_tests)
+  add_executable(clicknova_quick_clicker_policy_tests tests/quick_clicker_policy_tests.cpp)
+  target_link_libraries(clicknova_quick_clicker_policy_tests PRIVATE clicknova_core)
+  add_test(NAME quick_clicker_policy_tests COMMAND clicknova_quick_clicker_policy_tests)
+  add_executable(clicknova_quick_config_draft_tests tests/quick_config_draft_tests.cpp)
+  target_include_directories(clicknova_quick_config_draft_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME quick_config_draft_tests COMMAND clicknova_quick_config_draft_tests)
+  add_executable(clicknova_qml_accessibility_inspection_policy_tests
+    tests/qml_accessibility_inspection_policy_tests.cpp)
+  target_include_directories(clicknova_qml_accessibility_inspection_policy_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_accessibility_inspection_policy_tests
+    COMMAND clicknova_qml_accessibility_inspection_policy_tests)
+
+  add_executable(clicknova_qml_visual_tools_policy_tests
+    tests/qml_visual_tools_policy_tests.cpp)
+  target_include_directories(clicknova_qml_visual_tools_policy_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_visual_tools_policy_tests
+    COMMAND clicknova_qml_visual_tools_policy_tests)
+
+  add_executable(clicknova_qml_visual_worker_protocol_tests
+    tests/qml_visual_worker_protocol_tests.cpp)
+  target_include_directories(clicknova_qml_visual_worker_protocol_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_visual_worker_protocol_tests
+    COMMAND clicknova_qml_visual_worker_protocol_tests)
+  add_executable(clicknova_qml_accessibility_discovery_policy_tests
+    tests/qml_accessibility_discovery_policy_tests.cpp)
+  target_include_directories(clicknova_qml_accessibility_discovery_policy_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_accessibility_discovery_policy_tests
+    COMMAND clicknova_qml_accessibility_discovery_policy_tests)
+  add_executable(clicknova_qml_element_candidate_policy_tests
+    tests/qml_element_candidate_policy_tests.cpp)
+  target_include_directories(clicknova_qml_element_candidate_policy_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_element_candidate_policy_tests
+    COMMAND clicknova_qml_element_candidate_policy_tests)
+  add_executable(clicknova_qml_verified_uia_binding_tests
+    tests/qml_verified_uia_binding_tests.cpp)
+  target_include_directories(clicknova_qml_verified_uia_binding_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_verified_uia_binding_tests
+    COMMAND clicknova_qml_verified_uia_binding_tests)
+  add_executable(clicknova_qml_verified_uia_workspace_tests
+    tests/qml_verified_uia_workspace_tests.cpp
+    src/gui/qml/action_workspace.cpp src/gui/qml/action_edit_service.cpp
+    src/gui/qml/action_batch_service.cpp)
+  target_include_directories(clicknova_qml_verified_uia_workspace_tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(clicknova_qml_verified_uia_workspace_tests PRIVATE clicknova_core)
+  add_test(NAME qml_verified_uia_workspace_tests
+    COMMAND clicknova_qml_verified_uia_workspace_tests)
+
+  add_executable(clicknova_qml_uia_verify_snapshot_tests
+    tests/qml_uia_verify_snapshot_tests.cpp)
+  target_include_directories(clicknova_qml_uia_verify_snapshot_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_uia_verify_snapshot_tests
+    COMMAND clicknova_qml_uia_verify_snapshot_tests)
+
+  add_executable(clicknova_qml_uia_worker_protocol_tests
+    tests/qml_uia_worker_protocol_tests.cpp)
+  target_include_directories(clicknova_qml_uia_worker_protocol_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_uia_worker_protocol_tests
+    COMMAND clicknova_qml_uia_worker_protocol_tests)
+
+  if(CLICKNOVA_BUILD_GUI)
+    # Pure Qt Core process fixture: no COM/UIA or external application needed.
+    add_executable(clicknova_qml_uia_isolated_transport_tests
+      tests/qml_uia_isolated_transport_tests.cpp
+      src/gui/qml/uia_isolated_transport.cpp)
+    target_include_directories(clicknova_qml_uia_isolated_transport_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_uia_isolated_transport_tests PRIVATE Qt6::Core)
+    add_test(NAME qml_uia_isolated_transport_tests
+      COMMAND clicknova_qml_uia_isolated_transport_tests)
+    set_tests_properties(qml_uia_isolated_transport_tests PROPERTIES TIMEOUT 45)
+
+  endif()
+
+  # Pure C++20 tests: can run without COM, Qt runtime, input hooks or Windows.
+  add_executable(clicknova_qml_msaa_worker_policy_tests
+    tests/qml_msaa_worker_policy_tests.cpp)
+  target_include_directories(clicknova_qml_msaa_worker_policy_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_msaa_worker_policy_tests
+    COMMAND clicknova_qml_msaa_worker_policy_tests)
+
+  add_executable(clicknova_qml_java_preview_policy_tests
+    tests/qml_java_preview_policy_tests.cpp)
+  target_include_directories(clicknova_qml_java_preview_policy_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_java_preview_policy_tests
+    COMMAND clicknova_qml_java_preview_policy_tests)
+
+  add_executable(clicknova_qml_java_worker_protocol_tests
+    tests/qml_java_worker_protocol_tests.cpp)
+  target_include_directories(clicknova_qml_java_worker_protocol_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qml_java_worker_protocol_tests
+    COMMAND clicknova_qml_java_worker_protocol_tests)
+
+  # End-to-end real worker process + UIA COM fixture. Opt-in only, never
+  # misreport a headless Windows service session as a passing live UIA test.
+  if(WIN32 AND CLICKNOVA_BUILD_GUI AND CLICKNOVA_UIA_INTERACTIVE_TESTS)
+    add_executable(clicknova_qml_uia_worker_e2e_tests
+      tests/qml_uia_worker_e2e_tests.cpp
+      src/gui/qml/uia_isolated_transport.cpp)
+    target_include_directories(clicknova_qml_uia_worker_e2e_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_uia_worker_e2e_tests PRIVATE
+      Qt6::Core user32)
+    add_dependencies(clicknova_qml_uia_worker_e2e_tests ClickNova)
+    add_test(NAME qml_uia_worker_e2e_tests
+      COMMAND clicknova_qml_uia_worker_e2e_tests $<TARGET_FILE:ClickNova>)
+    set_tests_properties(qml_uia_worker_e2e_tests PROPERTIES
+      TIMEOUT 65 SKIP_RETURN_CODE 77 LABELS "interactive;windows;uia;worker")
+  endif()
+
+  # The MSAA fixture is opt-in and requires a real interactive Windows desktop.
+  # It launches the actual ClickNova.exe child. A headless skip is not a pass.
+  if(WIN32 AND CLICKNOVA_BUILD_GUI AND CLICKNOVA_MSAA_INTERACTIVE_TESTS)
+    add_executable(clicknova_qml_msaa_worker_e2e_tests
+      tests/qml_msaa_worker_e2e_tests.cpp
+      src/gui/qml/uia_isolated_transport.cpp)
+    target_include_directories(clicknova_qml_msaa_worker_e2e_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_msaa_worker_e2e_tests PRIVATE Qt6::Core user32)
+    add_dependencies(clicknova_qml_msaa_worker_e2e_tests ClickNova)
+    add_test(NAME qml_msaa_worker_e2e_tests
+      COMMAND clicknova_qml_msaa_worker_e2e_tests $<TARGET_FILE:ClickNova>)
+    set_tests_properties(qml_msaa_worker_e2e_tests PROPERTIES
+      TIMEOUT 65 SKIP_RETURN_CODE 77 LABELS "interactive;windows;msaa;worker")
+  endif()
+
+  option(CLICKNOVA_JAVA_INTERACTIVE_TESTS
+    "Run interactive Java Access Bridge process fixture (requires JAVA_HOME)" OFF)
+  if(WIN32 AND CLICKNOVA_BUILD_GUI AND CLICKNOVA_JAVA_INTERACTIVE_TESTS)
+    add_executable(clicknova_qml_java_worker_e2e_tests
+      tests/qml_java_worker_e2e_tests.cpp
+      src/gui/qml/uia_isolated_transport.cpp)
+    target_include_directories(clicknova_qml_java_worker_e2e_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_java_worker_e2e_tests PRIVATE
+      Qt6::Core user32)
+    add_dependencies(clicknova_qml_java_worker_e2e_tests ClickNova)
+    add_test(NAME qml_java_worker_e2e_tests
+      COMMAND clicknova_qml_java_worker_e2e_tests $<TARGET_FILE:ClickNova>
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ClickNovaJavaPreviewFixture.java)
+    set_tests_properties(qml_java_worker_e2e_tests PROPERTIES
+      TIMEOUT 90 SKIP_RETURN_CODE 77 LABELS "interactive;windows;java;worker")
+  endif()
+
+  # Real Windows UIA integration fixture: opt in only on an interactive
+  # desktop. CTest runs it in a separate OS process with a hard test timeout.
+  # This is NOT a hard timeout for production COM operations.
+  option(CLICKNOVA_UIA_INTERACTIVE_TESTS "Enable live Windows UIA fixture tests" OFF)
+  if(WIN32 AND CLICKNOVA_BUILD_GUI AND CLICKNOVA_UIA_INTERACTIVE_TESTS)
+    add_executable(clicknova_qml_uia_windows_integration_tests
+      tests/qml_uia_windows_integration_tests.cpp
+      src/gui/qml/element_candidate_win32.cpp)
+    target_include_directories(clicknova_qml_uia_windows_integration_tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_uia_windows_integration_tests PRIVATE
+      user32 ole32 oleaut32 uiautomationcore)
+    add_test(NAME qml_uia_windows_integration_tests
+      COMMAND clicknova_qml_uia_windows_integration_tests)
+    set_tests_properties(qml_uia_windows_integration_tests PROPERTIES
+      TIMEOUT 45 SKIP_RETURN_CODE 77 LABELS "interactive;windows;uia")
+  endif()
   add_executable(clicknova_duration_expression_tests tests/duration_expression_tests.cpp)
   target_include_directories(clicknova_duration_expression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME duration_expression_tests COMMAND clicknova_duration_expression_tests)
@@ -213,7 +425,6 @@ if(BUILD_TESTING)
 endif()
 
 # Optional native Qt application. The reusable C++20 core stays Qt-free.
-option(CLICKNOVA_BUILD_GUI "Build the Qt 6 Widgets desktop app" OFF)
 if(CLICKNOVA_BUILD_GUI)
   find_package(Qt6 6.12 REQUIRED COMPONENTS Widgets Network)
   qt_standard_project_setup()
@@ -221,6 +432,93 @@ if(CLICKNOVA_BUILD_GUI)
     add_executable(clicknova_portable_storage_tests tests/portable_storage_tests.cpp src/gui/portable_storage.cpp)
     target_link_libraries(clicknova_portable_storage_tests PRIVATE Qt6::Core)
     add_test(NAME portable_storage_tests COMMAND clicknova_portable_storage_tests)
+    add_executable(clicknova_recording_checkpoint_named_tests
+      tests/recording_checkpoint_named_tests.cpp
+      src/gui/recording_checkpoint.cpp src/gui/portable_storage.cpp)
+    target_link_libraries(clicknova_recording_checkpoint_named_tests PRIVATE Qt6::Core)
+    add_test(NAME recording_checkpoint_named_tests COMMAND clicknova_recording_checkpoint_named_tests)
+    add_executable(clicknova_qml_control_value_adapter_tests
+      tests/qml_control_value_adapter_tests.cpp src/gui/qml/control_value_adapter.cpp)
+    target_link_libraries(clicknova_qml_control_value_adapter_tests PRIVATE Qt6::Widgets)
+    add_test(NAME qml_control_value_adapter_tests COMMAND clicknova_qml_control_value_adapter_tests)
+    # BuildFix2: choose a deployed Qt platform for the widget adapter test.
+if(WIN32)
+  set_tests_properties(qml_control_value_adapter_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=windows")
+else()
+  set_tests_properties(qml_control_value_adapter_tests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
+    add_executable(clicknova_qml_recovery_catalog_tests
+      tests/qml_recovery_catalog_tests.cpp src/gui/qml/recovery_catalog.cpp
+      src/gui/recording_checkpoint.cpp src/gui/portable_storage.cpp)
+    target_link_libraries(clicknova_qml_recovery_catalog_tests PRIVATE Qt6::Core)
+    add_test(NAME qml_recovery_catalog_tests COMMAND clicknova_qml_recovery_catalog_tests)
+    add_executable(clicknova_qml_action_catalog_tests
+      tests/qml_action_catalog_tests.cpp src/gui/qml/action_catalog.cpp)
+    target_link_libraries(clicknova_qml_action_catalog_tests PRIVATE Qt6::Core)
+    target_include_directories(clicknova_qml_action_catalog_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME qml_action_catalog_tests COMMAND clicknova_qml_action_catalog_tests)
+    add_executable(clicknova_qml_action_edit_service_tests
+      tests/qml_action_edit_service_tests.cpp src/gui/qml/action_edit_service.cpp)
+    target_include_directories(clicknova_qml_action_edit_service_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME qml_action_edit_service_tests COMMAND clicknova_qml_action_edit_service_tests)
+    add_executable(clicknova_qml_action_workspace_tests
+      tests/qml_action_workspace_tests.cpp src/gui/qml/action_workspace.cpp
+      src/gui/qml/action_edit_service.cpp src/gui/qml/action_batch_service.cpp)
+    target_include_directories(clicknova_qml_action_workspace_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME qml_action_workspace_tests COMMAND clicknova_qml_action_workspace_tests)
+    add_executable(clicknova_qml_action_batch_service_tests
+      tests/qml_action_batch_service_tests.cpp
+      src/gui/qml/action_batch_service.cpp
+      src/gui/qml/action_workspace.cpp
+      src/gui/qml/action_edit_service.cpp)
+    target_include_directories(clicknova_qml_action_batch_service_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME qml_action_batch_service_tests COMMAND clicknova_qml_action_batch_service_tests)
+    add_executable(clicknova_qml_execution_policy_tests
+      tests/qml_execution_policy_tests.cpp src/gui/qml/execution_policy.cpp)
+    add_test(NAME qml_execution_policy_tests COMMAND clicknova_qml_execution_policy_tests)
+    add_executable(clicknova_quick_clicker_service_tests
+      tests/quick_clicker_service_tests.cpp
+      src/gui/quick_clicker_service.hpp
+      src/gui/quick_clicker_service.cpp)
+    target_link_libraries(clicknova_quick_clicker_service_tests PRIVATE Qt6::Core clicknova_core)
+    add_test(NAME quick_clicker_service_tests COMMAND clicknova_quick_clicker_service_tests)
+    add_executable(clicknova_quick_configuration_model_tests
+      tests/quick_configuration_model_tests.cpp
+      src/gui/qml/quick_configuration_model.cpp
+      src/gui/qml/quick_configuration_model.hpp)
+    target_include_directories(clicknova_quick_configuration_model_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_quick_configuration_model_tests PRIVATE Qt6::Core)
+    set_target_properties(clicknova_quick_configuration_model_tests PROPERTIES AUTOMOC ON)
+    add_test(NAME quick_configuration_model_tests COMMAND clicknova_quick_configuration_model_tests)
+    add_executable(clicknova_qml_accessibility_inspector_tests
+      tests/qml_accessibility_inspector_tests.cpp
+      src/gui/qml/accessibility_inspector.cpp
+      src/gui/qml/accessibility_inspector.hpp)
+    target_include_directories(clicknova_qml_accessibility_inspector_tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_accessibility_inspector_tests PRIVATE Qt6::Core)
+    add_test(NAME qml_accessibility_inspector_tests
+      COMMAND clicknova_qml_accessibility_inspector_tests)
+    add_executable(clicknova_qml_accessibility_discovery_service_tests
+      tests/qml_accessibility_discovery_service_tests.cpp
+      src/gui/qml/accessibility_discovery_service.cpp
+      src/gui/qml/accessibility_discovery_service.hpp)
+    target_include_directories(clicknova_qml_accessibility_discovery_service_tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_accessibility_discovery_service_tests PRIVATE Qt6::Core)
+    set_target_properties(clicknova_qml_accessibility_discovery_service_tests PROPERTIES AUTOMOC ON)
+    add_test(NAME qml_accessibility_discovery_service_tests
+      COMMAND clicknova_qml_accessibility_discovery_service_tests)
+    add_executable(clicknova_qml_element_candidate_service_tests
+      tests/qml_element_candidate_service_tests.cpp
+      src/gui/qml/element_candidate_service.cpp
+      src/gui/qml/element_candidate_service.hpp)
+    target_include_directories(clicknova_qml_element_candidate_service_tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(clicknova_qml_element_candidate_service_tests PRIVATE Qt6::Core)
+    set_target_properties(clicknova_qml_element_candidate_service_tests PROPERTIES AUTOMOC ON)
+    add_test(NAME qml_element_candidate_service_tests
+      COMMAND clicknova_qml_element_candidate_service_tests)
   endif()
   if(BUILD_TESTING)
     add_executable(clicknova_browser_discovery_tests tests/browser_discovery_tests.cpp src/gui/browser_discovery.cpp)
@@ -289,7 +587,80 @@ if(CLICKNOVA_BUILD_GUI)
     src/storage/scenario_store.hpp
     src/platform/windows/input_support.hpp)
   target_include_directories(ClickNova PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  target_sources(ClickNova PRIVATE
+    src/gui/qml/quick_configuration_model.hpp
+    src/gui/qml/quick_configuration_model.cpp
+    src/gui/qml/accessibility_inspector.hpp
+    src/gui/qml/accessibility_inspector.cpp
+    src/gui/qml/visual_tools_gateway.hpp
+    src/gui/qml/visual_tools_gateway.cpp
+    src/gui/qml/visual_preview_service.hpp
+    src/gui/qml/visual_preview_service.cpp
+    src/gui/qml/visual_isolated_transport.hpp
+    src/gui/qml/visual_isolated_transport.cpp
+    src/gui/qml/visual_worker_main.hpp
+    src/gui/qml/visual_worker_main.cpp
+    src/gui/qml/visual_worker_capture_win32.hpp
+    src/gui/qml/visual_worker_capture_win32.cpp
+    include/clicknova/visual_worker_protocol.hpp
+    include/clicknova/visual_tools_policy.hpp
+    src/gui/qml/accessibility_discovery_service.hpp
+    src/gui/qml/accessibility_discovery_service.cpp
+    src/gui/qml/legacy_accessibility_adapter.hpp
+    src/gui/qml/legacy_accessibility_adapter.cpp
+    src/gui/qml/element_candidate_service.hpp
+    src/gui/qml/element_candidate_service.cpp
+    src/gui/qml/element_candidate_win32.hpp
+    src/gui/qml/element_candidate_win32.cpp
+    src/gui/qml/element_candidate_msaa_win32.hpp
+    src/gui/qml/element_candidate_msaa_win32.cpp
+    src/gui/qml/element_candidate_java_win32.hpp
+    src/gui/qml/element_candidate_java_win32.cpp
+    include/clicknova/java_preview_policy.hpp
+    include/clicknova/verified_uia_binding.hpp
+    include/clicknova/uia_worker_protocol.hpp
+    src/gui/qml/uia_worker_main.hpp
+    src/gui/qml/uia_worker_main.cpp
+    src/gui/qml/uia_isolated_transport.hpp
+    src/gui/qml/uia_isolated_transport.cpp
+    src/gui/qml/isolated_uia_provider.hpp
+    src/gui/qml/isolated_uia_provider.cpp
+    src/gui/qml/control_value_adapter.hpp
+    src/gui/qml/control_value_adapter.cpp
+    src/gui/qml/recovery_catalog.hpp
+    src/gui/qml/recovery_catalog.cpp
+    src/gui/qml/action_catalog.hpp
+    src/gui/qml/action_catalog.cpp
+    src/gui/qml/action_edit_service.hpp
+    src/gui/qml/action_edit_service.cpp
+    src/gui/qml/action_workspace.hpp
+    src/gui/qml/action_workspace.cpp
+    src/gui/qml/action_batch_service.hpp
+    src/gui/qml/action_batch_service.cpp
+    src/gui/qml/execution_policy.hpp
+    src/gui/qml/execution_policy.cpp
+    src/gui/quick_clicker_service.hpp
+    src/gui/quick_clicker_service.cpp
+    src/gui/quick_clicker_device.cpp
+  )
   target_link_libraries(ClickNova PRIVATE Qt6::Widgets Qt6::Network clicknova_core)
+  if(WIN32)
+    target_link_libraries(ClickNova PRIVATE gdi32)
+    # Both backends are optional. The child reports Unavailable when absent.
+    if(OpenCV_FOUND)
+      target_compile_definitions(ClickNova PRIVATE CLICKNOVA_VISUAL_OPENCV=1)
+      target_include_directories(ClickNova PRIVATE ${OpenCV_INCLUDE_DIRS})
+      target_link_libraries(ClickNova PRIVATE ${OpenCV_LIBS})
+      if(CLICKNOVA_OCR_TARGET)
+        target_compile_definitions(ClickNova PRIVATE CLICKNOVA_VISUAL_TESSERACT=1)
+        target_link_libraries(ClickNova PRIVATE ${CLICKNOVA_OCR_TARGET})
+      endif()
+    endif()
+  endif()
+  if(WIN32)
+    # Windows MSAA AccessibleObjectFromWindow / IAccessible COM ABI.
+    target_link_libraries(ClickNova PRIVATE oleacc)
+  endif()
   if(OpenCV_FOUND)
     target_compile_definitions(ClickNova PRIVATE CLICKNOVA_WITH_OPENCV=1)
     if(CLICKNOVA_OCR_TARGET)
@@ -332,6 +703,9 @@ if(CLICKNOVA_BUILD_GUI)
   install(SCRIPT ${clicknova_deploy_script})
   if(BUILD_TESTING)
     # Layout regression after resizing the main window to its minimum size.
+    # The removed Qt Quick interface must not be launchable via its old smoke flag.
+    add_test(NAME retired_qml_mode_rejected COMMAND ClickNova --qml-smoke)
+    set_tests_properties(retired_qml_mode_rejected PROPERTIES WILL_FAIL TRUE)
     add_test(NAME gui_layout_smoke COMMAND ClickNova --smoke-test-ui)
     add_test(NAME gui_adaptive_smoke COMMAND ClickNova --smoke-test-adaptive)
     add_test(NAME gui_icons_smoke COMMAND ClickNova --smoke-test-icons)
@@ -339,9 +713,12 @@ if(CLICKNOVA_BUILD_GUI)
     add_test(NAME gui_workflows_smoke COMMAND ClickNova --smoke-test-workflows)
     add_test(NAME gui_sequence_smoke COMMAND ClickNova --smoke-test-sequence)
     add_test(NAME gui_input_lab_smoke COMMAND ClickNova --smoke-test-input-lab)
+add_test(NAME gui_execution_report_smoke COMMAND ClickNova --smoke-test-execution-report)
+set_tests_properties(gui_execution_report_smoke PROPERTIES TIMEOUT 20)
     add_test(NAME gui_unified_smoke COMMAND ClickNova --smoke-test-unified)
     add_test(NAME gui_unified_search_smoke COMMAND ClickNova --smoke-test-unified-search)
     add_test(NAME gui_step_tree_smoke COMMAND ClickNova --smoke-test-step-tree)
+add_test(NAME gui_scenario_check_smoke COMMAND ClickNova --smoke-test-scenario-check)
     add_test(NAME gui_manual_step_groups_smoke COMMAND ClickNova --smoke-test-manual-step-groups)
     add_test(NAME gui_wheel_routing_smoke COMMAND ClickNova --smoke-test-wheel-routing)
     add_test(NAME gui_action_menu_smoke COMMAND ClickNova --smoke-test-action-menu)
@@ -372,4 +749,13 @@ if(CLICKNOVA_BUILD_GUI)
       add_test(NAME gui_shortcuts_smoke COMMAND ClickNova --smoke-test-shortcuts)
     endif()
   endif()
+endif()
+
+# ClickNova QML checkpoint test include directories (build fix 1)
+# These targets use recording_checkpoint.hpp, which includes clicknova/input_recording.hpp.
+if(TARGET clicknova_qml_recovery_catalog_tests)
+  target_include_directories(clicknova_qml_recovery_catalog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endif()
+if(TARGET clicknova_recording_checkpoint_named_tests)
+  target_include_directories(clicknova_recording_checkpoint_named_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 endif()

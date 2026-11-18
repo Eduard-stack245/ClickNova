@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "../src/storage/input_plan_codec.hpp"
 #include "../src/storage/scenario_store.hpp"
 #include <QCoreApplication>
@@ -72,6 +72,18 @@ int main(int argc, char** argv) {
     const auto perWindowRoundtrip = decodeInputPlan(perWindowData);
     assert(perWindowRoundtrip && perWindowRoundtrip->stepWindows == perWindow.stepWindows);
     assert(!perWindowData.contains(QStringLiteral("HWND")) && !perWindowData.contains(QStringLiteral("PID")));
+    // Screenshot reference must travel with its action through scenario JSON.
+    StepWindow pictured;
+    pictured.screenshotId = std::string(64, 'a');
+    const Plan picturePlan{{Wait{250}, Click{}}, 1, 0, false, {pictured, {}}};
+    const auto pictureCopy = decodeInputPlan(encodeInputPlan(picturePlan));
+    assert(pictureCopy && pictureCopy->stepWindows[0].screenshotId == pictured.screenshotId);
+    assert(pictureCopy->stepWindows[1].screenshotId.empty());
+    auto invalidImage = encodeBoundInputAction(Wait{250}, pictured);
+    invalidImage[QStringLiteral("screenshotId")] = QStringLiteral("../../secret.png");
+    assert(!decodeStepWindow(invalidImage));
+    invalidImage[QStringLiteral("screenshotId")] = QStringLiteral("AAAA");
+    assert(!decodeStepWindow(invalidImage));
     const auto encodedAction = encodeBoundInputAction(KeyTap{65}, firstWindow);
     const auto decodedBinding = decodeStepWindow(encodedAction);
     assert(decodedBinding && *decodedBinding == firstWindow);
@@ -325,6 +337,24 @@ int main(int argc, char** argv) {
     badRows[1] = badEntry;
     incompatible[QStringLiteral("actions")] = badRows;
     assert(!decodeInputPlan(incompatible));
+    // Optional per-step names must survive serialization without breaking
+    // legacy scenarios (the field is absent by default).
+    StepWindow named;
+    named.displayName = "Sign in";
+    auto namedRecord = encodeBoundInputAction(Wait{10}, named);
+    assert(namedRecord.value(QStringLiteral("displayName")).toString() == QStringLiteral("Sign in"));
+    assert(decodeStepWindow(namedRecord) == named);
+    auto namedPlan = Plan{{Wait{10}}, 1, 0, false, {named}};
+    const auto namedRoundtrip = decodeInputPlan(encodeInputPlan(namedPlan));
+    assert(namedRoundtrip && namedRoundtrip->stepWindows == namedPlan.stepWindows);
+    auto badName = namedRecord;
+    badName[QStringLiteral("displayName")] = QString(81, QChar('x'));
+    assert(!decodeStepWindow(badName));
+    badName[QStringLiteral("displayName")] = QStringLiteral("");
+    assert(!decodeStepWindow(badName));
+    badName[QStringLiteral("displayName")] = 7;
+    assert(!decodeStepWindow(badName));
+    assert(!encodeBoundInputAction(Wait{10}, StepWindow{}).contains(QStringLiteral("displayName")));
     assert(decodeInputPlan(encodeInputPlan(Plan{{Click{Button::Left, 1, 100}}})));
     assert(store.load(Kind::Sequence, QStringLiteral("Mixed test")) == std::nullopt);
     assert(store.remove(Kind::InputLab, QStringLiteral("Mixed test")));

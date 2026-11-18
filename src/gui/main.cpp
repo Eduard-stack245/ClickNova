@@ -1,6 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include <memory>
 #include <QApplication>
+#include <cstring>
 #include <QCoreApplication>
 #include <QMainWindow>
 #include <QString>
@@ -12,6 +13,8 @@
 #include "ui_icons.hpp"
 #include "portable_storage.hpp"
 #include "optional_components.hpp"
+#include "qml/uia_worker_main.hpp"
+#include "qml/visual_worker_main.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QMessageBox>
@@ -24,7 +27,15 @@
 #endif
 
 int main(int argc, char* argv[]) {
+    // Parse exactly one reserved internal option before QApplication, plugins,
+    // settings, native hooks or QML initialization. Never open the visible UI.
+    if (argc == 2 && std::strcmp(argv[1], "--uia-worker") == 0)
+        return clicknova::gui::qml::runUiaWorker();
+    if (argc == 2 && std::strcmp(argv[1], "--visual-worker") == 0)
+        return clicknova::gui::qml::runVisualWorker();
     QApplication app(argc, argv);
+    // The retired QML smoke switch must never open a Widgets window and hang CI.
+    if (app.arguments().contains(QStringLiteral("--qml-smoke"))) return 2;
     QCoreApplication::setOrganizationName(QStringLiteral("ClickNova"));
     QCoreApplication::setApplicationName(QStringLiteral("ClickNova"));
     QString portableWarning;
@@ -51,8 +62,8 @@ int main(int argc, char* argv[]) {
     if (app.arguments().contains(QStringLiteral("--smoke-test-window-picker")))
         return runWindowPickerSmoke(app);
 
+    // Classic Qt Widgets is the only user interface.
     std::unique_ptr<QMainWindow> window(createClickNovaMainWindow());
-    window->show();
     // A console launcher can keep the foreground window on Windows even
     // after ClickNova has been shown. Request foreground activation ONCE at
     // event-loop startup; never steal focus later during normal operation.
@@ -63,6 +74,8 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
+
+    window->show();
     if (!smokeTest) {
         QTimer::singleShot(0, window.get(), [main = window.get()] {
             if (!main->isVisible()) return;

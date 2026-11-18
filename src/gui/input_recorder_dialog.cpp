@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "input_recorder_dialog.hpp"
 #include "ui_icons.hpp"
 #include "recording_checkpoint.hpp"
+#include "wrap_layout.hpp"
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QHideEvent>
@@ -281,8 +282,9 @@ InputRecorderDialog::InputRecorderDialog(bool russian, Finished finished)
         ? QString::fromUtf8("Черновики записи сохраняются локально с датой и временем. Они могут содержать введённый текст — не вводите пароли.")
         : QStringLiteral("Recording recovery is saved locally with timestamps. It may contain typed text; do not type passwords."));
     recoveryHint->setWordWrap(true);
+    recoveryHint->setObjectName(QStringLiteral("sectionHint"));
     layout->addWidget(recoveryHint);
-    auto* buttons = new QHBoxLayout;
+    auto* buttons = new WrapLayout(nullptr, 7);
     start_ = new QPushButton(russian_ ? QString::fromUtf8("Запись") : QStringLiteral("Record"));
     start_->setObjectName(QStringLiteral("recorderStart"));
     start_->setProperty("actionRole", QStringLiteral("record"));
@@ -303,7 +305,11 @@ InputRecorderDialog::InputRecorderDialog(bool russian, Finished finished)
     clicknova::gui::setButtonIcon(pause_, clicknova::gui::Icon::Pause);
     clicknova::gui::setButtonIcon(stop_, clicknova::gui::Icon::Check, QColor(QStringLiteral("#d8fff1")));
     clicknova::gui::setButtonIcon(cancel_, clicknova::gui::Icon::Close, QColor(QStringLiteral("#ffcbd2")));
-    for (auto* b : {start_, pause_, stop_, cancel_}) { b->setMinimumHeight(38); buttons->addWidget(b); }
+    for (auto* b : {start_, pause_, stop_, cancel_}) {
+        b->setMinimumHeight(38);
+        b->setMaximumWidth(155);
+        buttons->addWidget(b);
+    }
     layout->addLayout(buttons);
     hooks_ = new NativeHooks([this](const Sample& s) { record(s); });
     progressTimer_ = new QTimer(this);
@@ -561,6 +567,98 @@ void InputRecorderDialog::closeRecordedHolds() {
     }
     heldKeys_.clear();
     heldButtons_.clear();
+}
+
+QString InputRecorderDialog::statusText() const {
+    return info_ ? info_->text() : QString();
+}
+
+// Typed capture commands used by the Qt Quick bridge. Native UI actions call
+// the same private transitions, so pause timing, release balancing and recovery
+// checkpoints remain identical to the legacy safety controller.
+bool InputRecorderDialog::canStartFromQml() const noexcept {
+    return !started_ && !completed_;
+}
+
+bool InputRecorderDialog::canPauseFromQml() const noexcept {
+    return started_ && !completed_ && samples_.size() < 29800;
+}
+
+bool InputRecorderDialog::canReviewFromQml() const noexcept {
+    return started_ && !completed_;
+}
+
+bool InputRecorderDialog::canDiscardFromQml() const noexcept {
+    return started_ && !completed_ && paused_;
+}
+
+bool InputRecorderDialog::requestStartFromQml() {
+    if (!canStartFromQml()) return false;
+    start();
+    return started_ && !completed_;
+}
+
+bool InputRecorderDialog::requestPausedFromQml(bool desiredPaused) {
+    if (!started_ || completed_) return false;
+    if (paused_ == desiredPaused) return true;
+    if (!canPauseFromQml()) return false;
+    pauseOrResume();
+    return paused_ == desiredPaused && !completed_;
+}
+
+bool InputRecorderDialog::requestFinishFromQml() {
+    if (!canReviewFromQml()) return false;
+    stop(false); // May invoke the finished callback and queue deleteLater().
+    return true;
+}
+
+bool InputRecorderDialog::requestDiscardFromQml() {
+    if (!canDiscardFromQml()) return false;
+    stop(true);
+    return true;
+}
+
+bool InputRecorderDialog::captureOptionFromQml(int option) const {
+    switch (option) {
+    case 0: return keyboard_ && keyboard_->isChecked();
+    case 1: return text_ && text_->isChecked();
+    case 2: return movement_ && movement_->isChecked();
+    default: return false;
+    }
+}
+
+bool InputRecorderDialog::setCaptureOptionFromQml(int option, bool enabled) {
+    if (!canStartFromQml()) return false;
+    QCheckBox* checkbox = nullptr;
+    switch (option) {
+    case 0: checkbox = keyboard_; break;
+    case 1: checkbox = text_; break;
+    case 2: checkbox = movement_; break;
+    default: return false;
+    }
+    if (!checkbox || !checkbox->isEnabled()) return false;
+    checkbox->setChecked(enabled);
+    updateUi();
+    return checkbox->isChecked() == enabled;
+}
+
+int InputRecorderDialog::recordedEventCount() const noexcept {
+    return static_cast<int>(samples_.size()); // hard native cap <= 30000
+}
+
+std::uint64_t InputRecorderDialog::recordedElapsedMs() const noexcept {
+    if (!started_ || completed_) return 0;
+    const std::uint64_t end = paused_ ? pausedTick_ : nowMs();
+    const std::uint64_t start = startedTick_ + totalPaused_;
+    return end >= start ? end - start : 0;
+}
+
+QString InputRecorderDialog::progressTextFromQml() const {
+    return count_ ? count_->text() : QString();
+}
+
+QString InputRecorderDialog::windowTextFromQml() const {
+    return window_ ? window_->text() : QString();
 }
 
 void InputRecorderDialog::bringToFront() {

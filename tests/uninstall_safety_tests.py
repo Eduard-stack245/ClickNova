@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 """Safety regression tests for the portable Linux removal helper.
 The Windows PowerShell implementation still requires native Windows tests.
 """
