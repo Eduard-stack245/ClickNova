@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: MIT
 # Windows-only visual installer UI for optional developer dependencies.
 param([switch]$WaitForApplicationExit)
 $ErrorActionPreference = 'Stop'

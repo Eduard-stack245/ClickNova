@@ -1,5 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include <QApplication>
+#include <QClipboard>
+#include <QMimeData>
 #include <QStringList>
 #include <QMainWindow>
 #include <QToolBar>
@@ -44,6 +46,10 @@
 #include <QMetaObject>
 #include <QContextMenuEvent>
 #include "action_table_widget.hpp"
+#include "step_image_viewer.hpp"
+#include "step_image_store.hpp"
+#include <QBuffer>
+#include <QCryptographicHash>
 #include "input_lab.hpp"
 #include <QWheelEvent>
 #include <QMouseEvent>
@@ -90,6 +96,320 @@ int runWindowPickerSmoke(QApplication& app) {
 }
 
 void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
+    if (app.arguments().contains(QStringLiteral("--smoke-test-execution-report"))) {
+        // Only a zero-duration Wait is executed. No cursor, keyboard, UIA or
+        // external script calls are ever made by this GUI smoke test.
+        QTimer::singleShot(100, &window, [&app, &window] {
+            auto* lab = dynamic_cast<InputLabWidget*>(
+                window.findChild<QWidget*>(QStringLiteral("inputLab")));
+            auto* button = window.findChild<QPushButton*>(
+                QStringLiteral("inputLabExecutionReport"));
+            if (!lab || !button || button->isEnabled()) {
+                qCritical() << "Report button initial state invalid";
+                app.exit(1);
+                return;
+            }
+            clicknova::input::Plan plan;
+            plan.actions = {clicknova::input::Wait{0}};
+            plan.stepWindows.resize(1);
+            plan.stepWindows[0].displayName = "private user label should never be copied";
+            lab->replaceActions(plan);
+            // MainWindow intentionally does not register any system-wide
+            // hotkeys in smoke mode. Only this zero-Wait-only test bypasses
+            // shortcut registration; no mouse, key, script or UIA is used.
+            lab->setStopHotkeyController(
+                [](bool) { return true; },
+                [] { return QStringLiteral("smoke-only"); });
+            lab->requestRun();
+            QTimer::singleShot(4500, &window, [&app, &window, button] {
+                bool okay = button->isEnabled();
+                if (okay) button->click();
+                app.processEvents();
+                auto* dialog = window.findChild<QDialog*>(
+                    QStringLiteral("inputLabExecutionReportDialog"));
+                auto* view = dialog ? dialog->findChild<QPlainTextEdit*>(
+                    QStringLiteral("inputLabExecutionReportText")) : nullptr;
+                auto* copy = dialog ? dialog->findChild<QPushButton*>(
+                    QStringLiteral("inputLabExecutionReportCopy")) : nullptr;
+                auto* close = dialog ? dialog->findChild<QPushButton*>(
+                    QStringLiteral("inputLabExecutionReportClose")) : nullptr;
+                const QString report = view ? view->toPlainText() : QString();
+                okay &= view && copy && close &&
+                    report.contains(QStringLiteral("Pass 1 | Step 1")) &&
+                    report.contains(QStringLiteral("Recorded outcomes: 1")) &&
+                    report.contains(QStringLiteral("Completed")) &&
+                    !report.contains(QStringLiteral("private user label")) &&
+                    !report.contains(QStringLiteral("PowerShell script body"));
+                if (close) close->click();
+                if (!okay) qCritical() << "Actual execution report smoke failed";
+                app.exit(okay ? 0 : 1);
+            });
+        });
+    }
+    if (app.arguments().contains(QStringLiteral("--smoke-test-scenario-check"))) {
+        QTimer::singleShot(150, &window, [&app, &window] {
+            auto* lab = dynamic_cast<InputLabWidget*>(window.findChild<QWidget*>(QStringLiteral("inputLab")));
+            auto* search = window.findChild<QLineEdit*>(QStringLiteral("inputLabStepSearch"));
+            auto* table = window.findChild<QTableWidget*>(QStringLiteral("inputLabActions"));
+            auto* button = window.findChild<QPushButton*>(QStringLiteral("inputLabCheckScenario"));
+            if (!lab || !search || !table || !button) {
+                qCritical() << "Missing scenario checker components"; app.exit(1); return;
+            }
+            using namespace clicknova::input;
+            Plan sample;
+            sample.actions = {Click{Button::Left,1,50}, Wait{200}};
+            sample.stepWindows.resize(2);
+            sample.stepWindows[0].displayName = "Checkout form";
+            sample.stepWindows[1].bookmarked = true;
+            sample.stepWindows[1].note = "Confirm before committing this form";
+            sample.stepWindows[1].screenshotId = std::string(64, 'a'); // Metadata-only fixture.
+            sample.stepWindows[0].elementAutomationId = "checkout-field-42";
+            sample.stepWindows[0].elementName = "Submit order";
+            sample.stepWindows[0].title = "Example browser";
+            sample.stepWindows[0].process = "browser.exe";
+            sample.stepWindows[0].screenshotId = std::string(64, '0');
+            sample.stepWindows[0].elementRole = 1; // Button; valid UIA Invoke selector
+            sample.stepWindows[0].activate = true;
+            // A saved window must not be activated merely by opening the check.
+            lab->replaceActions(sample);
+            search->setText(QStringLiteral("checkout-field-42"));
+            bool ok = !table->isRowHidden(0) && table->isRowHidden(1);
+            int firstFailure = 0;
+            const auto milestone = [&ok, &firstFailure](int index) {
+                if (!ok && !firstFailure) firstFailure = index;
+            };
+            // Full-resolution viewer keeps its own zoom state; thumbnails
+            // never replace the source image.
+            QImage source(1280, 720, QImage::Format_ARGB32);
+            source.fill(Qt::white);
+            StepImageViewer preview(source, QStringLiteral("Preview test"));
+            ok &= preview.findChild<QPushButton*>(QStringLiteral("stepImageZoomIn")) != nullptr;
+            preview.setZoom(1.0);
+            preview.zoom(1.25);
+            ok &= qAbs(preview.zoomFactor() - 1.25) < 0.001;
+            preview.setZoom(100.0);  // Prevent unbounded image scaling.
+            ok &= preview.zoomFactor() <= 16.0;
+            preview.setZoom(0.0001);
+            ok &= preview.zoomFactor() >= 0.05;
+            // Gallery navigation retains the original action indexes. Missing
+            // screenshots between the first and third actions are skipped.
+            preview.enableGallery(0, 4, [&source](int actionIndex) -> QImage {
+                if (actionIndex == 0) return source;
+                if (actionIndex == 2) {
+                    QImage next(1400, 800, QImage::Format_ARGB32);
+                    next.fill(Qt::white);
+                    return next;
+                }
+                return {};
+            }, QStringLiteral("Gallery regression"), [](int index) {
+                return QStringLiteral("Action identity %1").arg(index + 1);
+            });
+            auto* galleryNext = preview.findChild<QPushButton*>(
+                QStringLiteral("stepImageNext"));
+            auto* galleryPrevious = preview.findChild<QPushButton*>(
+                QStringLiteral("stepImagePrevious"));
+            ok &= galleryNext && galleryPrevious && preview.galleryPosition() == 0;
+            ok &= preview.navigateGallery(1) && preview.galleryPosition() == 2;
+            ok &= !preview.navigateGallery(1) && preview.galleryPosition() == 2;
+            ok &= preview.navigateGallery(-1) && preview.galleryPosition() == 0;
+            ok &= !preview.navigateGallery(-1) && preview.galleryPosition() == 0;
+            // Direct step jumps always use the original action number.
+            // Unpictured/out-of-range steps cannot alter the displayed image.
+            auto* galleryJumpTest = preview.findChild<QSpinBox*>(QStringLiteral("stepImageJump"));
+            auto* galleryDescriptionTest = preview.findChild<QLabel*>(
+                QStringLiteral("stepImageDescription"));
+            ok &= galleryJumpTest && galleryDescriptionTest;
+            ok &= galleryDescriptionTest && galleryDescriptionTest->text().contains(
+                QStringLiteral("Action identity 1"));
+            ok &= preview.jumpToGallery(2) && preview.galleryPosition() == 2;
+            ok &= galleryJumpTest && galleryJumpTest->value() == 3;
+            ok &= galleryDescriptionTest && galleryDescriptionTest->text().contains(
+                QStringLiteral("Action identity 3"));
+            ok &= !preview.jumpToGallery(1) && preview.galleryPosition() == 2;
+            ok &= !preview.jumpToGallery(99) && preview.galleryPosition() == 2;
+            ok &= preview.jumpToGallery(0) && preview.galleryPosition() == 0;
+            milestone(1); // Gallery
+            // Read paths are content-addressed. A modified PNG must be
+            // rejected even when it still decodes and occupies the same path.
+            QTemporaryDir imageTemp;
+            QImage imageFixture(640, 480, QImage::Format_ARGB32);
+            imageFixture.fill(Qt::white);
+            QByteArray imageBytes;
+            QBuffer imageBuffer(&imageBytes);
+            const bool imageEncoded = imageBuffer.open(QIODevice::WriteOnly) &&
+                                      imageFixture.save(&imageBuffer, "PNG");
+            ok &= imageTemp.isValid() && imageEncoded;
+            if (imageTemp.isValid() && imageEncoded) {
+                const QString digest = QString::fromLatin1(QCryptographicHash::hash(
+                    imageBytes, QCryptographicHash::Sha256).toHex());
+                const QString localImage = imageTemp.filePath(digest + QStringLiteral(".png"));
+                QFile file(localImage);
+                const bool wrote = file.open(QIODevice::WriteOnly) &&
+                                   file.write(imageBytes) == imageBytes.size();
+                file.close();
+                ok &= wrote;
+                if (wrote) {
+                    const QImage original = clicknova::gui::step_images::loadVerifiedFile(
+                        localImage, digest);
+                    const QImage thumbnail = clicknova::gui::step_images::loadVerifiedFile(
+                        localImage, digest, QSize(96, 68));
+                    ok &= original.size() == imageFixture.size();
+                    ok &= thumbnail.width() <= 96 && thumbnail.height() <= 68 &&
+                          !thumbnail.isNull();
+                    ok &= clicknova::gui::step_images::loadVerifiedFile(
+                        localImage, QStringLiteral("../../secrets")).isNull();
+                    const QImage tampered(32, 32, QImage::Format_ARGB32);
+                    QImage other = tampered;
+                    other.fill(Qt::black);
+                    ok &= other.save(localImage, "PNG");
+                    ok &= clicknova::gui::step_images::loadVerifiedFile(
+                        localImage, digest).isNull();
+                }
+            }
+            milestone(2); // Image verification
+            auto* enlargeImages = window.findChild<QPushButton*>(
+                QStringLiteral("inputLabThumbnailIncrease"));
+            auto* shrinkImages = window.findChild<QPushButton*>(
+                QStringLiteral("inputLabThumbnailDecrease"));
+            auto* thumbnailPainter = static_cast<StepThumbnailDelegate*>(
+                table->itemDelegateForColumn(1));
+            ok &= enlargeImages && shrinkImages && thumbnailPainter;
+            if (enlargeImages && shrinkImages && thumbnailPainter) {
+                const int before = thumbnailPainter->thumbnailWidth();
+                if (before >= 176) {
+                    shrinkImages->click();
+                    ok &= thumbnailPainter->thumbnailWidth() == before - 16;
+                    enlargeImages->click();
+                } else {
+                    enlargeImages->click();
+                    ok &= thumbnailPainter->thumbnailWidth() == before + 16;
+                    shrinkImages->click();
+                }
+                ok &= thumbnailPainter->thumbnailWidth() == before;
+            }
+            milestone(3); // Thumbnail controls
+            const QString tooltip = table->item(0, 0)->toolTip();
+            ok &= tooltip.contains(QStringLiteral("#0001")) &&
+                  tooltip.contains(QStringLiteral("Checkout form")) &&
+                  tooltip.contains(QStringLiteral("checkout-field-42")) &&
+                  tooltip.contains(QStringLiteral("Example browser")) &&
+                  tooltip.contains(QStringLiteral("browser.exe"));
+            search->setText(QStringLiteral("Checkout form"));
+            ok &= !table->isRowHidden(0) && table->isRowHidden(1);
+            auto* next = window.findChild<QPushButton*>(QStringLiteral("inputLabNextStepMatch"));
+            auto* previous = window.findChild<QPushButton*>(QStringLiteral("inputLabPreviousStepMatch"));
+            ok &= next && previous;
+            search->setText(QStringLiteral("#2"));
+            ok &= table->isRowHidden(0) && !table->isRowHidden(1);
+            if (next) next->click();
+            ok &= table->currentRow() == 1;
+            search->setText(QStringLiteral("#99"));
+            ok &= table->isRowHidden(0) && table->isRowHidden(1);
+            search->setText(QStringLiteral("#1"));
+            if (previous) previous->click();
+            ok &= table->currentRow() == 0;
+            milestone(4); // Search and step number
+            search->clear();
+            auto* filterImagesTest = window.findChild<QComboBox*>(
+                QStringLiteral("inputLabStepFilter"));
+            auto* openImagesTest = window.findChild<QPushButton*>(
+                QStringLiteral("inputLabOpenStepImages"));
+            ok &= filterImagesTest && filterImagesTest->count() == 10 && openImagesTest;
+            if (filterImagesTest) {
+                filterImagesTest->setCurrentIndex(7);
+                ok &= !table->isRowHidden(0) && !table->isRowHidden(1);
+                filterImagesTest->setCurrentIndex(0);
+            }
+            milestone(5); // Image filter
+            // Bookmarked metadata travels with the action and is visible
+            // without changing which actions the scenario will execute.
+            auto* bookmarkFilter = window.findChild<QComboBox*>(
+                QStringLiteral("inputLabStepFilter"));
+            ok &= bookmarkFilter && bookmarkFilter->count() == 10;
+            ok &= table->item(1, 0)->text().contains(QStringLiteral("★ "));
+            if (bookmarkFilter) {
+                bookmarkFilter->setCurrentIndex(8);
+                ok &= table->isRowHidden(0) && !table->isRowHidden(1);
+                bookmarkFilter->setCurrentIndex(0);
+                bookmarkFilter->setCurrentIndex(9);
+                ok &= table->isRowHidden(0) && !table->isRowHidden(1);
+                bookmarkFilter->setCurrentIndex(0);
+            }
+            milestone(6); // Bookmarks and notes
+            // A consolidated outline lists actual action indices and does not
+            // run recorded input, show typed secrets, or alter the scenario.
+            auto* navigator = window.findChild<QPushButton*>(
+                QStringLiteral("inputLabStepNavigator"));
+            ok &= navigator != nullptr;
+            if (navigator) {
+                navigator->click();
+                app.processEvents();
+                QPointer<QDialog> navDialog = window.findChild<QDialog*>(
+                    QStringLiteral("inputLabStepNavigatorDialog"));
+                auto* navList = navDialog ? navDialog->findChild<QListWidget*>(
+                    QStringLiteral("inputLabStepNavigatorList")) : nullptr;
+                auto* navMode = navDialog ? navDialog->findChild<QComboBox*>(
+                    QStringLiteral("inputLabStepNavigatorMode")) : nullptr;
+                auto* navSearch = navDialog ? navDialog->findChild<QLineEdit*>(
+                    QStringLiteral("inputLabStepNavigatorSearch")) : nullptr;
+                auto* navGo = navDialog ? navDialog->findChild<QPushButton*>(
+                    QStringLiteral("inputLabStepNavigatorGo")) : nullptr;
+                ok &= navDialog && navList && navMode && navSearch && navGo;
+                if (navList && navMode && navSearch && navGo) {
+                    // Both actions have screenshot metadata; only the second is starred.
+                    ok &= navMode->currentIndex() == 0 && navList->count() == 2;
+                    navMode->setCurrentIndex(5);  // With notes.
+                    ok &= navList->count() == 1;
+                    navMode->setCurrentIndex(4);  // All real actions.
+                    ok &= navList->count() == 2;
+                    navSearch->setText(QStringLiteral("#2"));
+                    ok &= navList->count() == 1 &&
+                          navList->item(0)->data(Qt::UserRole).toInt() == 1;
+                    navGo->click();
+                    app.processEvents();
+                    ok &= table->currentRow() == 1;
+                }
+                if (navDialog && navDialog->isVisible()) navDialog->reject();
+            }
+            milestone(7); // Navigator
+            button->click();
+            app.processEvents();
+            auto* dialog = window.findChild<QDialog*>(QStringLiteral("inputLabScenarioCheckDialog"));
+            auto* issues = dialog ? dialog->findChild<QListWidget*>(
+                QStringLiteral("inputLabScenarioCheckIssues")) : nullptr;
+            auto* summary = dialog ? dialog->findChild<QLabel*>(
+                QStringLiteral("inputLabScenarioCheckSummary")) : nullptr;
+            auto* close = dialog ? dialog->findChild<QPushButton*>(
+                QStringLiteral("inputLabScenarioCheckClose")) : nullptr;
+            auto* copyReport = dialog ? dialog->findChild<QPushButton*>(
+                QStringLiteral("inputLabScenarioCheckCopy")) : nullptr;
+            bool hasScreenshotWarning = false;
+            if (issues) for (int i = 0; i < issues->count(); ++i) {
+                const QString message = issues->item(i)->text();
+                if (issues->item(i)->data(Qt::UserRole).toInt() == 0 &&
+                    (message.contains(QStringLiteral("screenshot"), Qt::CaseInsensitive) ||
+                     message.contains(QString::fromUtf8("снимок"), Qt::CaseInsensitive)))
+                    hasScreenshotWarning = true;
+            }
+            ok &= dialog && issues && summary && close && copyReport &&
+                  summary->text().contains(QStringLiteral("Steps: 2")) &&
+                  summary->text().contains(QStringLiteral("0/2")) &&
+                  hasScreenshotWarning && issues->count() > 0 && table->rowCount() == 2;
+            if (close) close->click();
+            if (!ok) {
+                QFile diagnostic(QCoreApplication::applicationDirPath() + QStringLiteral("/gui-scenario-check-smoke.log"));
+                if (diagnostic.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                    QString text = QStringLiteral("first failure milestone: %1\n").arg(firstFailure ? firstFailure : 8);
+                    text += QStringLiteral("summary: ") + (summary ? summary->text() : QStringLiteral("<none>")) + QLatin1Char('\n');
+                    if (issues) for (int i = 0; i < issues->count(); ++i)
+                        text += issues->item(i)->text() + QLatin1Char('\n');
+                    diagnostic.write(text.toUtf8());
+                }
+                qCritical() << "Scenario preflight and identity search smoke test failed";
+            }
+            app.exit(ok ? 0 : 1);
+        });
+    }
     if (app.arguments().contains(QStringLiteral("--smoke-test-unified-search"))) {
         // Do not click a real target: verify the one-window hierarchy, the
         // shared element list and the internal engine-agnostic source selector.
@@ -485,7 +805,13 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                    "loading actions must not create a selection without user input");
             expect(!table->alternatingRowColors(),
                    "alternating rows must not mimic highlighted selections");
-            expect(table->columnCount() == 3, "three action columns expected");
+            expect(table->columnCount() == 5, "five action columns expected");
+            expect(table->item(0, 3) && !table->item(0, 3)->text().isEmpty(),
+                   "step duration should be calculated");
+            expect(table->item(1, 4) && table->item(1, 4)->text().contains(QStringLiteral(":")),
+                   "step completion must show local clock time");
+            expect(window.findChild<QPushButton*>(QStringLiteral("inputLabCopyDiagnostic")) != nullptr,
+                   "diagnostic copy control missing");
             expect(table->viewport()->contextMenuPolicy() == Qt::CustomContextMenu,
                    "viewport right-click policy missing");
             expect(table->horizontalHeader()->contextMenuPolicy() == Qt::CustomContextMenu,
@@ -556,14 +882,33 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                    "explicit add should select only the newly created action");
             auto menu = openRowMenu(0);
             expect(action(menu, "stepCopy") && action(menu, "stepPaste") &&
-                   action(menu, "stepDuplicate") && action(menu, "stepDelete"),
-                   "copy/paste/duplicate/delete entries missing");
+                   action(menu, "stepDuplicate") && action(menu, "stepDelete") &&
+                   action(menu, "stepRename"),
+                   "rename/copy/paste/duplicate/delete entries missing");
             expect(action(menu, "stepFirst") && action(menu, "stepLast") &&
                    action(menu, "listUndo") && action(menu, "listRedo"),
                    "move/undo/redo entries missing");
             expect(submenu(menu, "stepInsertBefore") && submenu(menu, "stepInsertAfter"),
                    "insert before/after submenus missing");
-            if (auto* copy = action(menu, "stepCopy")) copy->trigger();
+            if (auto* copy = action(menu, "stepCopy")) {
+                expect(copy->isEnabled(), "copy action is disabled");
+                copy->trigger();
+            }
+            const auto* copiedMime = QApplication::clipboard()->mimeData();
+            if (!copiedMime || !copiedMime->hasFormat(QStringLiteral("application/x-clicknova-action+json"))) {
+                QFile diagnostics(diagnosticPath);
+                if (diagnostics.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+                    diagnostics.write(QStringLiteral("clipboard formats: %1; owns: %2\n")
+                        .arg(copiedMime ? copiedMime->formats().join(QLatin1Char(',')) : QStringLiteral("<null>"))
+                        .arg(QApplication::clipboard()->ownsClipboard()).toUtf8());
+                }
+            }
+            // A locked OS clipboard must not prevent an in-process step paste.
+            // The following menu assertion tests both normal and fallback paths.
+            if (copiedMime && !copiedMime->formats().isEmpty())
+                expect(copiedMime->hasFormat(
+                           QStringLiteral("application/x-clicknova-action+json")),
+                       "copy used the wrong clipboard format");
             closeMenu(menu);
             expect(!menuNow(), "closed row popup still has the active menu name");
 
@@ -888,7 +1233,7 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             auto* remove = review.findChild<QPushButton*>(QStringLiteral("reviewRemove"));
             auto* replace = review.findChild<QPushButton*>(QStringLiteral("reviewReplace"));
             auto* saving = review.findChild<QCheckBox*>(QStringLiteral("reviewSaveOptional"));
-            bool ok = table && table->rowCount() == 4 && table->columnCount() == 3 &&
+            bool ok = table && table->rowCount() == 4 && table->columnCount() == 4 &&
                       table->item(0, 2) &&
                       table->item(0, 2)->text().contains(QStringLiteral("Example browser")) && summary &&
                       summary->text().contains(QStringLiteral("42")) && remove && replace &&
@@ -934,11 +1279,13 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                 auto* cancel = overlay ? overlay->findChild<QPushButton*>(QStringLiteral("recorderCancel")) : nullptr;
                 auto* keyboard = overlay ? overlay->findChild<QCheckBox*>(QStringLiteral("recorderKeyboard")) : nullptr;
                 auto* movement = overlay ? overlay->findChild<QCheckBox*>(QStringLiteral("recorderMovement")) : nullptr;
+                auto* screenshots = overlay ? overlay->findChild<QCheckBox*>(QStringLiteral("recorderClickImages")) : nullptr;
                 auto* textInput = overlay ? overlay->findChild<QCheckBox*>(QStringLiteral("recorderTypingText")) : nullptr;
                 auto* windowInfo = overlay ? overlay->findChild<QLabel*>(QStringLiteral("recorderActiveWindow")) : nullptr;
                 ok &= overlay && overlay->isVisible() && start && start->isEnabled() &&
                       pause && !pause->isEnabled() && stop && !stop->isEnabled() &&
                       cancel && keyboard && movement && movement->isChecked() &&
+                      screenshots && !screenshots->isChecked() &&
                       textInput && windowInfo && textInput->isEnabled() == keyboard->isChecked();
                 // QDialog's default Escape/reject behavior used to hide the
                 // recorder and discard its in-memory events without a review.
@@ -1131,6 +1478,7 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             };
             auto* nav = window.findChild<QListWidget*>(QStringLiteral("navigation"));
             auto* table = window.findChild<QTableWidget*>(QStringLiteral("inputLabActions"));
+            auto* editorDialog = window.findChild<QDialog*>(QStringLiteral("inputLabStepEditorDialog"));
             auto* types = window.findChild<QComboBox*>(QStringLiteral("inputLabType"));
             auto* quickClick = window.findChild<QPushButton*>(QStringLiteral("inputLabQuickClick"));
             auto* quickWait = window.findChild<QPushButton*>(QStringLiteral("inputLabQuickWait"));
@@ -1154,11 +1502,18 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             auto* stepWindowActivate = window.findChild<QCheckBox*>(QStringLiteral("inputLabStepActivateWindow"));
             auto* stepWindowWait = window.findChild<QLineEdit*>(QStringLiteral("inputLabStepWindowWaitMs"));
             auto* library = window.findChild<QComboBox*>(QStringLiteral("inputLabSavedPlans"));
-            if (expect(nav && table && types && quickClick && quickWait && quickWaitUntil && quickCode && script &&
+            if (expect(nav && table && editorDialog && types && quickClick && quickWait && quickWaitUntil && quickCode && script &&
                        record && run && windowPicker && library && stepWindowPicker && stepWindowClear && elementSearch && elementClear &&
                        stepWindowEnforce && stepWindowActivate && stepWindowWait && previewNext && liveNext &&
                        waitExpression && waitSyntaxHint && clock && clockPreview,
                        "required workspace/timing controls missing")) {
+                const auto openSelectedStep = [&](int row) {
+                    if (row < 0 || !table || !editorDialog) return false;
+                    const bool invoked = QMetaObject::invokeMethod(table, "cellDoubleClicked",
+                        Qt::DirectConnection, Q_ARG(int, row), Q_ARG(int, 0));
+                    app.processEvents();
+                    return invoked && editorDialog->isVisible();
+                };
                 // v0.5.17 added PowerShell as action type 12 (13 types total).
                 // Check type identities instead of assuming there are exactly 12.
                 expect(nav->count() == 3, "navigation should contain three sections");
@@ -1179,6 +1534,8 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                        "click and wait quick actions were not appended");
                 if (table->rowCount() > 0) {
                     table->setCurrentCell(table->rowCount() - 1, 0);
+                    expect(openSelectedStep(table->rowCount() - 1),
+                           "Wait action editor did not open in a separate window");
                     expect(types->currentData().toInt() == 7,
                            "Wait action did not load into the shared editor");
                     expect(previewNext->isVisible() && !liveNext->text().isEmpty(),
@@ -1197,21 +1554,40 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                            "invalid duration expression must be reported to the user");
                     waitExpression->setText(QStringLiteral("3д 2ч 15мин 8с 250мс"));
                 }
+                if (editorDialog && editorDialog->isVisible()) {
+                    auto* saveWaitStep = editorDialog->findChild<QPushButton*>(
+                        QStringLiteral("inputLabCloseStepEditor"));
+                    expect(saveWaitStep != nullptr, "Wait-step Save button missing");
+                    if (saveWaitStep) saveWaitStep->click();
+                    app.processEvents();
+                    expect(!editorDialog->isVisible(), "Wait-step dialog did not close on Save");
+                }
                 quickCode->click(); // Only inserts a script step; does NOT execute it.
                 expect(table->rowCount() == before + 3,
                        "PowerShell quick action was not appended");
                 if (table->rowCount() > 0) {
                     table->setCurrentCell(table->rowCount() - 1, 0);
+                    expect(openSelectedStep(table->rowCount() - 1),
+                           "PowerShell action editor did not open in a separate window");
                     expect(types->currentData().toInt() == 12 && script->isVisible(),
-                           "PowerShell step is not editable in the shared editor");
+                           "PowerShell step is not editable in the separate editor");
                 }
                 // A clock-based delay is a NEW, editable action in the SAME table.
+                if (editorDialog && editorDialog->isVisible()) {
+                    auto* saveScriptStep = editorDialog->findChild<QPushButton*>(
+                        QStringLiteral("inputLabCloseStepEditor"));
+                    expect(saveScriptStep != nullptr, "Script-step Save button missing");
+                    if (saveScriptStep) saveScriptStep->click();
+                    app.processEvents();
+                    expect(!editorDialog->isVisible(), "Script-step dialog did not close on Save");
+                }
                 const int beforeClock = table->rowCount();
                 quickWaitUntil->click();
                 expect(table->rowCount() == beforeClock + 1,
                        "Wait-until quick action was not appended");
                 table->setCurrentCell(table->rowCount() - 1, 0);
-                app.processEvents();
+                expect(openSelectedStep(table->rowCount() - 1),
+                       "Wait-until editor did not open in a separate window");
                 expect(types->currentData().toInt() == 13 && clock->isVisible() &&
                        clockPreview->isVisible(), "Wait-until clock editor is unavailable");
                 clock->setTime(QTime(18, 30, 0));
@@ -1220,7 +1596,51 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                        "Wait-until local time is missing from the preview");
                 expect(table->item(table->rowCount()-1, 1)->text().contains(QStringLiteral("18:30:00")),
                        "Wait-until time was not saved in the step table");
+                editorDialog->close();
                 nav->setCurrentRow(0);
+                // Verify the other independent editor (quick-click sequence),
+                // including rollback, Save and pickers inside the dialog.
+                auto* sequenceAdd = window.findChild<QPushButton*>(QStringLiteral("sequenceAddPoint"));
+                auto* sequenceTable = window.findChild<QTableWidget*>(QStringLiteral("sequenceSteps"));
+                auto* sequenceDialog = window.findChild<QDialog*>(QStringLiteral("sequenceStepEditorDialog"));
+                auto* sequenceX = window.findChild<QSpinBox*>(QStringLiteral("sequenceCoordinateX"));
+                auto* sequenceSave = window.findChild<QPushButton*>(QStringLiteral("sequenceUpdateSelected"));
+                auto* sequenceCancel = window.findChild<QPushButton*>(QStringLiteral("sequenceDiscardChanges"));
+                expect(sequenceAdd && sequenceTable && sequenceDialog && sequenceX &&
+                       sequenceSave && sequenceCancel, "sequence editor widgets missing");
+                if (sequenceAdd && sequenceTable && sequenceDialog && sequenceX && sequenceSave && sequenceCancel) {
+                    sequenceAdd->click();
+                    app.processEvents();
+                    const int row = sequenceTable->rowCount() - 1;
+                    expect(row >= 0, "sequence editor could not append step");
+                    if (row >= 0) {
+                        // Add already opens the editor; ensure a second open
+                        // uses the existing window instead of creating another.
+                        const bool opened = QMetaObject::invokeMethod(sequenceTable, "cellDoubleClicked",
+                            Qt::DirectConnection, Q_ARG(int, row), Q_ARG(int, 0));
+                        app.processEvents();
+                        expect(opened && sequenceDialog->isVisible(), "sequence step dialog not visible");
+                        expect(sequenceDialog->findChild<QPushButton*>(QStringLiteral("sequenceEditorPickPoint")) &&
+                               sequenceDialog->findChild<QPushButton*>(QStringLiteral("sequenceEditorChooseWindow")),
+                               "sequence capture and window tools not moved into the editor");
+                        const int originalX = sequenceX->value();
+                        sequenceX->setValue(originalX == 123 ? 124 : 123);
+                        sequenceCancel->click();
+                        app.processEvents();
+                        expect(sequenceX->value() == originalX,
+                               "sequence Cancel did not restore its coordinate");
+                        const bool reopened = QMetaObject::invokeMethod(sequenceTable, "cellDoubleClicked",
+                            Qt::DirectConnection, Q_ARG(int, row), Q_ARG(int, 0));
+                        app.processEvents();
+                        expect(reopened && sequenceDialog->isVisible(), "sequence dialog did not reopen");
+                        const int committedX = originalX == 135 ? 136 : 135;
+                        sequenceX->setValue(committedX);
+                        sequenceSave->click();
+                        app.processEvents();
+                        expect(sequenceX->value() == committedX,
+                               "sequence Save discarded coordinates");
+                    }
+                }
             }
             if (!pass) qCritical() << "Unified Sequence UI smoke test failed";
             app.exit(pass ? 0 : 1);
@@ -1237,15 +1657,20 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
         });
     }
     if (app.arguments().contains(QStringLiteral("--smoke-test-input-lab"))) {
+        QFile::remove(QCoreApplication::applicationDirPath() +
+            QStringLiteral("/gui-input-lab-smoke.log"));
         // UI-only verification: no real input is injected.
         QTimer::singleShot(80, &app, [&app, &window] {
             auto* nav = window.findChild<QListWidget*>(QStringLiteral("navigation"));
             if (nav && nav->count() >= 3) nav->setCurrentRow(1);
             auto* lab = window.findChild<QWidget*>(QStringLiteral("inputLab"));
             auto* table = window.findChild<QTableWidget*>(QStringLiteral("inputLabActions"));
+            auto* editorDialog = window.findChild<QDialog*>(QStringLiteral("inputLabStepEditorDialog"));
             auto* add = window.findChild<QPushButton*>(QStringLiteral("inputLabQuickKey"));
             auto* type = window.findChild<QComboBox*>(QStringLiteral("inputLabType"));
             auto* run = window.findChild<QPushButton*>(QStringLiteral("inputLabRun"));
+            auto* report = window.findChild<QPushButton*>(QStringLiteral("inputLabExecutionReport"));
+            auto* continueButton = window.findChild<QPushButton*>(QStringLiteral("inputLabResumeFailed"));
             auto* saved = window.findChild<QComboBox*>(QStringLiteral("inputLabSavedPlans"));
             auto* save = window.findChild<QPushButton*>(QStringLiteral("inputLabSavePlan"));
             auto* load = window.findChild<QPushButton*>(QStringLiteral("inputLabLoadPlan"));
@@ -1259,7 +1684,9 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             auto* captureMouse = window.findChild<QPushButton*>(QStringLiteral("inputLabCaptureMouse"));
             auto* captureKey = window.findChild<QPushButton*>(QStringLiteral("inputLabCaptureKey"));
             auto* quickHold = window.findChild<QSpinBox*>(QStringLiteral("quickHoldDuration"));
-            bool pass = nav && lab && table && add && type && run && lab->isVisible() &&
+            bool pass = nav && lab && table && editorDialog && add && type && run &&
+                        continueButton && !continueButton->isVisible() &&
+                        report && !report->isEnabled() && lab->isVisible() &&
                         saved && save && load && erase && timedHold && text && captureMouse && captureKey && quickHold &&
                         moveMode && moveX && moveY && moveDuration;
             if (pass) {
@@ -1268,6 +1695,13 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                 add->click();
                 pass &= table->rowCount() == before + 1 &&
                         table->item(table->rowCount() - 1, 0)->text().contains(QStringLiteral("Key"));
+                // Fields live in their own top-level dialog now: open it through
+                // the actual table double-click signal before visibility checks.
+                const int editedRow = table->rowCount() - 1;
+                const bool opened = QMetaObject::invokeMethod(table, "cellDoubleClicked",
+                    Qt::DirectConnection, Q_ARG(int, editedRow), Q_ARG(int, 0));
+                app.processEvents();
+                pass &= opened && editorDialog->isVisible();
                 pass &= run->isEnabled() && save->isEnabled();
                 pass &= !load->isEnabled() && !erase->isEnabled();
                 type->setCurrentIndex(8); // Timed mouse hold.
@@ -1290,6 +1724,18 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                 type->setCurrentIndex(4); // Untimed mouse button down.
                 pass &= table->item(table->rowCount() - 1, 0)->text().contains(QStringLiteral("until"));
                 pass &= quickHold->maximum() == 60000;
+                // The step editor is window-modal. Commit the modified action
+                // before invoking quick-add buttons in the parent window.
+                auto* savePrimaryStep = editorDialog ?
+                    editorDialog->findChild<QPushButton*>(QStringLiteral("inputLabCloseStepEditor")) : nullptr;
+                if (savePrimaryStep && editorDialog->isVisible()) {
+                    savePrimaryStep->click();
+                    app.processEvents();
+                    pass &= !editorDialog->isVisible();
+                } else {
+                    pass = false;
+                }
+                pass &= run->isEnabled() && save->isEnabled();
                 // The common tasks must be one click away. Rare editing tools
                 // and saved plans are available but not permanently expanded.
                 auto* quickClick = window.findChild<QPushButton*>(QStringLiteral("inputLabQuickClick"));
@@ -1328,8 +1774,70 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
                 if (savedToggle && savedGroup) {
                     savedToggle->click(); pass &= savedGroup->isVisible();
                 }
+                if (editorDialog) editorDialog->close();
+                // An element action must now be editable within the same
+                // independent dialog. Cancel restores its complete payload.
+                if (auto* inputLab = dynamic_cast<InputLabWidget*>(lab)) {
+                    clicknova::input::Plan elementPlan;
+                    clicknova::input::ElementTask task;
+                    task.command = clicknova::input::ElementCommand::WaitVisible;
+                    task.timeoutMs = 5000;
+                    elementPlan.actions.push_back(task);
+                    clicknova::input::StepWindow binding;
+                    binding.title = "Test application";
+                    binding.elementName = "Search button";
+                    binding.elementAutomationId = "example-element";
+                    binding.elementRole = 1; // Button role; required by accessibility validation.
+                    binding.elementProvider = 0; // UIA.
+                    elementPlan.stepWindows.push_back(binding);
+                    inputLab->replaceActions(elementPlan);
+                    const QByteArray original = table->item(0, 0)->data(Qt::UserRole).toByteArray();
+                    const bool openedElement = QMetaObject::invokeMethod(table, "cellDoubleClicked",
+                        Qt::DirectConnection, Q_ARG(int, 0), Q_ARG(int, 0));
+                    app.processEvents();
+                    auto* elementPanel = window.findChild<QGroupBox*>(QStringLiteral("inputLabElementTaskEditor"));
+                    auto* timeout = window.findChild<QSpinBox*>(QStringLiteral("inputLabElementTaskTimeout"));
+                    auto* cancelEditor = window.findChild<QPushButton*>(QStringLiteral("inputLabCancelStepEditor"));
+                    auto* saveEditor = window.findChild<QPushButton*>(QStringLiteral("inputLabCloseStepEditor"));
+                    pass &= openedElement && elementPanel && elementPanel->isVisible() &&
+                            timeout && timeout->isVisible() && cancelEditor && saveEditor;
+                    if (timeout && cancelEditor && editorDialog && editorDialog->isVisible()) {
+                        timeout->setValue(7100);
+                        pass &= table->item(0, 0)->data(Qt::UserRole).toByteArray() != original;
+                        cancelEditor->click();
+                        app.processEvents();
+                        pass &= table->item(0, 0)->data(Qt::UserRole).toByteArray() == original;
+                        const bool reopened = QMetaObject::invokeMethod(table, "cellDoubleClicked",
+                            Qt::DirectConnection, Q_ARG(int, 0), Q_ARG(int, 0));
+                        app.processEvents();
+                        pass &= reopened && editorDialog->isVisible();
+                        timeout->setValue(7200);
+                        saveEditor->click();
+                        app.processEvents();
+                        pass &= table->item(0, 0)->data(Qt::UserRole).toByteArray() != original;
+                    }
+                }
             }
-            if (!pass) qCritical() << "Input Lab UI smoke test failed";
+            if (!pass) {
+                const QString diagnosticPath = QCoreApplication::applicationDirPath() +
+                    QStringLiteral("/gui-input-lab-smoke.log");
+                QFile diagnostic(diagnosticPath);
+                if (diagnostic.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+                    const QString message = QStringLiteral(
+                        "gui_input_lab_smoke: one or more editor checks failed\n"
+                        "table rows=%1, current row=%2, step dialog visible=%3, "
+                        "type=%4, run enabled=%5, saved enabled=%6\n"
+                        "Make sure modal editor is saved or cancelled before quick-add.\n")
+                        .arg(table ? table->rowCount() : -1)
+                        .arg(table ? table->currentRow() : -1)
+                        .arg(static_cast<int>(editorDialog && editorDialog->isVisible()))
+                        .arg(type ? type->currentIndex() : -1)
+                        .arg(static_cast<int>(run && run->isEnabled()))
+                        .arg(static_cast<int>(save && save->isEnabled()));
+                    diagnostic.write(message.toUtf8());
+                }
+                qCritical() << "Input Lab UI smoke test failed";
+            }
             app.exit(pass ? 0 : 1);
         });
     }
@@ -1488,10 +1996,49 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             auto* quick = window.findChild<QPushButton*>(QStringLiteral("inputLabQuickClick"));
             auto* record = window.findChild<QPushButton*>(QStringLiteral("inputLabRecord"));
             auto* run = window.findChild<QPushButton*>(QStringLiteral("inputLabRun"));
-            const bool pass = nav && nav->width() <= 150 && table && quick && record && run &&
+            auto* splitter = window.findChild<QSplitter*>(QStringLiteral("mainWorkspaceSplitter"));
+            auto* toggle = window.findChild<QToolButton*>(QStringLiteral("navigationCollapse"));
+            auto* pages = window.findChild<QStackedWidget*>();
+            bool pass = nav && splitter && toggle && splitter->count() == 2 &&
+                table && quick && record && run &&
                 quick->isVisible() && record->isVisible() && run->isVisible() &&
                 !table->toolTip().isEmpty() && !run->toolTip().isEmpty();
-            if (!pass) qCritical() << "Adaptive unified layout smoke test failed";
+            if (pass) {
+                const int previousRow = nav->currentRow();
+                toggle->click();
+                app.processEvents();
+                pass &= splitter->widget(0)->width() <= 72 &&
+                    nav->viewMode() == QListView::IconMode && nav->count() == 3;
+                nav->setCurrentRow(2);
+                app.processEvents();
+                pass &= pages && pages->currentIndex() == 6;
+                toggle->click();
+                app.processEvents();
+                pass &= splitter->widget(0)->width() >= 144 &&
+                    nav->viewMode() == QListView::ListMode &&
+                    !nav->item(0)->text().isEmpty();
+                nav->setCurrentRow(previousRow);
+            }
+            // UI cleanup must never remove the real editing commands.
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabCreateManualGroup")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabDuplicateStep")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabDeleteStep")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabUndoStep")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabRedoStep")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabSearchUiElements")) != nullptr;
+            pass &= window.findChild<QPushButton*>(QStringLiteral("inputLabStepChooseWindow")) != nullptr;
+            auto* mainEditor = window.findChild<QDialog*>(QStringLiteral("inputLabStepEditorDialog"));
+            auto* sequenceEditor = window.findChild<QDialog*>(QStringLiteral("sequenceStepEditorDialog"));
+            pass &= mainEditor && !mainEditor->isModal() &&
+                    mainEditor->windowModality() == Qt::NonModal;
+            pass &= sequenceEditor && !sequenceEditor->isModal() &&
+                    sequenceEditor->windowModality() == Qt::NonModal;
+            pass &= window.findChild<QLabel*>(QStringLiteral("inputLabEditHeading")) != nullptr;
+            if (nav && nav->count() == 3) {
+                for (int i = 0; i < nav->count(); ++i)
+                    pass &= !nav->item(i)->data(Qt::AccessibleTextRole).toString().isEmpty();
+            } else pass = false;
+            if (!pass) qCritical() << "Adaptive navigation/sidebar/commands smoke test failed";
             app.exit(pass ? 0 : 1);
         });
     }
@@ -1591,8 +2138,13 @@ void scheduleMainWindowSmokeTests(QApplication& app, QMainWindow& window) {
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutStop")) != nullptr;
             fieldsHaveMinimumHeight &= window.findChild<QKeySequenceEdit*>(QStringLiteral("shortcutPick")) != nullptr;
             const auto scrolls = window.findChildren<QScrollArea*>();
-            fieldsHaveMinimumHeight &= checkLayout(scrolls.size() == 7,
-                QStringLiteral("expected 7 scroll areas, got %1").arg(scrolls.size()));
+            // The main UI still owns seven scroll areas. Two more belong to
+            // the independent step-editing dialogs and are created at startup.
+            const auto* inputEditor = window.findChild<QDialog*>(QStringLiteral("inputLabStepEditorDialog"));
+            const auto* sequenceEditor = window.findChild<QDialog*>(QStringLiteral("sequenceStepEditorDialog"));
+            fieldsHaveMinimumHeight &= checkLayout(scrolls.size() == 9 && inputEditor && sequenceEditor &&
+                    inputEditor->findChild<QScrollArea*>() && sequenceEditor->findChild<QScrollArea*>(),
+                QStringLiteral("expected 7 page and 2 editor scroll areas, got %1").arg(scrolls.size()));
             // Wheel-over-input must scroll the containing page, not change settings.
             auto* interval = window.findChild<QSpinBox*>(QStringLiteral("quickClickInterval"));
             auto* startDelay = window.findChild<QSpinBox*>(QStringLiteral("quickStartDelayValue"));

@@ -150,6 +150,28 @@ Write-Host "ClickNova: configure with Qt at $QtRoot and MSVC v143" -ForegroundCo
 $nativeExit = -1
 Invoke-ClickNovaNative 'cmake' (@('-S', $root, '-B', $build, '-G', 'Visual Studio 18 2026', '-A', 'x64', '-T', 'v143', "-DCMAKE_PREFIX_PATH=$QtRoot", '-DCLICKNOVA_BUILD_GUI=ON') + $cmakeExtra) ([ref]$nativeExit)
 if ($nativeExit -ne 0) { throw "CMake configuration failed (exit $nativeExit). See the configure messages above." }
+# Build the actual Windows GUI FIRST. Previous CI/Windows runs compiled dozens
+# of test executables before reaching the actual Widgets UI.
+# Fail fast with a dedicated, persistent GUI compiler log.
+$guiBuildLog = Join-Path $build 'last-msbuild-gui.log'
+if (Test-Path -LiteralPath $guiBuildLog) { Remove-Item -LiteralPath $guiBuildLog -Force }
+Write-Host "MSVC GUI preflight (ClickNova.exe): $guiBuildLog" -ForegroundColor Cyan
+$nativeExit = -1
+Invoke-ClickNovaNative 'cmake' @('--build', $build, '--target', 'ClickNova', '--config', 'Release',
+    '--parallel', '2', '--', '/fl', "/flp:logfile=$guiBuildLog;verbosity=normal;encoding=UTF-8") ([ref]$nativeExit)
+if ($nativeExit -ne 0) {
+    Write-Host 'MSVC GUI compilation failed; tests were not built or run.' -ForegroundColor Red
+    if (Test-Path -LiteralPath $guiBuildLog) {
+        $guiErrors = @(Select-String -LiteralPath $guiBuildLog -Pattern ': error ', 'fatal error', 'error C[0-9]+', 'error LNK[0-9]+', 'error MSB[0-9]+', 'ошибка' | Select-Object -Last 40)
+        if ($guiErrors.Count -gt 0) {
+            foreach ($entry in $guiErrors) { Write-Host $entry.Line -ForegroundColor Red }
+        } else {
+            Get-Content -LiteralPath $guiBuildLog -Tail 65 | ForEach-Object { Write-Host $_ }
+        }
+    }
+    throw "GUI compilation failed (exit $nativeExit). See $guiBuildLog"
+}
+Write-Host 'Native GUI compilation passed; building remaining test targets.' -ForegroundColor Green
 # The PowerShell 5.1 transcript can omit MSBuild output from parallel native
 # processes. Use MSBuild's own file logger as the authoritative diagnostic log.
 # Keep parallelism bounded to avoid exhausting RAM on consumer Windows PCs.

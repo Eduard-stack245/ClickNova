@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/action_list_edit.hpp"
 #ifdef NDEBUG
 #undef NDEBUG

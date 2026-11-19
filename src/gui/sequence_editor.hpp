@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include "clicknova/sequence.hpp"
@@ -7,12 +7,14 @@
 
 #include <QAbstractItemView>
 #include <QComboBox>
+#include <QDialog>
 #include <QDropEvent>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
@@ -98,7 +100,7 @@ public:
         return table_->currentRow() >= 0 && table_->currentRow() < static_cast<int>(steps_.size());
     }
     // Action edits are committed immediately; dirty_ only controls Undo.
-    bool hasUnsavedActionChanges() const { return false; }
+    bool hasUnsavedActionChanges() const { return editDialog_ && editDialog_->isVisible(); }
     bool assignPickedWindow(const clicknova::platform::WindowTarget& target) {
         if (locked_ || !hasSelectedAction() || !target.handle || !target.processId) return false;
         const int row = table_->currentRow();
@@ -115,6 +117,9 @@ public:
         step.windowTitle = QString::fromStdWString(target.title).toUtf8().toStdString();
         step.space = clicknova::sequence::Space::Client;
         refresh(row);
+        if (editDialog_ && editingRow_ == row && !locked_) {
+            editDialog_->show(); editDialog_->raise();
+        }
         return true;
     }
     void addCapturedPoint(int x, int y, clicknova::sequence::Space space) {
@@ -128,6 +133,9 @@ public:
             if (!canUse(candidate)) return;
             steps_ = std::move(candidate);
             refresh(row);
+            if (editDialog_ && editingRow_ == row && !locked_) {
+                editDialog_->show(); editDialog_->raise();
+            }
         } else {
             clicknova::sequence::Step step{x, y, button_->currentIndex(), delay_->value(), space};
             step.clickCount = clicks_->value();
@@ -140,13 +148,21 @@ public:
         locked_ = value;
         const std::initializer_list<QWidget*> controls = {x_, y_, button_, delay_, interval_, clicks_, window_, add_, pick_, hover_, capture_, pickWindow_, chooseWindow_, pickSeconds_, passDelay_, windowSettingsToggle_, editToggle_};
         for (QWidget* w : controls) w->setEnabled(!locked_);
-        revert_->setEnabled(!locked_ && dirty_);
+        revert_->setEnabled(!locked_ && hasSelectedAction());
         table_->setEnabled(!locked_);
         updateButtons();
     }
     void setLanguage(const QString& language) {
         language_ = language;
         hint_->setText(label(QStringLiteral("First add an action. Then select a point by click, shortcut or timer.")));
+        stepSearch_->setPlaceholderText(language_ == QStringLiteral("ru")
+            ? QString::fromUtf8("Найти шаг: номер, координаты, окно...")
+            : QStringLiteral("Find step: number, coordinates, window..."));
+        stepSearchPrevious_->setText(language_ == QStringLiteral("ru")
+            ? QString::fromUtf8("Назад") : QStringLiteral("Previous"));
+        stepSearchNext_->setText(language_ == QStringLiteral("ru")
+            ? QString::fromUtf8("Далее") : QStringLiteral("Next"));
+        updateSearch();
         detailGroup_->setTitle(label(QStringLiteral("Selected action")));
         windowSettingsToggle_->setText(label(QStringLiteral("Window settings (optional)")));
         note_->setText(label(QStringLiteral("Drag rows to reorder. Individual windows require foreground focus; saved windows must be selected again after restart.")));
@@ -156,10 +172,25 @@ public:
         capture_->setText(label(QStringLiteral("Timed capture")));
         updateHoverLabel();
         pickSeconds_->setToolTip(label(QStringLiteral("Capture delay in seconds")));
-        update_->setText(label(QStringLiteral("Done")));
-        revert_->setText(label(QStringLiteral("Undo edits")));
+        update_->setText(language_ == QStringLiteral("ru") ? QString::fromUtf8("Сохранить шаг") : QStringLiteral("Save step"));
+        revert_->setText(language_ == QStringLiteral("ru") ? QString::fromUtf8("Отмена") : QStringLiteral("Cancel"));
         editToggle_->setText(label(QStringLiteral("Edit selected action")));
-        editToggle_->setToolTip(label(QStringLiteral("Show or hide details for the selected action")));
+        if (editDialog_) {
+            if (auto* hint = editDialog_->findChild<QLabel*>(QStringLiteral("sequenceEditorHint")))
+                hint->setText(language_ == QStringLiteral("ru") ?
+                    QString::fromUtf8("Сохранить — применить изменения, Отмена или X — вернуть прежние значения.") :
+                    QStringLiteral("Save commits changes; Cancel or X restores the previous values."));
+            const auto setCaption = [this](const char* name, const char* en, const char* ru) {
+                if (auto* button = editDialog_->findChild<QPushButton*>(QString::fromLatin1(name)))
+                    button->setText(QString::fromUtf8(language_ == QStringLiteral("ru") ? ru : en));
+            };
+            setCaption("sequenceEditorPickPoint", "Pick point", "Выбрать точку");
+            setCaption("sequenceEditorPickTimer", "Timed capture", "Захват по таймеру");
+            setCaption("sequenceEditorPickShortcut", "Capture by shortcut", "Захват по клавише");
+            setCaption("sequenceEditorChooseWindow", "Choose window", "Выбрать окно");
+            setCaption("sequenceEditorPickWindow", "Window under cursor", "Окно под курсором");
+        }
+        editToggle_->setToolTip(label(QStringLiteral("Edit selected action")));
         add_->setToolTip(label(QStringLiteral("Create a new action. Select its row, then choose where it should click.")));
         pick_->setToolTip(label(QStringLiteral("ClickNova hides. Click once at the destination to record its position; Esc cancels.")));
         capture_->setToolTip(label(QStringLiteral("ClickNova hides and captures the cursor when the countdown ends. Use the capture shortcut to finish early.")));
@@ -174,8 +205,8 @@ public:
         delay_->setToolTip(label(QStringLiteral("Wait before this action begins.")));
         interval_->setToolTip(label(QStringLiteral("Wait between clicks in the selected action.")));
         window_->setToolTip(label(QStringLiteral("Optional window for this action. Selecting a new window requires choosing coordinates again.")));
-        update_->setToolTip(label(QStringLiteral("Close the editor. Changes are applied automatically.")));
-        revert_->setToolTip(label(QStringLiteral("Restore the selected action to its values before editing.")));
+        update_->setToolTip(language_ == QStringLiteral("ru") ? QString::fromUtf8("Сохранить изменения выбранного шага") : QStringLiteral("Save this step"));
+        revert_->setToolTip(language_ == QStringLiteral("ru") ? QString::fromUtf8("Вернуть исходные значения шага") : QStringLiteral("Restore values from before editing"));
         table_->setToolTip(label(QStringLiteral("Select a row to edit it. Drag its handle to reorder, or use the three-dot menu.")));
 
         xLabel_->setText(label(QStringLiteral("X coordinate")));
@@ -224,6 +255,9 @@ private:
     void updateButtons();
 
     void updateRow(int row);
+    void updateSearch();
+    void findStep(bool forward);
+    void openEditDialog();
 
     void refresh(int row, bool notify = true);
 
@@ -245,10 +279,16 @@ private:
     QLabel *hint_{}, *note_{}, *selection_{}, *count_{}, *editStatus_{};
     QLabel *xLabel_{}, *yLabel_{}, *buttonLabel_{}, *delayLabel_{}, *intervalLabel_{}, *passLabel_{}, *clicksLabel_{}, *windowLabel_{};
     QGroupBox* detailGroup_{};
+    QDialog* editDialog_{};
+    int editingRow_{-1};
+    clicknova::sequence::Step editorOriginalStep_{};
     QToolButton* windowSettingsToggle_{};
     QToolButton* editToggle_{};
     QWidget* windowSettingsPanel_{};
     ActionTable* table_{};
+    QLineEdit* stepSearch_{};
+    QLabel* stepSearchCount_{};
+    QPushButton *stepSearchPrevious_{}, *stepSearchNext_{};
     QSpinBox *x_{}, *y_{}, *delay_{}, *interval_{}, *passDelay_{}, *pickSeconds_{}, *clicks_{};
     QComboBox *button_{}, *window_{};
     QPushButton *add_{}, *pick_{}, *hover_{}, *update_{}, *revert_{}, *capture_{}, *pickWindow_{}, *chooseWindow_{};

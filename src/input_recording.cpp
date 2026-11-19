@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/input_recording.hpp"
 #include <algorithm>
 #include <cmath>
@@ -20,6 +20,7 @@ bool append(Conversion& out, input::Action action, const WindowInfo& source) {
     if (out.plan.actions.size() >= kMaximumIntermediateActions) return false;
     out.plan.actions.push_back(std::move(action));
     out.windows.push_back(source);
+    out.screenshotIds.emplace_back();
     return true;
 }
 
@@ -184,7 +185,10 @@ Conversion convert(const std::vector<Sample>& samples) {
             if (added) {
                 switch (s.kind) {
                 case Kind::MouseDown:
-                    if (buttons.insert(s.button).second) added = append(result, input::ButtonDown{s.button}, s.window);
+                    if (buttons.insert(s.button).second) {
+                        added = append(result, input::ButtonDown{s.button}, s.window);
+                        if (added) result.screenshotIds.back() = s.screenshotId;
+                    }
                     break;
                 case Kind::MouseUp:
                     if (buttons.erase(s.button)) added = append(result, input::ButtonUp{s.button}, s.window);
@@ -243,8 +247,10 @@ Conversion convert(const std::vector<Sample>& samples) {
     // Never combine across an intervening action or a different window.
     std::vector<input::Action> reduced;
     std::vector<WindowInfo> reducedWindows;
+    std::vector<std::string> reducedScreenshots;
     reduced.reserve(result.plan.actions.size());
     reducedWindows.reserve(result.windows.size());
+    reducedScreenshots.reserve(result.screenshotIds.size());
     for (std::size_t i = 0; i < result.plan.actions.size();) {
         const auto& first = result.plan.actions[i];
         const auto& origin = result.windows[i];
@@ -270,6 +276,7 @@ Conversion convert(const std::vector<Sample>& samples) {
                     if (pressMs > 0) reduced.emplace_back(input::MouseHold{down->button, static_cast<int>(pressMs)});
                     else reduced.emplace_back(input::Click{down->button, 1, 0});
                     reducedWindows.push_back(origin);
+                    reducedScreenshots.push_back(result.screenshotIds[i]);
                     i = release + 1;
                     continue;
                 }
@@ -280,6 +287,7 @@ Conversion convert(const std::vector<Sample>& samples) {
                     if (pressMs > 0) reduced.emplace_back(input::KeyHold{down->virtualKey, static_cast<int>(pressMs)});
                     else reduced.emplace_back(input::KeyTap{down->virtualKey});
                     reducedWindows.push_back(origin);
+                    reducedScreenshots.push_back(result.screenshotIds[i]);
                     i = release + 1;
                     continue;
                 }
@@ -287,10 +295,17 @@ Conversion convert(const std::vector<Sample>& samples) {
         }
         reduced.push_back(first);
         reducedWindows.push_back(origin);
+        reducedScreenshots.push_back(result.screenshotIds[i]);
         ++i;
     }
     result.plan.actions = std::move(reduced);
     result.windows = std::move(reducedWindows);
+    result.screenshotIds = std::move(reducedScreenshots);
+    // Preserve the screenshot on its editable action after press/release folding.
+    // Window enforcement is still decided by the importer, not by the recorder.
+    result.plan.stepWindows.resize(result.plan.actions.size());
+    for (std::size_t i = 0; i < result.screenshotIds.size(); ++i)
+        result.plan.stepWindows[i].screenshotId = result.screenshotIds[i];
     stabilizeHeldWindows(result);
     if (result.plan.actions.size() > kMaximumActions) {
         result.error = "Recording contains more than 512 meaningful steps; shorten the session or split it into scenarios.";

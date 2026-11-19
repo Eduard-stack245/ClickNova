@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "input_plan_codec.hpp"
 #include <QJsonArray>
 #include <QJsonObject>
@@ -219,6 +219,14 @@ QJsonObject encodeBoundInputAction(const input::Action& action, const input::Ste
         if (!binding.elementValue.empty())
             record[QStringLiteral("uiaValue")] = QString::fromStdString(binding.elementValue);
     }
+    if (!binding.displayName.empty())
+        record[QStringLiteral("displayName")] = QString::fromStdString(binding.displayName);
+    if (!binding.screenshotId.empty())
+        record[QStringLiteral("screenshotId")] = QString::fromStdString(binding.screenshotId);
+    if (binding.bookmarked)
+        record[QStringLiteral("bookmarked")] = true;
+    if (!binding.note.empty())
+        record[QStringLiteral("stepNote")] = QString::fromStdString(binding.note);
     if (!binding.manualGroupId.empty()) {
         record[QStringLiteral("manualGroupId")] = QString::fromStdString(binding.manualGroupId);
         record[QStringLiteral("manualGroupTitle")] = QString::fromStdString(binding.manualGroupTitle);
@@ -227,6 +235,42 @@ QJsonObject encodeBoundInputAction(const input::Action& action, const input::Ste
 }
 std::optional<input::StepWindow> decodeStepWindow(const QJsonObject& record) {
     input::StepWindow binding;
+    const auto stepNote = record.value(QStringLiteral("stepNote"));
+    if (!stepNote.isUndefined()) {
+        if (!stepNote.isString()) return std::nullopt;
+        const QString note = stepNote.toString();
+        // Prevent unbounded scenario metadata, embedded NUL and invisible
+        // controls. Newlines and tabs are safe for user-written annotations.
+        if (note.isEmpty() || note.trimmed().isEmpty() || note.size() > 320 ||
+            std::any_of(note.begin(), note.end(), [](const QChar ch) {
+                return ch == QChar(0) || (ch.category() == QChar::Other_Control &&
+                    ch != QLatin1Char('\n') && ch != QLatin1Char('\t'));
+            })) return std::nullopt;
+        binding.note = note.toUtf8().toStdString();
+    }
+    const auto bookmark = record.value(QStringLiteral("bookmarked"));
+    if (!bookmark.isUndefined()) {
+        if (!bookmark.isBool()) return std::nullopt;
+        binding.bookmarked = bookmark.toBool();
+    }
+    const auto screenshotId = record.value(QStringLiteral("screenshotId"));
+    if (!screenshotId.isUndefined()) {
+        if (!screenshotId.isString()) return std::nullopt;
+        const QString id = screenshotId.toString();
+        static const QRegularExpression sha256(QStringLiteral("^[0-9a-f]{64}$"));
+        if (!sha256.match(id).hasMatch()) return std::nullopt;
+        binding.screenshotId = id.toStdString();
+    }
+    const auto displayName = record.value(QStringLiteral("displayName"));
+    if (!displayName.isUndefined()) {
+        if (!displayName.isString()) return std::nullopt;
+        const QString name = displayName.toString();
+        if (name.trimmed().isEmpty() || name.size() > 80 || name.contains(QChar(0)) ||
+            std::any_of(name.begin(), name.end(), [](const QChar ch) {
+                return ch.category() == QChar::Other_Control;
+            })) return std::nullopt;
+        binding.displayName = name.toStdString();
+    }
     const auto groupId = record.value(QStringLiteral("manualGroupId"));
     const auto groupTitle = record.value(QStringLiteral("manualGroupTitle"));
     if (!groupId.isUndefined() || !groupTitle.isUndefined()) {

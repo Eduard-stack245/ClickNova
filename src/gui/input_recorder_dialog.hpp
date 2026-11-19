@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_recording.hpp"
 #include <QDialog>
@@ -29,13 +29,32 @@ public:
     void finishForReview() { stop(false); }
     void bringToFront();
     bool recordingStarted() const noexcept { return started_; }
+    bool isPaused() const noexcept { return paused_; }
     QString checkpointFile() const { return checkpointFile_; }
+    QString statusText() const;
+    // Typed Qt Quick adapter. The dialog still owns all capture hooks and
+    // recovery checkpoints; no native input samples are exposed to QML.
+    bool canStartFromQml() const noexcept;
+    bool canPauseFromQml() const noexcept;
+    bool canReviewFromQml() const noexcept;
+    bool canDiscardFromQml() const noexcept;
+    bool requestStartFromQml();
+    bool requestPausedFromQml(bool paused);
+    bool requestFinishFromQml();
+    bool requestDiscardFromQml();
+    bool captureOptionFromQml(int option) const;
+    bool setCaptureOptionFromQml(int option, bool enabled);
+    int recordedEventCount() const noexcept;
+    std::uint64_t recordedElapsedMs() const noexcept;
+    QString progressTextFromQml() const;
+    QString windowTextFromQml() const;
 private:
     class NativeHooks;
     void start();
     void pauseOrResume();
     void stop(bool cancelled);
     void record(const clicknova::recording::Sample& event);
+    void captureClickImage(std::size_t index, int x, int y);
     void updateUi();
     void updateProgress();
     void maybeCheckpoint(bool force = false);
@@ -50,6 +69,10 @@ private:
     bool keyboardEnabled_{true};
     bool textEnabled_{true};
     bool movementEnabled_{true};
+    bool imagesEnabled_{}; // Never enabled by default or by prior settings.
+    int scheduledImages_{};
+    std::uint64_t lastImageTick_{};
+    std::set<std::string> newImageFiles_; // Delete only files created by this cancelled session.
     std::set<clicknova::input::Button> heldButtons_;
     std::set<int> heldKeys_;
     std::uint64_t startedTick_{};
@@ -75,6 +98,7 @@ private:
     QCheckBox* text_{};
     QLabel* window_{};
     QCheckBox* movement_{};
+    QCheckBox* images_{};
     QTimer* progressTimer_{};
     QPushButton* start_{};
     QPushButton* pause_{};

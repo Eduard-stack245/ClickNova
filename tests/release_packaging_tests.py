@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 """Exercise AppImage release staging without Qt or remote packaging downloads.
 
 The real AppImage build is tested in the GitHub Linux release runner.

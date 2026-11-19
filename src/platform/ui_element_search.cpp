@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/ui_element_search.hpp"
 #include "native_accessibility.hpp"
 #include "clicknova/visual_recognition.hpp"

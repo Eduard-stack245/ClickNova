@@ -126,6 +126,7 @@ __pycache__/
 !/.github/workflows/
 /.github/workflows/*
 !/.github/workflows/portable-releases.yml
+!/.github/workflows/widgets-windows.yml
 
 # Personal scenarios, build output, and logs are never tracked.
 
@@ -176,3 +177,16 @@ data/
 
 # Project audit notes and release documentation stay out of the minimal source repo.
 /*.md
+
+# QML migration: local state and distributables
+build*/
+data/
+dist*/
+*.zip
+*.log
+*.pdb
+*.obj
+.vs/
+.idea/
+.env
+.env.*

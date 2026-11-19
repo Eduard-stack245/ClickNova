@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "../src/gui/browser_discovery.hpp"
 #include <QCoreApplication>
 #ifdef NDEBUG

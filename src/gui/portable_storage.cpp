@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "portable_storage.hpp"
 #include <QCoreApplication>
 #include <QDir>

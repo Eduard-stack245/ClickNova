@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/input_actions.hpp"
 
 #include <algorithm>
@@ -165,12 +165,23 @@ void testUpcomingStepProgress() {
     SpyBackend backend;
     SpyWaiter waiter;
     std::vector<PlaybackProgress> notifications;
+    std::vector<PlaybackProgress> outcomes;
     const auto started = std::chrono::steady_clock::now();
     const Plan plan{{Wait{604'800'000}, KeyTap{0x41}, Wait{500}}, 2, 200};
     const auto result = play(plan, backend, waiter, {},
-        [&](const PlaybackProgress& progress) { notifications.push_back(progress); });
+        [&](const PlaybackProgress& progress) {
+            if (progress.kind == PlaybackProgress::Kind::ActionCompleted ||
+                progress.kind == PlaybackProgress::Kind::ActionFailed)
+                outcomes.push_back(progress);
+            else notifications.push_back(progress);
+        });
     assert(result.status == Status::Completed);
     assert(notifications.size() == 11);
+    assert(outcomes.size() == 6);
+    assert(std::all_of(outcomes.begin(), outcomes.end(), [](const PlaybackProgress& event) {
+        return event.kind == PlaybackProgress::Kind::ActionCompleted &&
+               event.elapsedMs >= 0;
+    }));
     using Kind = PlaybackProgress::Kind;
     // Pass 1: wait a week before the next key.
     assert(notifications[0].kind == Kind::ActionStarted && notifications[0].stepIndex == 0 &&
@@ -199,9 +210,11 @@ void testUpcomingStepProgress() {
     std::vector<PlaybackProgress> beforeCancel;
     assert(play({{Wait{1000}, KeyTap{0x42}}}, cancelled, cancelWait, {},
                 [&](const PlaybackProgress& e) { beforeCancel.push_back(e); }).status == Status::Cancelled);
-    assert(beforeCancel.size() == 2);
+    assert(beforeCancel.size() == 3);
     assert(beforeCancel[0].kind == Kind::ActionStarted);
     assert(beforeCancel[1].kind == Kind::WaitingForNextStep);
+    assert(beforeCancel[2].kind == Kind::ActionFailed);
+    assert(beforeCancel[2].stepIndex == 0 && beforeCancel[2].elapsedMs >= 0);
 }
 
 void testRepeatedClicksAndWheel() {

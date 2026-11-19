@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_actions.hpp"
 #include <cstdint>
@@ -26,11 +26,14 @@ struct Sample {
     // Only populated when "record typed text" is explicitly enabled.
     std::u16string text;
     WindowInfo window;
+    std::string screenshotId; // Optional SHA-256 of a local PNG for a mouse press.
 };
 struct Conversion {
     input::Plan plan;
     // Same indexes as plan.actions. These are labels, NOT automatic playback targets.
     std::vector<WindowInfo> windows;
+    // Exactly one screenshot ID per converted action; empty when not captured.
+    std::vector<std::string> screenshotIds;
     std::string error;
     bool completedHolds{false};
 };

@@ -1,6 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "recording_review_dialog.hpp"
 #include "ui_icons.hpp"
+#include "step_image_viewer.hpp"
+#include "step_image_store.hpp"
+#include "portable_storage.hpp"
+#include "wrap_layout.hpp"
+#include <QDir>
+#include <QFileInfo>
+#include <QImageReader>
+#include <QToolButton>
 #include "clicknova/recording_review.hpp"
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -33,9 +41,19 @@ using clicknova::input::Button;
 using clicknova::input::Axis;
 using clicknova::input::MoveMode;
 
+namespace {
+// Loading is centralized: the exact SHA-256 bytes are verified before any
+// PNG decoding. The thumbnail path has a bounded in-memory cache.
+QImage reviewImage(const std::string& id, const QSize& requested = {}) {
+    return clicknova::gui::step_images::load(id, requested);
+}
+} // namespace
+
 RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
-        std::size_t capturedEvents, std::uint64_t recordedMs, bool russian, QWidget* parent, std::vector<clicknova::recording::WindowInfo> windows)
+        std::size_t capturedEvents, std::uint64_t recordedMs, bool russian, QWidget* parent, std::vector<clicknova::recording::WindowInfo> windows,
+        std::vector<std::string> screenshotIds)
     : QDialog(parent), actions_(std::move(actions)), windows_(std::move(windows)),
+      screenshotIds_(std::move(screenshotIds)),
       capturedEvents_(capturedEvents), recordedMs_(recordedMs), russian_(russian) {
     setObjectName(QStringLiteral("recordingReviewDialog"));
     setWindowTitle(text("Review recorded actions", "Просмотр записанных действий"));
@@ -51,9 +69,10 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     stats_->setObjectName(QStringLiteral("reviewSummary"));
     stats_->setWordWrap(true);
     layout->addWidget(stats_);
-    table_ = new QTableWidget(0, 3);
+    table_ = new QTableWidget(0, 4);
     table_->setObjectName(QStringLiteral("recordingReviewActions"));
-    table_->setHorizontalHeaderLabels({text("Action", "Действие"), text("Details", "Параметры"), text("Window / application", "Окно / программа")});
+    table_->setHorizontalHeaderLabels({text("Action", "Действие"), text("Details", "Параметры"),
+        text("Window / application", "Окно / программа"), text("Image", "Снимок")});
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -62,10 +81,12 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
+    table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
     table_->setColumnWidth(2, 215);
+    table_->setColumnWidth(3, 132);
     table_->setMinimumHeight(180);
     layout->addWidget(table_, 1);
-    auto* tools = new QHBoxLayout;
+    auto* tools = new WrapLayout(nullptr, 7);
     edit_ = new QPushButton(text("Edit selected", "Изменить выбранное"));
     edit_->setObjectName(QStringLiteral("reviewEdit"));
     edit_->setProperty("actionRole", QStringLiteral("primary"));
@@ -83,7 +104,11 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     clicknova::gui::setButtonIcon(remove_, clicknova::gui::Icon::Delete, QColor(QStringLiteral("#ffcbd2")));
     clicknova::gui::setButtonIcon(up_, clicknova::gui::Icon::Up);
     clicknova::gui::setButtonIcon(down_, clicknova::gui::Icon::Down);
-    for (auto* button : {edit_, remove_, up_, down_}) tools->addWidget(button);
+    for (auto* button : {edit_, remove_, up_, down_}) {
+        button->setMaximumWidth(195);
+        button->setMinimumHeight(38);
+        tools->addWidget(button);
+    }
     layout->addLayout(tools);
     feedback_ = new QLabel;
     feedback_->setObjectName(QStringLiteral("reviewFeedback"));
@@ -96,7 +121,7 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     save_->setToolTip(text("Unchecked: no separate named scenario is created. The current editor still autosaves its draft locally.",
                                "Если выключено, именованный сценарий не создаётся. Черновик текущего редактора всё равно автосохраняется локально."));
     layout->addWidget(save_);
-    auto* buttons = new QHBoxLayout;
+    auto* buttons = new WrapLayout(nullptr, 8);
     replace_ = new QPushButton(text("Replace current actions", "Заменить текущие действия"));
     replace_->setObjectName(QStringLiteral("reviewReplace"));
     replace_->setProperty("actionRole", QStringLiteral("primary"));
@@ -116,7 +141,8 @@ RecordingReviewDialog::RecordingReviewDialog(std::vector<Action> actions,
     clicknova::gui::setButtonIcon(append_, clicknova::gui::Icon::List, QColor(QStringLiteral("#d8fff1")));
     clicknova::gui::setButtonIcon(cancel, clicknova::gui::Icon::Close);
     for (auto* button : {replace_, append_, cancel}) {
-        button->setMinimumHeight(36);
+        button->setMinimumHeight(38);
+        button->setMaximumWidth(275);
         buttons->addWidget(button);
     }
     layout->addLayout(buttons);
@@ -230,6 +256,33 @@ void RecordingReviewDialog::refresh(int selection) {
         auto* originItem = new QTableWidgetItem(label);
         originItem->setToolTip(label);
         table_->setItem(i, 2, originItem);
+        if (static_cast<std::size_t>(i) < screenshotIds_.size() &&
+            !screenshotIds_[static_cast<std::size_t>(i)].empty()) {
+            const auto& id = screenshotIds_[static_cast<std::size_t>(i)];
+            const QPixmap thumb = clicknova::gui::step_images::thumbnail(id, QSize(110, 76));
+            if (thumb.isNull()) {
+                auto* unavailable = new QTableWidgetItem(text("Unavailable", "Недоступен"));
+                unavailable->setToolTip(text(
+                    "Original screenshot missing or failed integrity verification.",
+                    "Исходный снимок отсутствует или не прошёл проверку целостности."));
+                table_->setItem(i, 3, unavailable);
+            }
+            if (!thumb.isNull()) {
+                auto* open = new QToolButton(table_);
+                open->setObjectName(QStringLiteral("recordingReviewImage"));
+                open->setIcon(QIcon(thumb));
+                open->setIconSize(QSize(110, 76));
+                open->setToolTip(text("Enlarge the original screenshot", "Увеличить исходный снимок"));
+                open->setAutoRaise(true);
+                open->setMinimumHeight(78);
+                table_->setCellWidget(i, 3, open);
+                table_->setRowHeight(i, qMax(table_->rowHeight(i), 84));
+                // Re-read the original image on demand: never zoom the thumbnail.
+                connect(open, &QToolButton::clicked, this, [this, i] {
+                    openScreenshot(i);
+                });
+            }
+        }
     }
     if (selection >= 0 && selection < table_->rowCount()) table_->selectRow(selection);
     else table_->clearSelection();
@@ -251,6 +304,37 @@ void RecordingReviewDialog::refresh(int selection) {
         text("Wheel:", "Колесо:") + QStringLiteral(" %1").arg(static_cast<qulonglong>(sum.wheelActions)));
 }
 
+void RecordingReviewDialog::openScreenshot(int row) {
+    if (row < 0 || static_cast<std::size_t>(row) >= screenshotIds_.size()) return;
+    const QImage original = reviewImage(screenshotIds_[static_cast<std::size_t>(row)]);
+    if (original.isNull()) {
+        feedback_->setText(text("The screenshot is unavailable or invalid.",
+                               "Снимок отсутствует или повреждён."));
+        return;
+    }
+    StepImageViewer viewer(original,
+        text("Recorded step %1", "Записанный шаг %1").arg(row + 1), {}, this);
+    // The preview remains read-only. The screenshot IDs already follow the
+    // actions when review rows are moved or removed.
+    viewer.enableGallery(row, static_cast<int>(screenshotIds_.size()),
+        [this](int candidate) -> QImage {
+            if (candidate < 0 || static_cast<std::size_t>(candidate) >= screenshotIds_.size())
+                return {};
+            return reviewImage(screenshotIds_[static_cast<std::size_t>(candidate)]);
+        }, text("Recorded screenshots", "Снимки записи"),
+        [this](int index) -> QString {
+            if (index < 0 || static_cast<std::size_t>(index) >= actions_.size()) return {};
+            QString label = actionName(actions_[static_cast<std::size_t>(index)]);
+            if (static_cast<std::size_t>(index) < windows_.size()) {
+                const QString title = QString::fromStdU16String(
+                    windows_[static_cast<std::size_t>(index)].title);
+                if (!title.isEmpty()) label += QStringLiteral("  ·  ") + title;
+            }
+            return label;
+        });
+    viewer.exec();
+}
+
 void RecordingReviewDialog::removeSelected() {
     const int row = table_->currentRow();
     if (row < 0) return;
@@ -261,6 +345,10 @@ void RecordingReviewDialog::removeSelected() {
                                 "Нельзя удалить действие, сохранив корректность сценария."));
         return;
     }
+    if (screenshotIds_.size() == originalSize) {
+        for (auto it = removed.rbegin(); it != removed.rend(); ++it)
+            screenshotIds_.erase(screenshotIds_.begin() + static_cast<std::ptrdiff_t>(*it));
+    } else screenshotIds_.clear();
     // A key/button pair may be nonadjacent. Remove precisely the same original
     // indexes in reverse order so the other recorded window labels survive.
     if (windows_.size() == originalSize) {
@@ -287,6 +375,9 @@ void RecordingReviewDialog::moveSelected(int distance) {
     if (windows_.size() == actions_.size()) {
         std::swap(windows_[static_cast<std::size_t>(row)], windows_[static_cast<std::size_t>(target)]);
     }
+    if (screenshotIds_.size() == actions_.size())
+        std::swap(screenshotIds_[static_cast<std::size_t>(row)],
+                  screenshotIds_[static_cast<std::size_t>(target)]);
     feedback_->clear();
     refresh(target);
 }

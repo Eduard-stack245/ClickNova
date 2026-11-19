@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # Checks required source files; does not modify the project.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -47,7 +47,7 @@ $required = @(
     'scripts/verify-source-tree.ps1',
     'scripts/build-linux.sh', 'scripts/package-portable-linux.sh', 'scripts/package-appimage-linux.sh',
     'scripts/package-appimage-bundle-linux.py',
-    '.github/workflows/portable-releases.yml', 'packaging/clicknova.desktop', 'packaging/clicknova.svg',
+    '.github/workflows/portable-releases.yml', '.github/workflows/widgets-windows.yml', 'packaging/clicknova.desktop', 'packaging/clicknova.svg',
     'tests/release_packaging_tests.py',
     'scripts/uninstall-clicknova.sh', 'scripts/uninstall-clicknova.ps1',
     'tests/uninstall_safety_tests.py', 'Enable-OpenCV-OCR.cmd'
@@ -55,6 +55,6 @@ $required = @(
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf) })
 if ($missing.Count -gt 0) {
     foreach ($item in $missing) { Write-Host "Missing: $item" -ForegroundColor Red }
-    throw 'Incomplete ClickNova source tree. Extract the update ZIP directly into the existing ClickNova checkout.'
+    throw 'Incomplete ClickNova source tree. Re-extract the complete full-source archive into a separate folder; do not apply overlays.'
 }
 Write-Host 'ClickNova source tree: required files found.' -ForegroundColor Green

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_actions.hpp"
 #include "clicknova/sequence.hpp"

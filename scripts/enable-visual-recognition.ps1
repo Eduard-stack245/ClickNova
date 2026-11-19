@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: MIT
 # Explicit opt-in developer dependency installer. No system-wide installation.
 param([string]$VcpkgRoot = '', [switch]$WaitForApplicationExit, [string]$ResultFile = '')
 $ErrorActionPreference = 'Stop'

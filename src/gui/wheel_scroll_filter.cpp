@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "wheel_scroll_filter.hpp"
 
 #include <QAbstractScrollArea>

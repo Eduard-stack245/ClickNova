@@ -1,7 +1,15 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "input_recorder_dialog.hpp"
 #include "ui_icons.hpp"
 #include "recording_checkpoint.hpp"
+#include "portable_storage.hpp"
+#include "wrap_layout.hpp"
+#include <QBuffer>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFileInfo>
+#include <QPainter>
+#include <QSaveFile>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QHideEvent>
@@ -274,6 +282,15 @@ InputRecorderDialog::InputRecorderDialog(bool russian, Finished finished)
     movement_->setToolTip(russian_ ? QString::fromUtf8("Если выключено, клики всё равно сохраняют свои координаты. Удобно для записи только нажатий.")
                                   : QStringLiteral("When disabled, clicks still capture their positions. Useful for recording only button actions."));
     layout->addWidget(movement_);
+    images_ = new QCheckBox(russian_ ?
+        QString::fromUtf8("Сохранять снимки области клика (могут содержать личные данные)") :
+        QStringLiteral("Capture click-area images (may contain private data)"));
+    images_->setObjectName(QStringLiteral("recorderClickImages"));
+    images_->setChecked(false); // Separate opt-in for EVERY recording.
+    images_->setToolTip(russian_ ?
+        QString::fromUtf8("Только при записи: область до 800×500 вокруг нажатия мыши. Не вводите секреты. Не более 160 кадров. PNG сохраняются локально и могут оставаться после удаления сценария.") :
+        QStringLiteral("Click area up to 800x500, up to 160 images; avoid secrets. Saved PNG files can outlive a scenario."));
+    layout->addWidget(images_);
     count_ = new QLabel;
     count_->setObjectName(QStringLiteral("recorderCounter"));
     layout->addWidget(count_);
@@ -281,8 +298,9 @@ InputRecorderDialog::InputRecorderDialog(bool russian, Finished finished)
         ? QString::fromUtf8("Черновики записи сохраняются локально с датой и временем. Они могут содержать введённый текст — не вводите пароли.")
         : QStringLiteral("Recording recovery is saved locally with timestamps. It may contain typed text; do not type passwords."));
     recoveryHint->setWordWrap(true);
+    recoveryHint->setObjectName(QStringLiteral("sectionHint"));
     layout->addWidget(recoveryHint);
-    auto* buttons = new QHBoxLayout;
+    auto* buttons = new WrapLayout(nullptr, 7);
     start_ = new QPushButton(russian_ ? QString::fromUtf8("Запись") : QStringLiteral("Record"));
     start_->setObjectName(QStringLiteral("recorderStart"));
     start_->setProperty("actionRole", QStringLiteral("record"));
@@ -303,7 +321,11 @@ InputRecorderDialog::InputRecorderDialog(bool russian, Finished finished)
     clicknova::gui::setButtonIcon(pause_, clicknova::gui::Icon::Pause);
     clicknova::gui::setButtonIcon(stop_, clicknova::gui::Icon::Check, QColor(QStringLiteral("#d8fff1")));
     clicknova::gui::setButtonIcon(cancel_, clicknova::gui::Icon::Close, QColor(QStringLiteral("#ffcbd2")));
-    for (auto* b : {start_, pause_, stop_, cancel_}) { b->setMinimumHeight(38); buttons->addWidget(b); }
+    for (auto* b : {start_, pause_, stop_, cancel_}) {
+        b->setMinimumHeight(38);
+        b->setMaximumWidth(155);
+        buttons->addWidget(b);
+    }
     layout->addLayout(buttons);
     hooks_ = new NativeHooks([this](const Sample& s) { record(s); });
     progressTimer_ = new QTimer(this);
@@ -329,6 +351,10 @@ void InputRecorderDialog::start() {
     QSettings().setValue(QStringLiteral("recorder/keyboard"), keyboardEnabled_);
     QSettings().setValue(QStringLiteral("recorder/text"), textEnabled_);
     movementEnabled_ = movement_->isChecked();
+    imagesEnabled_ = images_ && images_->isChecked();
+    scheduledImages_ = 0;
+    lastImageTick_ = 0;
+    newImageFiles_.clear();
     heldButtons_.clear();
     heldKeys_.clear();
     samples_.clear();
@@ -383,7 +409,16 @@ void InputRecorderDialog::stop(bool cancelled) {
     const std::uint64_t recordedDurationMs = started_ && endTick >= effectiveStart
         ? endTick - effectiveStart : 0;
     if (started_ && !cancelled) maybeCheckpoint(true);
-    if (cancelled) clicknova::gui::recording_checkpoint::remove(checkpointFile_);
+    if (cancelled) {
+        clicknova::gui::recording_checkpoint::remove(checkpointFile_);
+        // Content-addressed existing files belong to other recordings; only
+        // remove images newly written by THIS recording.
+        for (const auto& imageId : newImageFiles_) {
+            const QString file = clicknova::portable::filePath(
+                QStringLiteral("step-images/") + QString::fromStdString(imageId) + QStringLiteral(".png"));
+            if (!file.isEmpty()) QFile::remove(file);
+        }
+    }
     completed_ = true;
     QSettings().setValue(QStringLiteral("recorder/panelPosition"), pos());
     hide(); // Never cover the import-choice dialog with this topmost panel.
@@ -449,6 +484,19 @@ void InputRecorderDialog::record(const Sample& event) {
         }
     }
     if (!replacedMove) samples_.push_back(sample);
+    if (imagesEnabled_ && !replacedMove && sample.kind == Kind::MouseDown &&
+        scheduledImages_ < 160 &&
+        (!lastImageTick_ || sample.milliseconds >= lastImageTick_ + 300)) {
+        ++scheduledImages_;
+        lastImageTick_ = sample.milliseconds;
+        const std::size_t index = samples_.size() - 1;
+        const int x = sample.x, y = sample.y;
+        // Hooks remain fast: screen capture runs in the event loop after the
+        // low-level input callback has returned.
+        QTimer::singleShot(0, this, [this, index, x, y] {
+            captureClickImage(index, x, y);
+        });
+    }
     // The first event of a different semantic action commits the preceding
     // group at the next safe GUI timer tick, never from inside the hook.
     const int meaning = sample.kind == Kind::Text ? 1 :
@@ -466,6 +514,47 @@ void InputRecorderDialog::record(const Sample& event) {
     if (sample.kind == Kind::KeyUp) heldKeys_.erase(sample.virtualKey);
     // Progress and the window label are updated by the 300 ms timer, not
     // inside the time-sensitive low-level Windows hook callback.
+}
+
+void InputRecorderDialog::captureClickImage(std::size_t index, int x, int y) {
+    if (!started_ || paused_ || completed_ || !imagesEnabled_ || index >= samples_.size() ||
+        samples_[index].kind != Kind::MouseDown) return;
+    auto* screen = QGuiApplication::screenAt(QPoint(x, y));
+    if (!screen) return;
+    const QRect bounds = screen->geometry();
+    const int width = std::min(800, bounds.width());
+    const int height = std::min(500, bounds.height());
+    if (width <= 0 || height <= 0) return;
+    const int left = std::clamp(x - width / 2, bounds.left(), bounds.right() - width + 1);
+    const int top = std::clamp(y - height / 2, bounds.top(), bounds.bottom() - height + 1);
+    const QPixmap pixmap = screen->grabWindow(0, left - bounds.left(), top - bounds.top(), width, height);
+    if (pixmap.isNull()) return;
+    QImage image = pixmap.toImage();
+    if (image.isNull()) return;
+    // Visible target marker remains sharp when the full-resolution PNG is enlarged.
+    const qreal sx = qreal(image.width()) / width;
+    const qreal sy = qreal(image.height()) / height;
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(255, 72, 65), std::max(2.0, 3.0 * sx)));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawEllipse(QPointF((x - left) * sx, (y - top) * sy), 14 * sx, 14 * sy);
+    painter.end();
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG") ||
+        bytes.size() > 8 * 1024 * 1024) return;
+    const QByteArray hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
+    const QString fileName = clicknova::portable::filePath(
+        QStringLiteral("step-images/") + QString::fromLatin1(hash) + QStringLiteral(".png"));
+    if (fileName.isEmpty() || !QDir().mkpath(QFileInfo(fileName).absolutePath())) return;
+    if (!QFileInfo::exists(fileName)) {
+        QSaveFile file(fileName);
+        if (!file.open(QIODevice::WriteOnly) ||
+            file.write(bytes) != bytes.size() || !file.commit()) return;
+        newImageFiles_.insert(hash.toStdString());
+    }
+    samples_[index].screenshotId = hash.toStdString();
 }
 
 void InputRecorderDialog::maybeCheckpoint(bool force) {
@@ -495,6 +584,7 @@ void InputRecorderDialog::updateUi() {
     keyboard_->setEnabled(!started_);
     text_->setEnabled(!started_ && keyboard_->isChecked());
     movement_->setEnabled(!started_);
+    images_->setEnabled(!started_);
     pause_->setEnabled(started_ && samples_.size() < 29800);
     stop_->setEnabled(started_);
     pause_->setText(paused_ ? (russian_ ? QString::fromUtf8("Продолжить") : QStringLiteral("Resume"))
@@ -561,6 +651,100 @@ void InputRecorderDialog::closeRecordedHolds() {
     }
     heldKeys_.clear();
     heldButtons_.clear();
+}
+
+QString InputRecorderDialog::statusText() const {
+    return info_ ? info_->text() : QString();
+}
+
+// Typed capture commands used by the Qt Quick bridge. Native UI actions call
+// the same private transitions, so pause timing, release balancing and recovery
+// checkpoints remain identical to the legacy safety controller.
+bool InputRecorderDialog::canStartFromQml() const noexcept {
+    return !started_ && !completed_;
+}
+
+bool InputRecorderDialog::canPauseFromQml() const noexcept {
+    return started_ && !completed_ && samples_.size() < 29800;
+}
+
+bool InputRecorderDialog::canReviewFromQml() const noexcept {
+    return started_ && !completed_;
+}
+
+bool InputRecorderDialog::canDiscardFromQml() const noexcept {
+    return started_ && !completed_ && paused_;
+}
+
+bool InputRecorderDialog::requestStartFromQml() {
+    if (!canStartFromQml()) return false;
+    start();
+    return started_ && !completed_;
+}
+
+bool InputRecorderDialog::requestPausedFromQml(bool desiredPaused) {
+    if (!started_ || completed_) return false;
+    if (paused_ == desiredPaused) return true;
+    if (!canPauseFromQml()) return false;
+    pauseOrResume();
+    return paused_ == desiredPaused && !completed_;
+}
+
+bool InputRecorderDialog::requestFinishFromQml() {
+    if (!canReviewFromQml()) return false;
+    stop(false); // May invoke the finished callback and queue deleteLater().
+    return true;
+}
+
+bool InputRecorderDialog::requestDiscardFromQml() {
+    if (!canDiscardFromQml()) return false;
+    stop(true);
+    return true;
+}
+
+bool InputRecorderDialog::captureOptionFromQml(int option) const {
+    switch (option) {
+    case 0: return keyboard_ && keyboard_->isChecked();
+    case 1: return text_ && text_->isChecked();
+    case 2: return movement_ && movement_->isChecked();
+    case 3: return images_ && images_->isChecked();
+    default: return false;
+    }
+}
+
+bool InputRecorderDialog::setCaptureOptionFromQml(int option, bool enabled) {
+    if (!canStartFromQml()) return false;
+    QCheckBox* checkbox = nullptr;
+    switch (option) {
+    case 0: checkbox = keyboard_; break;
+    case 1: checkbox = text_; break;
+    case 2: checkbox = movement_; break;
+    case 3: checkbox = images_; break;
+    default: return false;
+    }
+    if (!checkbox || !checkbox->isEnabled()) return false;
+    checkbox->setChecked(enabled);
+    updateUi();
+    return checkbox->isChecked() == enabled;
+}
+
+int InputRecorderDialog::recordedEventCount() const noexcept {
+    return static_cast<int>(samples_.size()); // hard native cap <= 30000
+}
+
+std::uint64_t InputRecorderDialog::recordedElapsedMs() const noexcept {
+    if (!started_ || completed_) return 0;
+    const std::uint64_t end = paused_ ? pausedTick_ : nowMs();
+    const std::uint64_t start = startedTick_ + totalPaused_;
+    return end >= start ? end - start : 0;
+}
+
+QString InputRecorderDialog::progressTextFromQml() const {
+    return count_ ? count_->text() : QString();
+}
+
+QString InputRecorderDialog::windowTextFromQml() const {
+    return window_ ? window_->text() : QString();
 }
 
 void InputRecorderDialog::bringToFront() {

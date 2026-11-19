@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #if defined(__linux__) && defined(CLICKNOVA_WITH_X11)
 #include "clicknova/input_actions.hpp"

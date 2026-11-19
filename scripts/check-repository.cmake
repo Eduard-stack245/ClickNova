@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # Validate the minimal source repository without documentation or Git dependencies.
 cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED PROJECT_ROOT OR NOT DEFINED PROJECT_VERSION)
@@ -12,6 +12,7 @@ foreach(path IN ITEMS CMakeLists.txt LICENSE .gitignore .gitattributes ClickNova
                       scripts/package-appimage-linux.sh
                       scripts/package-appimage-bundle-linux.py
                       .github/workflows/portable-releases.yml
+                      .github/workflows/widgets-windows.yml
                       packaging/clicknova.desktop packaging/clicknova.svg
                       tests/release_packaging_tests.py
                       scripts/uninstall-clicknova.sh scripts/uninstall-clicknova.ps1

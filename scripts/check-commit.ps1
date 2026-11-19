@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: MIT
 # Read-only Git check. Does not stage, commit, push, clean or delete files.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -38,7 +38,7 @@ $sourceFiles = @(Get-ChildItem (Join-Path $root 'src'), (Join-Path $root 'includ
     Where-Object { $_.Extension -in '.cpp', '.hpp', '.h' -or $_.Name.EndsWith('.hpp.in') })
 foreach ($file in $sourceFiles) {
     $firstLine = Get-Content $file.FullName -TotalCount 1
-    if ($firstLine -ne '// SPDX-License-Identifier: Apache-2.0') {
+    if ($firstLine -ne '// SPDX-License-Identifier: MIT') {
         throw "Wrong or missing source license marker: $($file.FullName)"
     }
 }
@@ -56,7 +56,7 @@ $sensitive = @($staged | Where-Object {
     $_ -match '(?i)\.md$' -or
     $_ -match '^tools/(vcpkg|clicknova-visual-vcpkg[^/]*|clicknova-visual-installer[.]lock)(/|$)' -or
     ($_ -match '(^|/)(docs|\.github|build(-[^/]*)?|cmake-build-[^/]*|dist(-[^/]*)?|\.clicknova|user-data|user-profiles|user-macros|scenarios|user-scenarios|profiles|backups|backup-[^/]*|backup_[^/]*|data|ClickNova-data|tessdata|recording-recovery)/' -and
-     $_ -cne '.github/workflows/portable-releases.yml') -or
+     $_ -notin @('.github/workflows/portable-releases.yml', '.github/workflows/widgets-windows.yml')) -or
     ($_ -match '(?i)\.(exe|dll|lib|obj|pdb|log|dmp|zip|json|tsv|traineddata|sqlite|sqlite3)$' -and
      $_ -notmatch '^extensions/(chromium|firefox)/manifest[.]json$') -or
     $_ -match '(^|/)\.env(\.|$)' -or
@@ -72,7 +72,7 @@ $disallowedTracked = @($tracked | Where-Object {
     $_ -match '(?i)\.md$' -or
     $_ -match '^tools/(vcpkg|clicknova-visual-vcpkg[^/]*|clicknova-visual-installer[.]lock)(/|$)' -or
     ($_ -match '(^|/)(docs|\.github|data|ClickNova-data|tessdata|recording-recovery|backup-[^/]*|backup_[^/]*)/' -and
-     $_ -cne '.github/workflows/portable-releases.yml')
+     $_ -notin @('.github/workflows/portable-releases.yml', '.github/workflows/widgets-windows.yml'))
 })
 if ($disallowedTracked.Count -gt 0) {
     $disallowedTracked | ForEach-Object { Write-Host "Remove from Git index: $_" -ForegroundColor Yellow }

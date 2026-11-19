@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/input_recording.hpp"
 #include <cassert>
 #include <limits>
@@ -6,6 +6,28 @@
 using namespace clicknova;
 using namespace clicknova::recording;
 int main() {
+    // Click-area screenshot stays attached after MouseDown+MouseUp compaction.
+    // All other actions must remain unaffected.
+    {
+        using namespace clicknova::recording;
+        Sample down; down.kind = Kind::MouseDown;
+        down.milliseconds = 10; down.x = 125; down.y = 240;
+        down.screenshotId = std::string(64, 'a');
+        Sample up = down; up.kind = Kind::MouseUp;
+        up.milliseconds = 30; up.screenshotId.clear();
+        auto converted = convert({down, up});
+        assert(converted.error.empty());
+        assert(converted.screenshotIds.size() == converted.plan.actions.size());
+        bool found = false;
+        for (std::size_t i = 0; i < converted.plan.actions.size(); ++i) {
+            if (converted.screenshotIds[i] == down.screenshotId) {
+                assert(std::holds_alternative<clicknova::input::Click>(converted.plan.actions[i]));
+                found = true;
+            }
+        }
+        assert(found);
+    }
+
     {
         const auto r = convert({
             {Kind::Move, 0, 100, 100},

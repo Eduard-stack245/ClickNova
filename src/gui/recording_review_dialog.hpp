@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
 #include "clicknova/input_actions.hpp"
 #include "clicknova/input_recording.hpp"
@@ -21,8 +21,10 @@ public:
     RecordingReviewDialog(std::vector<clicknova::input::Action> actions,
                           std::size_t capturedEvents, std::uint64_t recordedMs,
                           bool russian, QWidget* parent = nullptr,
-                          std::vector<clicknova::recording::WindowInfo> windows = {});
+                          std::vector<clicknova::recording::WindowInfo> windows = {},
+                          std::vector<std::string> screenshotIds = {});
     const std::vector<clicknova::recording::WindowInfo>& windows() const noexcept { return windows_; }
+    const std::vector<std::string>& screenshotIds() const noexcept { return screenshotIds_; }
     Decision decision() const noexcept { return decision_; }
     bool saveRequested() const;
     const std::vector<clicknova::input::Action>& actions() const noexcept { return actions_; }
@@ -30,6 +32,7 @@ private:
     QString text(const char* english, const char* russian) const;
     void refresh(int selection);
     void editSelected();
+    void openScreenshot(int row);
     void removeSelected();
     void moveSelected(int distance);
     void import(Decision decision);
@@ -38,6 +41,7 @@ private:
 
     std::vector<clicknova::input::Action> actions_;
     std::vector<clicknova::recording::WindowInfo> windows_;
+    std::vector<std::string> screenshotIds_;
     std::size_t capturedEvents_{};
     std::uint64_t recordedMs_{};
     bool russian_{};

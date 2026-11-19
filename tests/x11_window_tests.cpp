@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // Real native X11 integration test. Runs with a second-process window in Xvfb.
 #include "clicknova/window_target.hpp"
 #include <X11/Xatom.h>

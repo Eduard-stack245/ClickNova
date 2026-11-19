@@ -1,9 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #pragma once
+#include <string>
+#include <string_view>
+#include <QByteArray>
+namespace clicknova::accessibility::candidates { struct Candidate; }
 
 #include "clicknova/input_actions.hpp"
 #include "clicknova/input_recording.hpp"
 #include "clicknova/action_list_edit.hpp"
+#include "qml/action_workspace.hpp"
 #include "clicknova/window_target.hpp"
 #ifdef CLICKNOVA_WITH_X11
 #include "clicknova/x11_input_backend.hpp"
@@ -14,6 +19,8 @@
 #include "../storage/scenario_store.hpp"
 #include <QWidget>
 #include <QString>
+#include <QStringList>
+#include <QDateTime>
 #include <QPoint>
 #include <QPointer>
 #include <stop_token>
@@ -22,6 +29,8 @@
 #include <utility>
 #include <vector>
 #include <QSet>
+#include <QHash>
+#include <QImage>
 
 class QComboBox;
 class QLineEdit;
@@ -47,6 +56,7 @@ public:
     ~InputLabWidget() override;
     void setRussian(bool enabled);
     bool isRunning() const noexcept;
+    bool isPlaybackActive() const noexcept;
     void cancel();
     void requestRun() { beginPlayback(); }
     QPushButton* runControl() const { return run_; }
@@ -65,6 +75,50 @@ public:
     void setStartShortcut(std::function<QString()> label);
     void setLegacyImporter(std::function<void()> importer);
     void refreshLibrary();
+    // Read-only owner-scoped access, not a second window registry.
+    InputRecorderDialog* activeRecorder() const noexcept { return recorder_; }
+    // Typed QML window binding. No native HWND is persisted in action files.
+    bool bindTargetWindowFromQml(const clicknova::platform::WindowTarget& target,
+                                 bool allowCoordinateRetarget);
+    bool bindStepWindowFromQml(int expectedRow, const clicknova::platform::WindowTarget& target,
+                               bool allowElementReset);
+    bool actionPlanExistsForQml(const QString& name);
+    bool saveActionPlanFromQml(const QString& name, bool replaceExisting);
+    bool loadActionPlanFromQml(const QString& name);
+    bool deleteActionPlanFromQml(const QString& name);
+    bool reviewSavedRecordingFromQml(const QString& fileName);
+    // Verified local recovery import controlled by the QML confirmation dialog.
+    // This method never opens QWidget prompts or executes recorded actions.
+    bool importSavedRecordingFromQml(const QString& fileName, bool append);
+    // QML-only review handoff; the native dialog remains a safe fallback if
+    // a finished recording cannot be durably checkpointed.
+    void setQmlRecordingReviewEnabled(bool enabled) noexcept { qmlRecordingReviewEnabled_ = enabled; }
+    QString pendingRecordingReviewForQml() const;
+    bool dismissPendingRecordingReviewForQml();
+    bool deleteSavedRecordingFromQml(const QString& fileName);
+    bool validateEditorFromQml(int row) const;
+    bool editActionFromQml(int row, const QString& field, const QString& value);
+    std::string actionRevisionForPresentation() const { return actionWorkspace_.revision(); }
+    bool editActionFieldsFromQml(int row,
+        const std::vector<clicknova::gui::qml::ActionWorkspace::FieldEdit>& edits,
+        std::string_view expectedRevision);
+    bool setBrowserTabScopeFromQml(int row, bool enabled, const QByteArray& titleUtf8);
+    bool bindVerifiedUiaElementFromQml(int row, const std::string& title,
+        const std::string& process, const clicknova::accessibility::candidates::Candidate& selected);
+    bool undoActionFromQml();
+    bool redoActionFromQml();
+    std::optional<std::vector<int>> batchActionsFromQml(
+        const QString& operation, const std::vector<int>& rows);
+    bool canUndoActionFromQml() const { return !isRunning() && actionWorkspace_.canUndo(); }
+    bool canRedoActionFromQml() const { return !isRunning() && actionWorkspace_.canRedo(); }
+    const std::vector<clicknova::input::Action>& actionsForPresentation() const noexcept { return actions_; }
+    const std::vector<clicknova::input::StepWindow>& windowBindingsForPresentation() const noexcept { return stepWindows_; }
+    int selectedActionRowForPresentation() const;
+    bool selectActionRowForPresentation(int row);
+    // Typed public actions for the Qt Quick inspector; native validation stays authoritative.
+    bool addActionFromQml(int actionType);
+    bool canEditActionFromQml(int row) const;
+    void applyLineFieldFromQml(const QString& name);
     void refreshStartLabel() { updateStartLabel(); }
     void setStopHotkeyController(std::function<bool(bool)> controller,
                                  std::function<QString()> label);
@@ -83,6 +137,11 @@ private:
     void redoActionEdit();
     void checkpointActions();
     void showActionMenu(int row, const QPoint& globalPos);
+    void renameStep(int row);
+    void toggleStepBookmark(int row);
+    void editStepNote(int row);
+    void chooseStepImage(int row);
+    void viewStepImage(int row);
     void moveActionRow(int from, int to);
     void duplicateRow(int row);
     void deleteRow(int row);
@@ -100,6 +159,10 @@ private:
     void pasteActionAt(int row);
     bool canPasteAction() const;
     void updateSelected();
+    void openStepEditor(int row);
+    void finishStepEditor(bool save);
+    void loadElementTaskEditor(const clicknova::input::Action& action);
+    void updateElementTaskEditor();
     void chooseStepWindow();
     void searchStepUiElements();
     void clearStepUiElement();
@@ -113,13 +176,19 @@ private:
     std::int64_t passMilliseconds() const;
     void selectAction(int index);
     void refreshTable(int selectRow);
+    void refreshTimingColumns();
+    void openStepNavigator();
+    void openScenarioCheck();
     void applyStepVisibility();
+    void navigateStepMatches(bool forward);
     void toggleStepGroup(int row);
     void createManualGroup();
     void renameManualGroup();
     void ungroupManualSteps();
     bool selectedManualGroup(int& first, int& end) const;
     void resizeStepList(int pixels);
+    void resizeStepThumbnails(int delta);
+    void refreshThumbnailBatch(int startRow, int generation);
     void detachStepList();
     int stepCategory(int row) const;
     void updateFields();
@@ -142,10 +211,13 @@ private:
     void reviewCapturedRecording(std::vector<clicknova::recording::Sample> samples,
                                  bool cancelled, std::uint64_t durationMs,
                                  const QString& checkpointFile);
-    void beginPlayback();
+    void beginPlayback(std::optional<clicknova::input::PlaybackCursor> cursor = std::nullopt);
+    void continueFailedPlayback();
     void startPlayback();
     void stopPlayback();
     void onPlaybackProgress(const clicknova::input::PlaybackProgress& progress);
+    void openExecutionReport();
+    QString executionReportText() const;
     void refreshNextStepTime();
     void refreshWaitPreview();
     void clearNextStepTime();
@@ -155,6 +227,7 @@ private:
     std::vector<clicknova::input::Action> actions_;
     std::vector<clicknova::input::StepWindow> stepWindows_;
     clicknova::input::ActionListHistory actionHistory_;
+    clicknova::gui::qml::ActionWorkspace actionWorkspace_{actions_, stepWindows_, actionHistory_};
     // Transient binding only: never persisted as an HWND or PID.
     std::optional<clicknova::platform::WindowTarget> targetWindow_;
     bool requireWindowBinding_{false};
@@ -164,6 +237,9 @@ private:
     bool running_{false};
     bool stopHotkeyActive_{false};
     bool recording_{false};
+    bool qmlRecordingReviewEnabled_{false};
+    // Local checkpoint basename only; never an HWND or captured text.
+    QString pendingRecordingReviewName_;
     bool nextStepPending_{false};
     bool waitingForFirst_{false};
     std::int64_t nextStepDelayMs_{0};
@@ -171,6 +247,28 @@ private:
     int upcomingPass_{1};
     std::chrono::steady_clock::time_point nextStepStarted_{};
     std::uint64_t playbackGeneration_{0};
+    struct ExecutedStep {
+        std::size_t stepIndex{0};
+        int passNumber{1};
+        std::int64_t elapsedMs{0};
+        bool succeeded{false};
+    };
+    std::vector<ExecutedStep> executionRows_;
+    QStringList executionStepKinds_; // generic action type only; never action details
+    bool executionRowsTruncated_{false};
+    QString executionOutcome_;
+    QDateTime executionStartedAt_;
+    QDateTime executionFinishedAt_;
+    std::chrono::steady_clock::time_point executionStartedSteady_{};
+    std::int64_t executionElapsedMs_{0};
+    int executionTotalSteps_{0};
+    int executionTotalPasses_{0};
+    // Volatile continuation: never saved to disk, cleared on stop/completion.
+    std::optional<clicknova::input::PlaybackCursor> resumeCursor_;
+    std::optional<clicknova::input::PlaybackCursor> pendingStartCursor_;
+    std::optional<clicknova::input::Plan> lastStartedPlan_;
+    std::optional<clicknova::platform::WindowTarget> lastStartedTarget_;
+    std::string resumeRevision_;
     InputRecorderDialog* recorder_{nullptr};
     std::function<bool(bool)> stopHotkeyController_;
     std::function<QString()> stopHotkeyLabel_;
@@ -189,12 +287,22 @@ private:
     QVBoxLayout* stepsRootLayout_{nullptr};
     QLineEdit* stepSearch_{nullptr};
     QComboBox* stepFilter_{nullptr};
+    QPushButton* previousStepMatch_{nullptr};
+    QPushButton* nextStepMatch_{nullptr};
     QLabel* stepCount_{nullptr};
     QWidget* stepResizeGrip_{nullptr};
+    QPushButton* checkScenario_{nullptr};
+    QPushButton* stepNavigator_{nullptr};
+    QPushButton* openStepImages_{nullptr};
+    QPushButton* resumeFailed_{nullptr};
     QPushButton* expandGroups_{nullptr};
     QPushButton* collapseGroups_{nullptr};
     QPushButton* enlargeSteps_{nullptr};
     QPushButton* shrinkSteps_{nullptr};
+    QPushButton* increaseThumbnails_{nullptr};
+    QPushButton* decreaseThumbnails_{nullptr};
+    int stepThumbnailWidth_{96};
+    int thumbnailUpdateGeneration_{0};
     QPushButton* detachSteps_{nullptr};
     QPushButton* createGroup_{nullptr};
     QPushButton* renameGroup_{nullptr};
@@ -219,6 +327,9 @@ private:
     // Only the currently open menu has the discoverable object name. Closing
     // a menu does not always delete it before the next GUI event is processed.
     QPointer<QMenu> activeActionMenu_;
+    // Local fallback when a locked/noninteractive Windows clipboard drops the
+    // application's custom MIME type. Never copied as readable plain text.
+    QByteArray inProcessCopiedSteps_;
     QPushButton* chooseWindow_{nullptr};
     QPushButton* clearWindow_{nullptr};
     QPushButton* chooseStepWindow_{nullptr};
@@ -286,7 +397,30 @@ private:
     QLabel* quickHeading_{nullptr};
     QLabel* stepsHeading_{nullptr};
     QLabel* status_{nullptr};
+    QPushButton* reportExecution_{nullptr};
+    QPushButton* copyDiagnostic_{nullptr};
+    QString lastDiagnostic_;
     QGroupBox* editorGroup_{nullptr};
+    QPointer<QDialog> stepEditorDialog_;
+    QPushButton* closeStepEditor_{nullptr};
+    QPushButton* cancelStepEditor_{nullptr};
+    int editingStepRow_{-1};
+    std::vector<clicknova::input::Action> editorOriginalActions_;
+    std::vector<clicknova::input::StepWindow> editorOriginalWindows_;
+    QGroupBox* elementTaskGroup_{nullptr};
+    QLabel* elementTaskSummary_{nullptr};
+    QLabel* elementTaskTextLabel_{nullptr};
+    QLineEdit* elementTaskText_{nullptr};
+    QLabel* elementTaskAxisLabel_{nullptr};
+    QComboBox* elementTaskAxis_{nullptr};
+    QLabel* elementTaskAmountLabel_{nullptr};
+    QSpinBox* elementTaskAmount_{nullptr};
+    QLabel* elementTaskTimeoutLabel_{nullptr};
+    QSpinBox* elementTaskTimeout_{nullptr};
+    QLabel* elementTaskPollLabel_{nullptr};
+    QSpinBox* elementTaskPoll_{nullptr};
+    QLabel* elementTaskDoubleLabel_{nullptr};
+    QSpinBox* elementTaskDouble_{nullptr};
     QGroupBox* savedGroup_{nullptr};
     QPushButton* quickClick_{nullptr};
     QPushButton* quickText_{nullptr};

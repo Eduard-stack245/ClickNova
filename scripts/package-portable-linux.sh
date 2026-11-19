@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # Package an ALREADY BUILT portable Linux directory. Does not vendor Linux deps.
 set -euo pipefail
 (( $# == 2 )) || { echo "Usage: $0 <ready-bundle-directory> <output-directory>" >&2; exit 2; }

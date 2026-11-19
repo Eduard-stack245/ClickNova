@@ -1,6 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "sequence_editor.hpp"
 #include <QFormLayout>
+#include <QScrollArea>
 #include <QResizeEvent>
 #include <QTimer>
 #include <limits>
@@ -57,14 +58,40 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         editToggle_ = new QToolButton(this);
         editToggle_->setObjectName(QStringLiteral("sequenceEditToggle"));
         editToggle_->setProperty("actionRole", QStringLiteral("secondary"));
-        editToggle_->setCheckable(true);
+        editToggle_->setCheckable(false);
         editToggle_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        editToggle_->setArrowType(Qt::RightArrow);
+        editToggle_->setArrowType(Qt::NoArrow);
         editToggle_->setMinimumHeight(40);
         secondaryToolbar->addWidget(chooseWindow_);
         secondaryToolbar->addWidget(pickWindow_);
         secondaryToolbar->addWidget(editToggle_);
+        for (auto* button : {capture_, chooseWindow_, pickWindow_})
+            button->setMaximumWidth(245);
+        editToggle_->setMaximumWidth(250);
         layout->addLayout(secondaryToolbar);
+
+        // Search is navigation only: it never filters the underlying action model,
+        // so row numbers, drag/drop and playback order remain stable.
+        auto* searchRow = new QHBoxLayout;
+        stepSearch_ = new QLineEdit(this);
+        stepSearch_->setObjectName(QStringLiteral("sequenceStepSearch"));
+        stepSearch_->setClearButtonEnabled(true);
+        stepSearch_->setMinimumHeight(38);
+        stepSearchPrevious_ = new QPushButton(this);
+        stepSearchPrevious_->setObjectName(QStringLiteral("sequenceSearchPrevious"));
+        stepSearchNext_ = new QPushButton(this);
+        stepSearchNext_->setObjectName(QStringLiteral("sequenceSearchNext"));
+        stepSearchCount_ = new QLabel(this);
+        stepSearchCount_->setObjectName(QStringLiteral("sequenceSearchMatches"));
+        searchRow->addWidget(stepSearch_, 1);
+        searchRow->addWidget(stepSearchPrevious_);
+        searchRow->addWidget(stepSearchNext_);
+        searchRow->addWidget(stepSearchCount_);
+        layout->addLayout(searchRow);
+        connect(stepSearch_, &QLineEdit::textChanged, this, [this] { updateSearch(); });
+        connect(stepSearch_, &QLineEdit::returnPressed, this, [this] { findStep(true); });
+        connect(stepSearchPrevious_, &QPushButton::clicked, this, [this] { findStep(false); });
+        connect(stepSearchNext_, &QPushButton::clicked, this, [this] { findStep(true); });
 
         table_ = new ActionTable(0, 5, this);
         table_->setObjectName(QStringLiteral("sequenceSteps"));
@@ -105,6 +132,11 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
                     showSelected(row);
                 });
         layout->addWidget(table_, 1);
+        connect(table_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+            if (locked_ || row < 0) return;
+            table_->setCurrentCell(row, 0);
+            openEditDialog();
+        });
 
         detailGroup_ = new QGroupBox(this);
         auto* detail = new QVBoxLayout(detailGroup_);
@@ -132,7 +164,14 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         clicks_->setRange(1, std::numeric_limits<int>::max()); clicks_->setValue(1);
         window_ = new QComboBox(this); window_->setObjectName(QStringLiteral("sequenceStepWindow"));
         const std::initializer_list<QWidget*> fields = {x_, y_, button_, delay_, interval_, clicks_, window_};
-        for (QWidget* w : fields) w->setMinimumHeight(44);
+        for (QWidget* w : fields) {
+            w->setMinimumHeight(44);
+            if (w != window_) w->setMaximumWidth(190);
+        }
+        for (auto* amount : {x_, y_, delay_, interval_, clicks_})
+            amount->setMaximumWidth(220);
+        button_->setMaximumWidth(240);
+        window_->setMaximumWidth(420); // Window title may be longer than a number.
         form->addWidget(xLabel_, 0, 0); form->addWidget(yLabel_, 0, 1);
         form->addWidget(x_, 1, 0); form->addWidget(y_, 1, 1);
         form->addWidget(buttonLabel_, 2, 0); form->addWidget(clicksLabel_, 2, 1);
@@ -192,19 +231,82 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
         auto* editActions = new QHBoxLayout;
         editActions->addWidget(update_, 1);
         editActions->addWidget(revert_);
+        // The main toolbar remains available for fast point capture. Its full
+        // workflow is also reachable without leaving this step editor.
+        auto* pickers = new QGroupBox(detailGroup_);
+        pickers->setObjectName(QStringLiteral("sequenceStepPickers"));
+        auto* pickerLayout = new QGridLayout(pickers);
+        auto* pickPointInEditor = new QPushButton(pickers);
+        pickPointInEditor->setObjectName(QStringLiteral("sequenceEditorPickPoint"));
+        auto* pickTimerInEditor = new QPushButton(pickers);
+        pickTimerInEditor->setObjectName(QStringLiteral("sequenceEditorPickTimer"));
+        auto* pickShortcutInEditor = new QPushButton(pickers);
+        pickShortcutInEditor->setObjectName(QStringLiteral("sequenceEditorPickShortcut"));
+        auto* chooseWindowInEditor = new QPushButton(pickers);
+        chooseWindowInEditor->setObjectName(QStringLiteral("sequenceEditorChooseWindow"));
+        auto* pickWindowInEditor = new QPushButton(pickers);
+        pickWindowInEditor->setObjectName(QStringLiteral("sequenceEditorPickWindow"));
+        pickerLayout->addWidget(pickPointInEditor, 0, 0);
+        pickerLayout->addWidget(pickTimerInEditor, 0, 1);
+        pickerLayout->addWidget(pickShortcutInEditor, 1, 0);
+        pickerLayout->addWidget(chooseWindowInEditor, 1, 1);
+        pickerLayout->addWidget(pickWindowInEditor, 2, 0, 1, 2);
+        const auto launchPicker = [this](QPushButton* original) {
+            if (locked_ || !hasSelectedAction() || !original) return;
+            // Input capture must never pick the step editor window itself.
+            if (editDialog_) editDialog_->hide();
+            original->click();
+        };
+        connect(pickPointInEditor, &QPushButton::clicked, this,
+                [this, launchPicker] { launchPicker(pick_); });
+        connect(pickTimerInEditor, &QPushButton::clicked, this,
+                [this, launchPicker] { launchPicker(capture_); });
+        connect(pickShortcutInEditor, &QPushButton::clicked, this,
+                [this, launchPicker] { launchPicker(hover_); });
+        connect(chooseWindowInEditor, &QPushButton::clicked, this,
+                [this] { if (chooseWindow_) chooseWindow_->click(); });
+        connect(pickWindowInEditor, &QPushButton::clicked, this,
+                [this, launchPicker] { launchPicker(pickWindow_); });
+        pickers->setTitle(QString::fromUtf8("Цель и захват / Target and capture"));
+        pickPointInEditor->setText(QString::fromUtf8("Выбрать точку / Pick point"));
+        pickTimerInEditor->setText(QString::fromUtf8("По таймеру / Timed capture"));
+        pickShortcutInEditor->setText(QString::fromUtf8("По клавише / Shortcut"));
+        chooseWindowInEditor->setText(QString::fromUtf8("Выбрать окно / Choose window"));
+        pickWindowInEditor->setText(QString::fromUtf8("Окно под курсором / Window under cursor"));
+        detail->addWidget(pickers);
         detail->addLayout(editActions);
         connect(revert_, &QPushButton::clicked, this, [this] {
-            if (!locked_ && dirty_ && hasSelectedAction()) {
-                const int row = table_->currentRow();
-                steps_[static_cast<std::size_t>(row)] = undoStep_;
-                refresh(row);
-            }
+            if (editDialog_) editDialog_->reject();
         });
-        layout->addWidget(detailGroup_);
-        detailGroup_->hide();
-        connect(editToggle_, &QToolButton::toggled, this, [this](bool enabled) {
-            editToggle_->setArrowType(enabled ? Qt::DownArrow : Qt::RightArrow);
-            detailGroup_->setVisible(enabled && hasSelectedAction());
+        editDialog_ = new QDialog(this);
+        editDialog_->setObjectName(QStringLiteral("sequenceStepEditorDialog"));
+        editDialog_->setWindowModality(Qt::NonModal);
+        editDialog_->setMinimumSize(520, 460);
+        editDialog_->resize(710, 650);
+        auto* dialogLayout = new QVBoxLayout(editDialog_);
+        dialogLayout->setContentsMargins(16, 14, 16, 14);
+        auto* dialogHint = new QLabel(editDialog_);
+        dialogHint->setObjectName(QStringLiteral("sequenceEditorHint"));
+        dialogHint->setText(QStringLiteral("Save commits the step; Cancel or X restores its previous values."));
+        dialogHint->setWordWrap(true);
+        dialogLayout->addWidget(dialogHint);
+        auto* editorScroll = new QScrollArea(editDialog_);
+        editorScroll->setWidgetResizable(true);
+        editorScroll->setFrameShape(QFrame::NoFrame);
+        editorScroll->setObjectName(QStringLiteral("sequenceEditorScroll"));
+        editorScroll->setWidget(detailGroup_);
+        dialogLayout->addWidget(editorScroll);
+        connect(editToggle_, &QToolButton::clicked, this, [this] { openEditDialog(); });
+        connect(editDialog_, &QDialog::finished, this, [this, dialogHint](int result) {
+            Q_UNUSED(dialogHint);
+            const int row = editingRow_;
+            editingRow_ = -1;
+            if (result != QDialog::Accepted && row >= 0 &&
+                row < static_cast<int>(steps_.size())) {
+                // The model updates live for preview, but Cancel is a real rollback.
+                steps_[static_cast<std::size_t>(row)] = editorOriginalStep_;
+                refresh(table_->currentRow());
+            }
         });
 
         note_ = new QLabel(this); note_->setWordWrap(true);
@@ -219,7 +321,7 @@ SequenceEditor::SequenceEditor(QWidget* parent) : QWidget(parent) {
             step.space = space_();
             step.configured = false;
             append(step);
-            editToggle_->setChecked(true);
+            openEditDialog();
         });
         connect(update_, &QPushButton::clicked, this, [this] { applyChanges(); });
         for (auto* field : {x_, y_, delay_, interval_, clicks_}) {
@@ -326,6 +428,19 @@ void SequenceEditor::refreshWindows() {
     }
 
 void SequenceEditor::showSelected(int row) {
+        if (editDialog_ && editDialog_->isVisible() && editingRow_ != row) {
+            // Edits to the previous row are already reflected in steps_.
+            // Switching rows commits them; Cancel now restores only the new row.
+            if (row >= 0 && row < static_cast<int>(steps_.size())) {
+                editingRow_ = row;
+                editorOriginalStep_ = steps_[static_cast<std::size_t>(row)];
+                dirty_ = false;
+                editDialog_->setWindowTitle(label(QStringLiteral("Selected action %1"))
+                    .arg(row + 1));
+            } else {
+                editDialog_->accept();
+            }
+        }
         loadingAction_ = true;
         if (row < 0 || row >= static_cast<int>(steps_.size())) {
             loadingAction_ = false; dirty_ = false;
@@ -350,10 +465,24 @@ void SequenceEditor::showSelected(int row) {
         updateEditStatus();
     }
 
+void SequenceEditor::openEditDialog() {
+        if (locked_ || !hasSelectedAction() || !editDialog_) return;
+        if (editDialog_->isVisible()) { editDialog_->raise(); return; }
+        editingRow_ = table_->currentRow();
+        editorOriginalStep_ = steps_[static_cast<std::size_t>(editingRow_)];
+        editDialog_->setWindowTitle(label(QStringLiteral("Selected action %1"))
+            .arg(editingRow_ + 1));
+        editDialog_->show();
+        editDialog_->raise();
+        editDialog_->activateWindow();
+        x_->setFocus(Qt::OtherFocusReason);
+    }
+
 void SequenceEditor::applyChanges() {
         if (locked_ || !hasSelectedAction()) return;
-        // Edits are already reflected in the model. Done simply closes the panel.
-        editToggle_->setChecked(false);
+        // Keep the live preview changes; mark them accepted so X/Cancel
+        // cannot accidentally restore the snapshot after a successful save.
+        if (editDialog_) editDialog_->accept();
         dirty_ = false;
         undoStep_ = steps_[static_cast<std::size_t>(table_->currentRow())];
         updateButtons();
@@ -367,7 +496,7 @@ void SequenceEditor::menuForRow(int row, QPushButton* anchor) {
         auto* duplicate = menu.addAction(label(QStringLiteral("Duplicate")));
         auto* remove = menu.addAction(label(QStringLiteral("Delete action")));
         auto* picked = menu.exec(anchor->mapToGlobal(QPoint(0, anchor->height())));
-        if (picked == edit) { table_->setCurrentCell(row, 0); editToggle_->setChecked(true); }
+        if (picked == edit) { table_->setCurrentCell(row, 0); openEditDialog(); }
         else if (picked == duplicate && steps_.size() < 128) {
             const auto duplicateStep = steps_[static_cast<std::size_t>(row)];
             steps_.insert(steps_.begin() + row + 1, duplicateStep);
@@ -410,16 +539,18 @@ void SequenceEditor::markActionDirty() {
 
 void SequenceEditor::updateEditStatus() {
         if (!editStatus_) return;
-        editStatus_->setText(dirty_
-            ? label(QStringLiteral("Changes are saved automatically. Undo is available until you select another action."))
-            : label(QStringLiteral("Changes update the selected action immediately.")));
+        editStatus_->setText(language_ == QStringLiteral("ru")
+            ? (dirty_ ? QString::fromUtf8("Есть изменения. «Сохранить шаг» оставит их, «Отмена» восстановит прежние значения.")
+                      : QString::fromUtf8("Настройте шаг. Сохранение и отмена доступны внизу."))
+            : (dirty_ ? QStringLiteral("Unsaved edits. Save to keep them; Cancel to restore the previous step.")
+                      : QStringLiteral("Configure the step, then Save or Cancel.")));
     }
 
 void SequenceEditor::updateButtons() {
         const int row = table_->currentRow();
         const bool selected = row >= 0 && row < static_cast<int>(steps_.size());
         update_->setEnabled(!locked_ && selected);
-        revert_->setEnabled(!locked_ && selected && dirty_);
+        revert_->setEnabled(!locked_ && selected);
         if (hint_) {
             const QString help = selected
                 ? label(QStringLiteral("Selected action %1: choose its point, select a window, or open Edit to change clicks and delays.")).arg(row + 1)
@@ -427,7 +558,10 @@ void SequenceEditor::updateButtons() {
             hint_->setText(help);
         }
         editToggle_->setEnabled(!locked_ && selected);
-        detailGroup_->setVisible(editToggle_->isChecked() && selected);
+        if (editDialog_ && editDialog_->isVisible() && (!selected || locked_)) {
+            // Save live changes when the editor is no longer applicable.
+            editDialog_->accept();
+        }
         add_->setEnabled(!locked_);
         pick_->setEnabled(!locked_ && selected);
         hover_->setEnabled(!locked_ && selected);
@@ -489,8 +623,59 @@ void SequenceEditor::refresh(int row, bool notify) {
         }
         updateButtons();
         updateEditStatus();
+        updateSearch();
         if (notify && onChange) onChange();
     }
+
+void SequenceEditor::updateSearch() {
+    if (!stepSearch_ || !table_) return;
+    const QString query = stepSearch_->text().trimmed();
+    int matches = 0;
+    for (int row = 0; row < table_->rowCount(); ++row) {
+        const bool numbered = query.startsWith(QLatin1Char('#')) &&
+            QString::number(row + 1) == query.mid(1).trimmed();
+        bool found = numbered;
+        if (!query.isEmpty() && !query.startsWith(QLatin1Char('#'))) {
+            if (QString::number(row + 1) == query) found = true;
+            for (int col = 1; col < 4 && !found; ++col) {
+                const auto* cell = table_->item(row, col);
+                found = cell && cell->text().contains(query, Qt::CaseInsensitive);
+            }
+        }
+        if (found) ++matches;
+    }
+    stepSearchCount_->setText(query.isEmpty() ? QString::number(table_->rowCount())
+        : QStringLiteral("%1 / %2").arg(matches).arg(table_->rowCount()));
+    stepSearchNext_->setEnabled(matches > 0);
+    stepSearchPrevious_->setEnabled(matches > 0);
+}
+
+void SequenceEditor::findStep(bool forward) {
+    if (!stepSearch_ || !table_) return;
+    const QString query = stepSearch_->text().trimmed();
+    if (query.isEmpty()) return;
+    const int count = table_->rowCount();
+    if (!count) return;
+    const int current = table_->currentRow();
+    for (int offset = 1; offset <= count; ++offset) {
+        const int start = current < 0 ? (forward ? -1 : 0) : current;
+        const int row = ((start + (forward ? offset : -offset)) % count + count) % count;
+        bool found = query.startsWith(QLatin1Char('#'))
+            ? QString::number(row + 1) == query.mid(1).trimmed()
+            : QString::number(row + 1) == query;
+        if (!found && !query.startsWith(QLatin1Char('#'))) {
+            for (int col = 1; col < 4 && !found; ++col) {
+                const auto* cell = table_->item(row, col);
+                found = cell && cell->text().contains(query, Qt::CaseInsensitive);
+            }
+        }
+        if (!found) continue;
+        table_->setCurrentCell(row, 0);
+        table_->selectRow(row);
+        table_->scrollToItem(table_->item(row, 0), QAbstractItemView::PositionAtCenter);
+        return;
+    }
+}
 
 void SequenceEditor::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);

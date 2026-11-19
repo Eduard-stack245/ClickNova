@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/action_step_groups.hpp"
 #include <cassert>
 #include <vector>

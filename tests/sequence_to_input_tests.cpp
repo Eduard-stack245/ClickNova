@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/sequence_to_input.hpp"
 #include <cassert>
 #include <variant>

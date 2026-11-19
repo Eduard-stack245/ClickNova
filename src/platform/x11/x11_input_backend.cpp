@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "clicknova/x11_input_backend.hpp"
 #include "x11_error_sync.hpp"
 #include <X11/Xlib.h>

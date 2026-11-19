@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 # ClickNova portable remover. Only packaged files listed by SHA-256 are eligible.
 [CmdletBinding()]
 param(

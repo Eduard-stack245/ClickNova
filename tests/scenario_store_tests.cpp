@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 #include "../src/storage/scenario_store.hpp"
 #include "../src/storage/scenario_codec.hpp"
 #include "../src/i18n/translations.hpp"

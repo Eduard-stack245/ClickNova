@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: MIT
 # Package a PREBUILT deployed Windows release without machine-specific paths.
 # Source ZIP is NOT a runnable portable Windows bundle.
 param([string]$BuildDirectory = '', [string]$OutputZip = '')
@@ -30,7 +30,7 @@ try {
     # Copy Qt deployment and associated runtime DLLs. Do not ship test executables,
     # source files, user data, logs or secrets in the distribution.
     Get-ChildItem -LiteralPath $release -File | Where-Object {
-        $_.Name -eq 'ClickNova.exe' -or $_.Extension -eq '.dll'
+        $_.Name -eq 'ClickNova.exe' -or ($_.Extension -eq '.dll' -and $_.Name -notmatch '^(?:msvcp|vcruntime|concrt|ucrtbase)')
     } | Copy-Item -Destination $target
     foreach ($sub in @('platforms','styles','imageformats','iconengines','tls','networkinformation','generic','translations')) {
         $from = Join-Path $release $sub
@@ -48,18 +48,25 @@ try {
     }
     New-Item -ItemType Directory -Path (Join-Path $target 'data\tessdata') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $target 'README-PORTABLE.txt') -Encoding UTF8 -Value @'
-ClickNova — переносимая версия для Windows x64 10/11.
-Запускайте ClickNova.exe. Папку ClickNova можно переместить на другой диск.
-Настройки и сценарии будут в data/ рядом с exe, если папка доступна для записи.
-При первом запуске можно отказаться от дополнительных файлов.
-Для распознавания изображений требуется сборка с OpenCV; для OCR — с Tesseract.
-Этот базовый release не включает OpenCV/Tesseract, если они не присутствовали при сборке.
-Никакого компилятора пользователю НЕ нужно.
-На чистой Windows может потребоваться официальный Microsoft Visual C++ Redistributable x64,
-который устанавливается ОТДЕЛЬНО (это runtime, НЕ Visual Studio и НЕ компилятор).
-Официальные условия распространения runtime описаны Microsoft/Qt: НЕ распространяйте
-неразрешенные к отдельному распространению DLL из Visual Studio.
-Linux требует отдельной сборки AppImage. Windows EXE не является Linux-приложением.
+ClickNova — portable Windows x64 application / портативна програма для Windows x64.
+
+ENGLISH
+1. Run ClickNova.exe. You may move the ClickNova folder to another disk.
+2. Settings, scenarios and recordings live in data/ next to the executable when writable.
+3. The program needs the shipped Qt plugins and QML imports; keep the entire folder together.
+4. OpenCV/Tesseract features work only when those optional dependencies were enabled at build time.
+5. A clean Windows installation may require Microsoft's official Visual C++ Redistributable x64.
+6. Never distribute Visual Studio or third-party DLLs without their redistribution rights.
+7. Linux requires a separate build; the Windows executable does not run natively on Linux.
+
+УКРАЇНСЬКА
+1. Запустіть ClickNova.exe. Папку ClickNova можна перенести на інший диск.
+2. Налаштування, сценарії та записи зберігаються в data/ поряд із програмою, якщо є доступ до запису.
+3. Не вилучайте бібліотеки Qt, плагіни та QML-модулі з портативної папки.
+4. Функції OpenCV/Tesseract працюють лише тоді, коли їх було ввімкнено під час збирання.
+5. На чистій системі Windows може знадобитися офіційний Microsoft Visual C++ Redistributable x64.
+6. Дотримуйтеся ліцензій та дозволів на поширення сторонніх компонентів.
+7. Для Linux потрібне окреме збирання. EXE для Windows не є нативною програмою Linux.
 '@
     # Bundle a tightly scoped uninstaller. The uninstall manifest is generated
     # only for files actually shipped in THIS portable ZIP (never system files).
